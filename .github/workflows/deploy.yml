@@ -33,16 +33,20 @@ jobs:
             echo "Pulling latest changes..."
             git pull origin main
             
-            echo "Building and restarting services..."
-            docker-compose -f docker-compose.prod.yml down
-            docker-compose -f docker-compose.prod.yml build --no-cache
-            docker-compose -f docker-compose.prod.yml up -d
+            echo "Stopping application..."
+            docker compose -f docker-compose.prod.yml down
             
-            echo "Cleaning up old images..."
+            echo "Building only changed services (uses cache)..."
+            docker compose -f docker-compose.prod.yml build
+            
+            echo "Starting services..."
+            docker compose -f docker-compose.prod.yml up -d
+            
+            echo "Cleaning up unused images..."
             docker image prune -f
             
             echo "Deployment complete!"
-            docker-compose -f docker-compose.prod.yml ps
+            docker compose -f docker-compose.prod.yml ps
           ENDSSH
 
       - name: Verify Deployment
