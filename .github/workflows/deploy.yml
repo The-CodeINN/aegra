@@ -1,0 +1,54 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main # Change to your production branch
+  workflow_dispatch: # Allow manual triggers
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to EC2
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+          HOST: ${{ secrets.EC2_HOST }}
+          USER: ubuntu
+        run: |
+          # Setup SSH
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key.pem
+          chmod 600 ~/.ssh/deploy_key.pem
+          ssh-keyscan -H $HOST >> ~/.ssh/known_hosts
+
+          # Deploy to EC2
+          ssh -i ~/.ssh/deploy_key.pem -o StrictHostKeyChecking=no $USER@$HOST << 'ENDSSH'
+            cd /home/ubuntu/aegra
+            
+            echo "Pulling latest changes..."
+            git pull origin main
+            
+            echo "Building and restarting services..."
+            docker-compose -f docker-compose.prod.yml down
+            docker-compose -f docker-compose.prod.yml build --no-cache
+            docker-compose -f docker-compose.prod.yml up -d
+            
+            echo "Cleaning up old images..."
+            docker image prune -f
+            
+            echo "Deployment complete!"
+            docker-compose -f docker-compose.prod.yml ps
+          ENDSSH
+
+      - name: Verify Deployment
+        env:
+          HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          sleep 10
+          curl -f http://$HOST:8000/health || exit 1
+          echo "Health check passed!"
