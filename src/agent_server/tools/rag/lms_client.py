@@ -8,7 +8,7 @@ This module handles communication with the LMS API to retrieve:
 """
 
 import os
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 from pydantic import BaseModel
@@ -19,7 +19,7 @@ class CourseData(BaseModel):
 
     course_id: str
     title: str
-    description: Optional[str] = None
+    description: str | None = None
     levels: list[dict[str, Any]] = []
 
 
@@ -39,8 +39,8 @@ class LMSClient:
 
     def __init__(
         self,
-        base_url: Optional[str] = None,
-        admin_token: Optional[str] = None,
+        base_url: str | None = None,
+        admin_token: str | None = None,
     ):
         """
         Initialize LMS client.
@@ -60,7 +60,7 @@ class LMSClient:
             "Content-Type": "application/json",
         }
 
-    async def get_course(self, course_id: str) -> Optional[CourseData]:
+    async def get_course(self, course_id: str) -> CourseData | None:
         """
         Fetch course data by ID.
 
@@ -165,7 +165,7 @@ class LMSClient:
         level_title: str,
         module_index: int,
         lesson_index: int,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """
         Fetch lesson details including materials.
 
