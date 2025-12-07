@@ -1,0 +1,33 @@
+[Unit]
+Description=Aegra Agent Server (FastAPI + LangGraph) - Instance %i
+After=network.target postgresql.service valkey-server.service
+Wants=postgresql.service valkey-server.service
+
+[Service]
+ExecStart=/home/ubuntu/.local/bin/uv run python run_server.py
+WorkingDirectory=/home/ubuntu/aegra
+User=ubuntu
+Group=ubuntu
+Environment="PORT=800%i"
+Environment="DATABASE_URL=postgresql+asyncpg://postgres:postgres_secure_password@localhost:5432/aegra"
+Environment="REDIS_URL=redis://localhost:6379"
+EnvironmentFile=/home/ubuntu/.env
+
+# Security
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=5s
+TimeoutSec=30
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=true
+ReadWritePaths=/home/ubuntu/aegra
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aegra-%i
+
+[Install]
+WantedBy=multi-user.target

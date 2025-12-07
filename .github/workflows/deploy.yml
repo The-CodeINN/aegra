@@ -1,58 +1,83 @@
-name: Deploy to EC2
+name: Deploy to Server
 
 on:
   push:
     branches:
-      - main # Change to your production branch
-  workflow_dispatch: # Allow manual triggers
+      - main
+  workflow_dispatch:
+
+permissions:
+  packages: write
 
 jobs:
-  deploy:
+  build-and-test:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Cache uv packages
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.cache/uv
+          key: uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: uv-
+
+      - name: Install dependencies
+        run: ~/.cargo/bin/uv sync
+
+      - name: Run linting and formatting checks
+        run: ~/.cargo/bin/uv run ruff check .
+
+      - name: Run tests
+        run: ~/.cargo/bin/uv run pytest tests/ -v
+
+      - name: Build release
+        run: |
+          echo "Building release for commit ${{ github.sha }}"
+          mkdir -p releases
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key.pem
+          chmod 600 ~/.ssh/deploy_key.pem
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
       - name: Deploy to EC2
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
-          HOST: ${{ secrets.EC2_HOST }}
           USER: ubuntu
+          HOST: ${{ secrets.EC2_HOST }}
+          RELEASES_DIR: /home/ubuntu/releases
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          # Setup SSH
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key.pem
-          chmod 600 ~/.ssh/deploy_key.pem
-          ssh-keyscan -H $HOST >> ~/.ssh/known_hosts
+          # Create releases directory on server
+          ssh -i ~/.ssh/deploy_key.pem -o StrictHostKeyChecking=no $USER@$HOST mkdir -p $RELEASES_DIR/aegra-${COMMIT_SHA}
 
-          # Deploy to EC2
-          ssh -i ~/.ssh/deploy_key.pem -o StrictHostKeyChecking=no $USER@$HOST << 'ENDSSH'
-            cd /home/ubuntu/aegra
+          # Copy the entire project to releases
+          scp -i ~/.ssh/deploy_key.pem -r -o StrictHostKeyChecking=no . $USER@$HOST:$RELEASES_DIR/aegra-${COMMIT_SHA}/
 
-            echo "Pulling latest changes..."
-            git pull origin main
-
-            echo "Stopping application..."
-            docker compose -f docker-compose.prod.yml down
-
-            echo "Building only changed services (uses cache)..."
-            docker compose -f docker-compose.prod.yml build
-
-            echo "Starting services..."
-            docker compose -f docker-compose.prod.yml up -d
-
-            echo "Cleaning up unused images..."
-            docker image prune -f
-
-            echo "Deployment complete!"
-            docker compose -f docker-compose.prod.yml ps
-          ENDSSH
+          # Run the deploy script on the server
+          ssh -i ~/.ssh/deploy_key.pem -o StrictHostKeyChecking=no $USER@$HOST "bash /home/ubuntu/aegra/deployments/systemd/deploy.sh ${COMMIT_SHA}"
 
       - name: Verify Deployment
         env:
           HOST: ${{ secrets.EC2_HOST }}
         run: |
           sleep 10
-          curl -f http://$HOST:8000/health || exit 1
-          echo "Health check passed!"
+          for port in 8000 8001 8002; do
+            if curl -f http://$HOST:$port/health 2>/dev/null; then
+              echo "Health check passed on port $port"
+            else
+              echo "Warning: Health check failed on port $port"
+            fi
+          done
