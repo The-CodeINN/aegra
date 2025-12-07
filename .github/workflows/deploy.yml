@@ -29,22 +29,22 @@ jobs:
           # Deploy to EC2
           ssh -i ~/.ssh/deploy_key.pem -o StrictHostKeyChecking=no $USER@$HOST << 'ENDSSH'
             cd /home/ubuntu/aegra
-            
+
             echo "Pulling latest changes..."
             git pull origin main
-            
+
             echo "Stopping application..."
             docker compose -f docker-compose.prod.yml down
-            
+
             echo "Building only changed services (uses cache)..."
             docker compose -f docker-compose.prod.yml build
-            
+
             echo "Starting services..."
             docker compose -f docker-compose.prod.yml up -d
-            
+
             echo "Cleaning up unused images..."
             docker image prune -f
-            
+
             echo "Deployment complete!"
             docker compose -f docker-compose.prod.yml ps
           ENDSSH

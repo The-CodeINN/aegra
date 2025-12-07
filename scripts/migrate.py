@@ -2,7 +2,7 @@
 """Database migration management script for Aegra."""
 
 import os
-import subprocess
+import subprocess  # nosec B404 - subprocess required for migration management
 import sys
 from pathlib import Path
 
@@ -11,20 +11,28 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 
-def run_command(cmd: str, description: str = ""):
-    """Run a command and handle errors."""
+def run_command(cmd_parts: list, description: str = "") -> bool:
+    """Run a command and handle errors.
+
+    Args:
+        cmd_parts: List of command parts to execute (no shell=True for security)
+        description: Optional description to print
+    """
     if description:
         print(f"🔄 {description}")
 
     try:
         result = subprocess.run(
-            cmd, shell=True, check=True, capture_output=True, text=True
+            cmd_parts,
+            check=True,
+            capture_output=True,
+            text=True,  # nosec B603 - input is from trusted argv
         )
         if result.stdout:
             print(result.stdout)
         return True
     except subprocess.CalledProcessError as e:
-        print(f"❌ Error running '{cmd}': {e}")
+        print(f"❌ Error running '{' '.join(cmd_parts)}': {e}")
         if e.stderr:
             print(f"Error output: {e.stderr}")
         return False
@@ -62,17 +70,21 @@ Examples:
 
     if command == "init":
         print("🚀 Initializing Alembic...")
-        if not run_command("alembic init alembic", "Creating Alembic directory"):
+        if not run_command(
+            ["alembic", "init", "alembic"], "Creating Alembic directory"
+        ):
             return
         print("✅ Alembic initialized! You may need to update alembic.ini and env.py")
 
     elif command == "upgrade":
-        if not run_command("alembic upgrade head", "Applying migrations"):
+        if not run_command(["alembic", "upgrade", "head"], "Applying migrations"):
             return
         print("✅ All migrations applied successfully!")
 
     elif command == "downgrade":
-        if not run_command("alembic downgrade -1", "Rolling back last migration"):
+        if not run_command(
+            ["alembic", "downgrade", "-1"], "Rolling back last migration"
+        ):
             return
         print("✅ Last migration rolled back!")
 
@@ -86,7 +98,7 @@ Examples:
         # Use subprocess.run directly to avoid shell quoting issues
         try:
             cmd_parts = ["alembic", "revision"] + sys.argv[2:]
-            result = subprocess.run(
+            result = subprocess.run(  # nosec B603 - argv comes from trusted command-line input
                 cmd_parts, check=True, capture_output=True, text=True
             )
             if result.stdout:
@@ -99,11 +111,11 @@ Examples:
             return False
 
     elif command == "history":
-        if not run_command("alembic history", "Showing migration history"):
+        if not run_command(["alembic", "history"], "Showing migration history"):
             return
 
     elif command == "current":
-        if not run_command("alembic current", "Showing current migration version"):
+        if not run_command(["alembic", "current"], "Showing current migration version"):
             return
 
     elif command == "reset":
@@ -115,9 +127,11 @@ Examples:
 
         print("🔄 Resetting database...")
         # Drop all tables (this is a simplified approach)
-        if not run_command("alembic downgrade base", "Rolling back all migrations"):
+        if not run_command(
+            ["alembic", "downgrade", "base"], "Rolling back all migrations"
+        ):
             return
-        if not run_command("alembic upgrade head", "Reapplying all migrations"):
+        if not run_command(["alembic", "upgrade", "head"], "Reapplying all migrations"):
             return
         print("✅ Database reset complete!")
 
