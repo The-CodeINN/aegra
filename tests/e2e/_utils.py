@@ -21,21 +21,23 @@ def elog(title: str, payload):
     except UnicodeEncodeError:
         # Fallback to ASCII-safe version on Windows
         try:
-            formatted_safe = json.dumps(payload, ensure_ascii=True, indent=2, default=str)
+            formatted_safe = json.dumps(
+                payload, ensure_ascii=True, indent=2, default=str
+            )
             print(f"\n=== {title} ===\n{formatted_safe}\n")
         except UnicodeEncodeError:
             # Last resort: encode title and use safe output
-            safe_title = title.encode('ascii', 'replace').decode('ascii')
+            safe_title = title.encode("ascii", "replace").decode("ascii")
             print(f"\n=== {safe_title} ===\n{formatted_safe}\n")
 
 
 def get_e2e_client():
     """Construct a LangGraph SDK client from env and log the target URL.
-    
+
     Note: E2E tests expect the server to be running with AUTH_TYPE=noop.
     Start the server with: $env:AUTH_TYPE='noop'; uv run python run_server.py
     """
     server_url = os.getenv("SERVER_URL", "http://localhost:8000")
     print(f"[E2E] Using SERVER_URL={server_url}")
-    print(f"[E2E] Note: Server should be running with AUTH_TYPE=noop")
+    print("[E2E] Note: Server should be running with AUTH_TYPE=noop")
     return get_client(url=server_url)
