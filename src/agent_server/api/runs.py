@@ -235,7 +235,11 @@ async def create_run(
     resolved_assistant_id = resolve_assistant_id(requested_id, available_graphs)
 
     # Extract token and user_id from Authorization header and inject into context
-    if authorization and isinstance(authorization, str) and authorization.startswith("Bearer "):
+    if (
+        authorization
+        and isinstance(authorization, str)
+        and authorization.startswith("Bearer ")
+    ):
         token = authorization.split("Bearer ", 1)[1]
         context["user_token"] = token
         # Extract user_id from the authenticated user context
@@ -389,7 +393,11 @@ async def create_and_stream_run(
     context = request.context or {}
 
     # Extract token and user_id from Authorization header and inject into context
-    if authorization and isinstance(authorization, str) and authorization.startswith("Bearer "):
+    if (
+        authorization
+        and isinstance(authorization, str)
+        and authorization.startswith("Bearer ")
+    ):
         token = authorization.split("Bearer ", 1)[1]
         context["user_token"] = token
         # Extract user_id from the authenticated user context
@@ -728,7 +736,11 @@ async def wait_for_run(
         context = configurable.copy()
 
     # Extract token and user_id from Authorization header and inject into context
-    if authorization and isinstance(authorization, str) and authorization.startswith("Bearer "):
+    if (
+        authorization
+        and isinstance(authorization, str)
+        and authorization.startswith("Bearer ")
+    ):
         token = authorization.split("Bearer ", 1)[1]
         context["user_token"] = token
         # Extract user_id from the authenticated user context
