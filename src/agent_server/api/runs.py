@@ -207,6 +207,15 @@ async def create_run(
     # Validate resume command requirements early
     await _validate_resume_command(session, thread_id, request.command)
 
+    # Validate that both configurable and context are not specified
+    config = request.config
+    context = request.context or {}
+    if config.get("configurable") and context:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot specify both configurable and context. Prefer setting context alone. Context was introduced in LangGraph 0.6.0 and is the long term planned replacement for configurable.",
+        )
+
     run_id = str(uuid4())
 
     # Get LangGraph service
@@ -225,11 +234,8 @@ async def create_run(
     available_graphs = langgraph_service.list_graphs()
     resolved_assistant_id = resolve_assistant_id(requested_id, available_graphs)
 
-    config = request.config
-    context = request.context or {}
-
     # Extract token and user_id from Authorization header and inject into context
-    if authorization and authorization.startswith("Bearer "):
+    if authorization and isinstance(authorization, str) and authorization.startswith("Bearer "):
         token = authorization.split("Bearer ", 1)[1]
         context["user_token"] = token
         # Extract user_id from the authenticated user context
@@ -383,7 +389,7 @@ async def create_and_stream_run(
     context = request.context or {}
 
     # Extract token and user_id from Authorization header and inject into context
-    if authorization and authorization.startswith("Bearer "):
+    if authorization and isinstance(authorization, str) and authorization.startswith("Bearer "):
         token = authorization.split("Bearer ", 1)[1]
         context["user_token"] = token
         # Extract user_id from the authenticated user context
@@ -722,7 +728,7 @@ async def wait_for_run(
         context = configurable.copy()
 
     # Extract token and user_id from Authorization header and inject into context
-    if authorization and authorization.startswith("Bearer "):
+    if authorization and isinstance(authorization, str) and authorization.startswith("Bearer "):
         token = authorization.split("Bearer ", 1)[1]
         context["user_token"] = token
         # Extract user_id from the authenticated user context

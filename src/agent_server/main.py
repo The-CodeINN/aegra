@@ -40,6 +40,8 @@ from .core.health import router as health_router
 from .core.redis import redis_manager
 from .middleware import DoubleEncodedJSONMiddleware, StructLogMiddleware
 from .models.errors import AgentProtocolError, get_error_type
+from .observability.base import get_observability_manager
+from .observability.langfuse_integration import LangfuseProvider
 from .services.broker import broker_manager
 from .services.event_store import event_store
 from .services.langgraph_service import get_langgraph_service
@@ -60,6 +62,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     # Initialize Redis if configured
     await redis_manager.initialize()
+
+    # Initialize observability
+    manager = get_observability_manager()
+    manager.register_provider(LangfuseProvider())
 
     # Initialize LangGraph service
     langgraph_service = get_langgraph_service()
