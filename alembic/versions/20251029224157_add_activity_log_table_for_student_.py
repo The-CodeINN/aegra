@@ -78,12 +78,16 @@ def upgrade() -> None:
         ["user_id", "created_at"],
         unique=False,
     )
-    op.drop_index(op.f("checkpoints_thread_id_idx"), table_name="checkpoints", if_exists=True)
+    op.drop_index(
+        op.f("checkpoints_thread_id_idx"), table_name="checkpoints", if_exists=True
+    )
     op.drop_table("checkpoints", if_exists=True)
     op.drop_table("checkpoint_migrations", if_exists=True)
     op.drop_table("store_migrations", if_exists=True)
     op.drop_index(
-        op.f("checkpoint_writes_thread_id_idx"), table_name="checkpoint_writes", if_exists=True
+        op.f("checkpoint_writes_thread_id_idx"),
+        table_name="checkpoint_writes",
+        if_exists=True,
     )
     op.drop_table("checkpoint_writes", if_exists=True)
     op.drop_index(
@@ -99,7 +103,11 @@ def upgrade() -> None:
         if_exists=True,
     )
     op.drop_table("store", if_exists=True)
-    op.drop_index(op.f("checkpoint_blobs_thread_id_idx"), table_name="checkpoint_blobs", if_exists=True)
+    op.drop_index(
+        op.f("checkpoint_blobs_thread_id_idx"),
+        table_name="checkpoint_blobs",
+        if_exists=True,
+    )
     op.drop_table("checkpoint_blobs", if_exists=True)
     # ### end Alembic commands ###
 
