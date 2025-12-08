@@ -10,7 +10,9 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
+      actions: read
+      checks: write
     strategy:
       matrix:
         python-version: ['3.11']
