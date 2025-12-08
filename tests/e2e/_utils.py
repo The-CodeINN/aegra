@@ -15,7 +15,18 @@ def elog(title: str, payload):
         formatted = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
     except Exception:
         formatted = str(payload)
-    print(f"\n=== {title} ===\n{formatted}\n")
+    # Use ensure_ascii=True to avoid Windows Unicode encoding issues
+    try:
+        print(f"\n=== {title} ===\n{formatted}\n")
+    except UnicodeEncodeError:
+        # Fallback to ASCII-safe version on Windows
+        try:
+            formatted_safe = json.dumps(payload, ensure_ascii=True, indent=2, default=str)
+            print(f"\n=== {title} ===\n{formatted_safe}\n")
+        except UnicodeEncodeError:
+            # Last resort: encode title and use safe output
+            safe_title = title.encode('ascii', 'replace').decode('ascii')
+            print(f"\n=== {safe_title} ===\n{formatted_safe}\n")
 
 
 def get_e2e_client():

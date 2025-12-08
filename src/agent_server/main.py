@@ -12,6 +12,10 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
+# Fix for Windows: psycopg requires SelectorEventLoop on Windows
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # Add graphs directory to Python path so react_agent can be imported
 # This MUST happen before importing any modules that depend on graphs/
 current_dir = Path(__file__).parent.parent.parent  # Go up to aegra root
