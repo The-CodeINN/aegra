@@ -30,7 +30,12 @@ def elog(title: str, payload):
 
 
 def get_e2e_client():
-    """Construct a LangGraph SDK client from env and log the target URL."""
+    """Construct a LangGraph SDK client from env and log the target URL.
+    
+    Note: E2E tests expect the server to be running with AUTH_TYPE=noop.
+    Start the server with: $env:AUTH_TYPE='noop'; uv run python run_server.py
+    """
     server_url = os.getenv("SERVER_URL", "http://localhost:8000")
     print(f"[E2E] Using SERVER_URL={server_url}")
+    print(f"[E2E] Note: Server should be running with AUTH_TYPE=noop")
     return get_client(url=server_url)
