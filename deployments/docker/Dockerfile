@@ -61,5 +61,3 @@ USER app
 
 # Leave default CMD empty so docker-compose command can run migrations then start uvicorn
 # CMD ["uvicorn", "src.agent_server.main:app", "--host", "0.0.0.0", "--port", "8000"]
-
-

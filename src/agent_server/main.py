@@ -12,6 +12,10 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
+# Fix for Windows: psycopg requires SelectorEventLoop on Windows
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # Add graphs directory to Python path so react_agent can be imported
 # This MUST happen before importing any modules that depend on graphs/
 current_dir = Path(__file__).parent.parent.parent  # Go up to aegra root
@@ -40,6 +44,8 @@ from .core.health import router as health_router
 from .core.redis import redis_manager
 from .middleware import DoubleEncodedJSONMiddleware, StructLogMiddleware
 from .models.errors import AgentProtocolError, get_error_type
+from .observability.base import get_observability_manager
+from .observability.langfuse_integration import LangfuseProvider
 from .services.broker import broker_manager
 from .services.event_store import event_store
 from .services.langgraph_service import get_langgraph_service
@@ -60,6 +66,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     # Initialize Redis if configured
     await redis_manager.initialize()
+
+    # Initialize observability
+    manager = get_observability_manager()
+    manager.register_provider(LangfuseProvider())
 
     # Initialize LangGraph service
     langgraph_service = get_langgraph_service()

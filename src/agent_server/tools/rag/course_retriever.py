@@ -8,7 +8,7 @@ relevant course information based on semantic similarity.
 import hashlib
 import os
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from langchain_openai import OpenAIEmbeddings
 from sqlalchemy import and_, create_engine, select
@@ -23,7 +23,7 @@ class CourseRetriever:
 
     def __init__(
         self,
-        database_url: Optional[str] = None,
+        database_url: str | None = None,
         embedding_model: str = "text-embedding-3-small",
     ):
         """
@@ -231,8 +231,8 @@ class CourseRetriever:
     async def search(
         self,
         query: str,
-        course_id: Optional[str] = None,
-        content_type: Optional[str] = None,
+        course_id: str | None = None,
+        content_type: str | None = None,
         k: int = 5,
     ) -> list[dict[str, Any]]:
         """
@@ -291,7 +291,7 @@ class CourseRetriever:
         finally:
             session.close()
 
-    def get_indexing_status(self, course_id: str) -> Optional[dict[str, Any]]:
+    def get_indexing_status(self, course_id: str) -> dict[str, Any] | None:
         """Get indexing status for a course."""
         session = self.Session()
 

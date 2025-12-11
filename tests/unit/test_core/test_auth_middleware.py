@@ -196,6 +196,7 @@ class TestLangGraphAuthBackend:
         backend.auth_instance = None
 
         mock_conn = Mock(spec=HTTPConnection)
+        mock_conn.scope = {}
 
         result = await backend.authenticate(mock_conn)
 
@@ -211,6 +212,7 @@ class TestLangGraphAuthBackend:
         backend.auth_instance = mock_auth_instance
 
         mock_conn = Mock(spec=HTTPConnection)
+        mock_conn.scope = {}
 
         result = await backend.authenticate(mock_conn)
 
@@ -232,6 +234,7 @@ class TestLangGraphAuthBackend:
         backend.auth_instance = mock_auth_instance
 
         mock_conn = Mock(spec=HTTPConnection)
+        mock_conn.scope = {}
         mock_conn.headers = {
             "authorization": b"Bearer token123",
             "content-type": b"application/json",
@@ -257,6 +260,7 @@ class TestLangGraphAuthBackend:
         backend.auth_instance = mock_auth_instance
 
         mock_conn = Mock(spec=HTTPConnection)
+        mock_conn.scope = {}
         mock_conn.headers = {"authorization": b"Bearer token123"}
 
         credentials, user = await backend.authenticate(mock_conn)
@@ -273,6 +277,7 @@ class TestLangGraphAuthBackend:
         backend.auth_instance = mock_auth_instance
 
         mock_conn = Mock(spec=HTTPConnection)
+        mock_conn.scope = {}
         mock_conn.headers = {"authorization": b"Bearer token123"}
 
         with pytest.raises(AuthenticationError, match="Authentication system error"):
@@ -290,6 +295,7 @@ class TestLangGraphAuthBackend:
         backend.auth_instance = mock_auth_instance
 
         mock_conn = Mock(spec=HTTPConnection)
+        mock_conn.scope = {}
         mock_conn.headers = {"authorization": b"Bearer token123"}
 
         with pytest.raises(AuthenticationError, match="Authentication system error"):
@@ -315,6 +321,7 @@ class TestLangGraphAuthBackend:
             mock_auth.exceptions.HTTPException = Exception
 
             mock_conn = Mock(spec=HTTPConnection)
+            mock_conn.scope = {}
             mock_conn.headers = {"authorization": b"Bearer token123"}
 
             with pytest.raises(AuthenticationError, match="Invalid token"):
@@ -332,6 +339,7 @@ class TestLangGraphAuthBackend:
         backend.auth_instance = mock_auth_instance
 
         mock_conn = Mock(spec=HTTPConnection)
+        mock_conn.scope = {}
         mock_conn.headers = {
             b"authorization": b"Bearer token123",  # bytes key and value
             "content-type": "application/json",  # str key and value
@@ -448,6 +456,7 @@ class TestAuthMiddlewareIntegration:
 
         # Mock connection
         mock_conn = Mock(spec=HTTPConnection)
+        mock_conn.scope = {}
         mock_conn.headers = {
             "authorization": "Bearer valid-token",
             "content-type": "application/json",
@@ -484,6 +493,7 @@ class TestAuthMiddlewareIntegration:
         backend.auth_instance = mock_auth_instance
 
         mock_conn = Mock(spec=HTTPConnection)
+        mock_conn.scope = {}
         mock_conn.headers = {"authorization": "Bearer invalid-token"}
 
         # Should raise AuthenticationError

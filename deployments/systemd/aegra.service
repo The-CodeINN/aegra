@@ -1,0 +1,29 @@
+[Unit]
+Description=Aegra Agent Server (FastAPI + LangGraph)
+After=network.target postgresql.service redis-server.service
+Wants=postgresql.service redis-server.service
+
+[Service]
+ExecStart=/usr/local/bin/uv run python run_server.py
+WorkingDirectory=/opt/aegra
+User=aegra
+Group=aegra
+
+# Security
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=5s
+TimeoutSec=30
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=true
+ReadWritePaths=/opt/aegra
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aegra
+
+[Install]
+WantedBy=multi-user.target

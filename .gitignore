@@ -11,6 +11,13 @@ wheels/
 
 # env files
 .env
+.env.production
+
+# SSH keys and certificates
+*.pem
+*.key
+*.crt
+ssl/
 
 # Pycharm
 .idea/

@@ -1,0 +1,134 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read # Needed to read repo via GitHub App
+  packages: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      ############################################################
+      # 1. Generate GitHub App Token (MOST SECURE METHOD)
+      ############################################################
+      - name: Authenticate with GitHub App
+        id: app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+
+      ############################################################
+      # 2. Checkout Code Using GitHub App Token
+      ############################################################
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app_token.outputs.token }}
+
+      ############################################################
+      # 3. Setup Python
+      ############################################################
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      ############################################################
+      # 4. Install uv
+      ############################################################
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      ############################################################
+      # 5. Cache uv packages
+      ############################################################
+      - name: Cache uv packages
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.cache/uv
+          key: uv-${{ hashFiles('**/uv.lock') }}
+          restore-keys: uv-
+
+      ############################################################
+      # 6. Install Dependencies
+      ############################################################
+      - name: Install dependencies
+        run: ~/.cargo/bin/uv sync
+
+      ############################################################
+      # 7. Linting & Tests
+      ############################################################
+      - name: Run linting and formatting checks
+        run: ~/.cargo/bin/uv run ruff check .
+
+      - name: Run tests
+        run: ~/.cargo/bin/uv run pytest tests/ -v
+
+      ############################################################
+      # 8. Build Release Bundle
+      ############################################################
+      - name: Build release
+        run: |
+          echo "Building release for commit ${{ github.sha }}"
+          mkdir -p releases
+
+      ############################################################
+      # 9. SSH Setup
+      ############################################################
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key.pem
+          chmod 600 ~/.ssh/deploy_key.pem
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      ############################################################
+      # 10. Deploy to EC2
+      ############################################################
+      - name: Deploy to EC2
+        env:
+          USER: ubuntu
+          HOST: ${{ secrets.EC2_HOST }}
+          RELEASES_DIR: /home/ubuntu/releases
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          echo "Deploying commit $COMMIT_SHA to EC2..."
+
+          # Create releases directory
+          ssh -i ~/.ssh/deploy_key.pem -o StrictHostKeyChecking=no $USER@$HOST \
+            mkdir -p $RELEASES_DIR/aegra-${COMMIT_SHA}
+
+          # Copy project files to server
+          scp -i ~/.ssh/deploy_key.pem -r -o StrictHostKeyChecking=no . \
+            $USER@$HOST:$RELEASES_DIR/aegra-${COMMIT_SHA}/
+
+          # Execute remote deploy script
+          ssh -i ~/.ssh/deploy_key.pem -o StrictHostKeyChecking=no $USER@$HOST \
+            "bash /home/ubuntu/aegra/deployments/systemd/deploy.sh ${COMMIT_SHA}"
+
+      ############################################################
+      # 11. Post-deployment Health Checks
+      ############################################################
+      - name: Verify Deployment
+        env:
+          HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          echo "Waiting for application to start..."
+          sleep 10
+
+          for port in 8000 8001 8002; do
+            echo "Checking /health on port $port"
+            if curl -f http://$HOST:$port/health 2>/dev/null; then
+              echo "Health check passed on port $port"
+            else
+              echo "Warning: Health check failed on port $port"
+            fi
+          done

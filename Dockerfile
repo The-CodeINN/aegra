@@ -66,5 +66,3 @@ USER app
 # Entrypoint will attempt to run alembic (best-effort) then exec the CMD below
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["uvicorn", "src.agent_server.main:app", "--host", "0.0.0.0", "--port", "8000"]
-
-

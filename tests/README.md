@@ -53,6 +53,20 @@ tests/
 - **Speed**: 🐌 Slowest (1s-10s per test)
 - **Run with**: `pytest tests/e2e/`
 
+**⚠️ Important**: E2E tests require a running server with `AUTH_TYPE=noop`. To run locally:
+
+```bash
+# Terminal 1: Start server with noop auth
+# Windows PowerShell:
+$env:AUTH_TYPE='noop'; uv run python run_server.py
+
+# Linux/Mac:
+AUTH_TYPE=noop uv run python run_server.py
+
+# Terminal 2: Run E2E tests
+pytest tests/e2e/
+```
+
 ## Running Tests
 
 ### Run all tests

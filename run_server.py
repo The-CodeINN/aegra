@@ -8,6 +8,7 @@ This script:
 3. Can be used for testing our LangGraph integration
 """
 
+import asyncio
 import logging
 import os
 import sys
@@ -18,6 +19,10 @@ import uvicorn
 from dotenv import load_dotenv
 
 from src.agent_server.utils.setup_logging import get_logging_config, setup_logging
+
+# Fix for Windows: psycopg requires SelectorEventLoop on Windows
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Add graphs directory to Python path so imports can be resolved
 current_dir = Path(__file__).parent
