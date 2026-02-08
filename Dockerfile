@@ -25,19 +25,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy aegra-api package files
-COPY libs/aegra-api/pyproject.toml libs/aegra-api/uv.lock libs/aegra-api/README.md ./
+# Copy workspace root files (uv.lock lives at the repo root)
+COPY pyproject.toml uv.lock ./
 
-# Install dependencies strictly from uv.lock.
-RUN uv export --frozen --no-dev --no-emit-project --format=requirements-txt > requirements.txt && \
+# Copy aegra-api package metadata (preserving workspace layout)
+COPY libs/aegra-api/pyproject.toml libs/aegra-api/README.md libs/aegra-api/
+
+# Install dependencies from the workspace lock file.
+RUN uv export --frozen --no-dev --no-emit-project \
+    --package aegra-api \
+    --format=requirements-txt > requirements.txt && \
     uv pip install --system --compile-bytecode -r requirements.txt && \
     rm requirements.txt
 
 # Copy the actual project source code.
-COPY libs/aegra-api/src/ ./src/
+COPY libs/aegra-api/src/ libs/aegra-api/src/
 
-# Install the project package itself.
-RUN uv pip install --system --compile-bytecode --no-deps .
+# Install the project package itself (from the aegra-api subdirectory).
+RUN uv pip install --system --compile-bytecode --no-deps libs/aegra-api/
 
 # -----------------------------
 # Final, minimal runtime image
@@ -72,5 +77,3 @@ USER app
 # Entrypoint will attempt to run alembic (best-effort) then exec the CMD below
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["uvicorn", "aegra_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
-
-
