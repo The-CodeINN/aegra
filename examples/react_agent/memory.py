@@ -95,9 +95,7 @@ async def save_user_memory(memory_key: str, memory_data: dict[str, Any]) -> str:
 
     if not user_id:
         logger.warning("No user_id in context, user not authenticated")
-        return (
-            "Error: User not authenticated. Cannot save memory without authentication."
-        )
+        return "Error: User not authenticated. Cannot save memory without authentication."
 
     namespace = (user_id, "memories")
 
@@ -163,12 +161,8 @@ async def search_user_memories(query: str) -> list[dict[str, Any]]:
                 {
                     "key": item.key,
                     "value": item.value,
-                    "created_at": item.created_at.isoformat()
-                    if item.created_at
-                    else None,
-                    "updated_at": item.updated_at.isoformat()
-                    if item.updated_at
-                    else None,
+                    "created_at": item.created_at.isoformat() if item.created_at else None,
+                    "updated_at": item.updated_at.isoformat() if item.updated_at else None,
                 }
             )
 

@@ -424,11 +424,7 @@ def get_dynamic_system_prompt(advisor: dict | None = None) -> str:
         advisor_experience=advisor.get("experience", DEFAULT_ADVISOR["experience"]),
         advisor_personality=advisor.get("personality", DEFAULT_ADVISOR["personality"]),
         advisor_background=advisor.get("background", DEFAULT_ADVISOR["background"]),
-        advisor_communication_style=advisor.get(
-            "communication_style", DEFAULT_ADVISOR["communication_style"]
-        ),
-        advisor_expertise=format_expertise_areas(
-            advisor.get("expertise_areas", DEFAULT_ADVISOR["expertise_areas"])
-        ),
+        advisor_communication_style=advisor.get("communication_style", DEFAULT_ADVISOR["communication_style"]),
+        advisor_expertise=format_expertise_areas(advisor.get("expertise_areas", DEFAULT_ADVISOR["expertise_areas"])),
         system_time="{system_time}",  # Keep this as a placeholder for runtime
     )

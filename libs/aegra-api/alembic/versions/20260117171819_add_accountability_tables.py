@@ -31,13 +31,9 @@ def upgrade() -> None:
         sa.Column("user_id", sa.Text(), nullable=False),
         sa.Column("thread_id", sa.Text(), nullable=True),
         sa.Column("description", sa.Text(), nullable=False),
-        sa.Column(
-            "status", sa.Text(), server_default=sa.text("'pending'"), nullable=False
-        ),
+        sa.Column("status", sa.Text(), server_default=sa.text("'pending'"), nullable=False),
         sa.Column("due_date", sa.TIMESTAMP(timezone=True), nullable=True),
-        sa.Column(
-            "priority", sa.Text(), server_default=sa.text("'normal'"), nullable=False
-        ),
+        sa.Column("priority", sa.Text(), server_default=sa.text("'normal'"), nullable=False),
         sa.Column("category", sa.Text(), nullable=True),
         sa.Column("source_message_id", sa.Text(), nullable=True),
         sa.Column(
@@ -69,12 +65,8 @@ def upgrade() -> None:
         sa.Column("title", sa.Text(), nullable=False),
         sa.Column("content", sa.Text(), nullable=False),
         sa.Column("channel", sa.Text(), nullable=False),
-        sa.Column(
-            "priority", sa.Text(), server_default=sa.text("'normal'"), nullable=False
-        ),
-        sa.Column(
-            "status", sa.Text(), server_default=sa.text("'pending'"), nullable=False
-        ),
+        sa.Column("priority", sa.Text(), server_default=sa.text("'normal'"), nullable=False),
+        sa.Column("status", sa.Text(), server_default=sa.text("'pending'"), nullable=False),
         sa.Column(
             "metadata",
             postgresql.JSONB(astext_type=sa.Text()),
@@ -97,9 +89,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(
-        "idx_notifications_scheduled", "notifications", ["scheduled_at"], unique=False
-    )
+    op.create_index("idx_notifications_scheduled", "notifications", ["scheduled_at"], unique=False)
     op.create_index(
         "idx_notifications_user_status",
         "notifications",

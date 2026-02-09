@@ -45,9 +45,7 @@ class CourseChunk(Base):
 
     # Content fields
     content = Column(Text, nullable=False)
-    content_type = Column(
-        String(50), nullable=False
-    )  # course, lesson, material, transcript
+    content_type = Column(String(50), nullable=False)  # course, lesson, material, transcript
 
     # Metadata
     title = Column(String(500))
@@ -55,9 +53,7 @@ class CourseChunk(Base):
     module_index = Column(Integer)
     lesson_index = Column(Integer)
     material_id = Column(String(255))
-    chunk_metadata = Column(
-        JSON, default={}
-    )  # Renamed from 'metadata' to avoid SQLAlchemy reserved name
+    chunk_metadata = Column(JSON, default={})  # Renamed from 'metadata' to avoid SQLAlchemy reserved name
 
     # Embedding vector (1536 dimensions for OpenAI text-embedding-3-small)
     embedding = Column(Vector(1536), nullable=False)
@@ -68,15 +64,10 @@ class CourseChunk(Base):
 
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
-    )
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     def __repr__(self) -> str:
-        return (
-            f"<CourseChunk(id={self.id}, course_id={self.course_id}, "
-            f"title={self.title}, type={self.content_type})>"
-        )
+        return f"<CourseChunk(id={self.id}, course_id={self.course_id}, title={self.title}, type={self.content_type})>"
 
 
 class IndexingStatus(Base):
@@ -93,9 +84,7 @@ class IndexingStatus(Base):
     course_id = Column(String(255), nullable=False, unique=True, index=True)
 
     # Status tracking
-    status = Column(
-        String(50), nullable=False, default="pending"
-    )  # pending, processing, completed, failed
+    status = Column(String(50), nullable=False, default="pending")  # pending, processing, completed, failed
     total_chunks = Column(Integer, default=0)
     indexed_chunks = Column(Integer, default=0)
     error_message = Column(Text)
@@ -104,9 +93,7 @@ class IndexingStatus(Base):
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
-    )
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     def __repr__(self) -> str:
         return (

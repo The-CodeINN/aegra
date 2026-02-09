@@ -29,6 +29,7 @@ router = APIRouter(prefix="/opportunities")
 
 # ── Pydantic Models ──────────────────────────────────────────────────
 
+
 class OpportunityResponse(BaseModel):
     id: str
     opportunity_type: str  # event | job | learning
@@ -89,14 +90,11 @@ class DiscoverRequest(BaseModel):
 
 # ── List / Filter ────────────────────────────────────────────────────
 
+
 @router.get("", response_model=OpportunityListResponse)
 async def list_opportunities(
-    opportunity_type: str | None = Query(
-        None, description="Filter by type: event, job, learning"
-    ),
-    status: str = Query(
-        "new", description="Filter by status: new, notified, saved, dismissed, applied"
-    ),
+    opportunity_type: str | None = Query(None, description="Filter by type: event, job, learning"),
+    status: str = Query("new", description="Filter by status: new, notified, saved, dismissed, applied"),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_session),
@@ -120,6 +118,7 @@ async def list_opportunities(
 
 # ── Stats ────────────────────────────────────────────────────────────
 
+
 @router.get("/stats")
 async def opportunity_stats(
     session: AsyncSession = Depends(get_session),
@@ -131,21 +130,21 @@ async def opportunity_stats(
 
 # ── Single opportunity ───────────────────────────────────────────────
 
+
 @router.get("/{opportunity_id}", response_model=OpportunityResponse)
 async def get_opportunity(
     opportunity_id: str,
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> OpportunityResponse:
-    opportunity = await OpportunityService.get_opportunity(
-        session, opportunity_id, user.identity
-    )
+    opportunity = await OpportunityService.get_opportunity(session, opportunity_id, user.identity)
     if not opportunity:
         raise HTTPException(status_code=404, detail="Opportunity not found")
     return OpportunityResponse.from_orm_model(opportunity)
 
 
 # ── Strategy ─────────────────────────────────────────────────────────
+
 
 @router.get("/{opportunity_id}/strategy")
 async def get_strategy(
@@ -154,15 +153,14 @@ async def get_strategy(
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return the AI-generated strategy for an opportunity."""
-    data = await OpportunityService.get_opportunity_with_strategy(
-        session, opportunity_id, user.identity
-    )
+    data = await OpportunityService.get_opportunity_with_strategy(session, opportunity_id, user.identity)
     if not data:
         raise HTTPException(status_code=404, detail="Opportunity not found")
     return data
 
 
 # ── Save / Dismiss / Applied ─────────────────────────────────────────
+
 
 @router.post("/{opportunity_id}/save")
 async def save_opportunity(
@@ -172,9 +170,7 @@ async def save_opportunity(
 ) -> dict[str, str]:
     """Bookmark an opportunity."""
     try:
-        return await OpportunityService.save_opportunity(
-            session, opportunity_id, user.identity
-        )
+        return await OpportunityService.save_opportunity(session, opportunity_id, user.identity)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
@@ -186,9 +182,7 @@ async def dismiss_opportunity(
     user: User = Depends(get_current_user),
 ) -> dict[str, str]:
     try:
-        return await OpportunityService.dismiss_opportunity(
-            session, opportunity_id, user.identity
-        )
+        return await OpportunityService.dismiss_opportunity(session, opportunity_id, user.identity)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
@@ -200,14 +194,13 @@ async def mark_applied(
     user: User = Depends(get_current_user),
 ) -> dict[str, str]:
     try:
-        return await OpportunityService.mark_opportunity_applied(
-            session, opportunity_id, user.identity
-        )
+        return await OpportunityService.mark_opportunity_applied(session, opportunity_id, user.identity)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
 
 # ── Manual discovery ─────────────────────────────────────────────────
+
 
 @router.post("/discover")
 async def trigger_discovery(
@@ -224,9 +217,7 @@ async def trigger_discovery(
         token = param if scheme.lower() == "bearer" else authorization
 
     if not token:
-        raise HTTPException(
-            status_code=401, detail="Authentication token required for discovery"
-        )
+        raise HTTPException(status_code=401, detail="Authentication token required for discovery")
 
     provider = request.search_provider if request else "auto"
     if provider not in ("brave", "claude", "both", "auto"):

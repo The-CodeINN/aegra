@@ -230,9 +230,7 @@ async def stream_graph_events(
 
                     # Update checkpoint state for debug tracking
                     if mode == "debug" and chunk.get("type") == "checkpoint":
-                        _normalize_checkpoint_payload(
-                            cast(CheckpointPayload | None, chunk.get("payload"))
-                        )
+                        _normalize_checkpoint_payload(cast(CheckpointPayload | None, chunk.get("payload")))
 
                     # Also yield as raw "events" event if "events" mode requested
                     # This ensures on_chain_stream events are available as raw events
@@ -290,9 +288,7 @@ async def stream_graph_events(
 
                 # Update checkpoint state for debug tracking
                 if mode == "debug" and chunk.get("type") == "checkpoint":
-                    _normalize_checkpoint_payload(
-                        cast("CheckpointPayload | None", chunk.get("payload"))
-                    )
+                    _normalize_checkpoint_payload(cast("CheckpointPayload | None", chunk.get("payload")))
 
 
 def _process_stream_event(

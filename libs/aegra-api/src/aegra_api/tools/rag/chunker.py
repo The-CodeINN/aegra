@@ -74,11 +74,7 @@ class CourseContentChunker:
         Returns:
             Transcript text content or empty string if fetch fails
         """
-        if (
-            not url
-            or not isinstance(url, str)
-            or not url.startswith(("http://", "https://"))
-        ):
+        if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
             return ""
 
         try:
@@ -135,9 +131,7 @@ class CourseContentChunker:
             if lesson.get("transcript"):
                 transcript = lesson["transcript"]
                 # Check if it's a URL
-                if isinstance(transcript, str) and transcript.startswith(
-                    ("http://", "https://")
-                ):
+                if isinstance(transcript, str) and transcript.startswith(("http://", "https://")):
                     lesson_content = await self._fetch_transcript_from_url(transcript)
                 elif isinstance(transcript, str) and transcript.strip():
                     lesson_content = transcript
@@ -150,20 +144,11 @@ class CourseContentChunker:
                     for item in structured:
                         if isinstance(item, dict):
                             # Try different possible text field names
-                            text = (
-                                item.get("text")
-                                or item.get("content")
-                                or item.get("transcript")
-                                or ""
-                            )
+                            text = item.get("text") or item.get("content") or item.get("transcript") or ""
                             if text and str(text).strip():
                                 # Check if text is a URL
-                                if isinstance(text, str) and text.startswith(
-                                    ("http://", "https://")
-                                ):
-                                    fetched_text = (
-                                        await self._fetch_transcript_from_url(text)
-                                    )
+                                if isinstance(text, str) and text.startswith(("http://", "https://")):
+                                    fetched_text = await self._fetch_transcript_from_url(text)
                                     if fetched_text:
                                         texts.append(fetched_text.strip())
                                 else:
@@ -174,19 +159,12 @@ class CourseContentChunker:
                 elif isinstance(structured, str):
                     # Check if it's a URL
                     if structured.startswith(("http://", "https://")):
-                        lesson_content = await self._fetch_transcript_from_url(
-                            structured
-                        )
+                        lesson_content = await self._fetch_transcript_from_url(structured)
                     elif structured.strip():
                         lesson_content = structured
                 elif isinstance(structured, dict):
                     # If it's a dict, try to get text from common fields
-                    text = (
-                        structured.get("text")
-                        or structured.get("content")
-                        or structured.get("transcript")
-                        or ""
-                    )
+                    text = structured.get("text") or structured.get("content") or structured.get("transcript") or ""
                     if text and isinstance(text, str):
                         if text.startswith(("http://", "https://")):
                             lesson_content = await self._fetch_transcript_from_url(text)
@@ -194,11 +172,7 @@ class CourseContentChunker:
                             lesson_content = text
 
             # Fallback to content field if it exists
-            if (
-                not lesson_content
-                and lesson.get("content")
-                and str(lesson.get("content")).strip()
-            ):
+            if not lesson_content and lesson.get("content") and str(lesson.get("content")).strip():
                 lesson_content = lesson["content"]
 
             if lesson_content and str(lesson_content).strip():
@@ -209,12 +183,9 @@ class CourseContentChunker:
                         "course_id": course_data.get("course_id"),
                         "lesson_id": lesson.get("_id"),
                         "lesson_title": lesson.get("title"),
-                        "level_title": lesson.get("levelTitle")
-                        or lesson.get("level_title"),
-                        "module_index": lesson.get("moduleIndex")
-                        or lesson.get("module_index"),
-                        "lesson_index": lesson.get("lessonIndex")
-                        or lesson.get("lesson_index"),
+                        "level_title": lesson.get("levelTitle") or lesson.get("level_title"),
+                        "module_index": lesson.get("moduleIndex") or lesson.get("module_index"),
+                        "lesson_index": lesson.get("lessonIndex") or lesson.get("lesson_index"),
                     },
                 )
 

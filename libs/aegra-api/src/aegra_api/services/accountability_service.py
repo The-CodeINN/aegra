@@ -48,12 +48,8 @@ class AccountabilityService:
         return result.scalars().all()
 
     @staticmethod
-    async def update_action_item_status(
-        session: AsyncSession, item_id: str, user_id: str, status: str
-    ) -> dict:
-        stmt = select(ActionItem).where(
-            ActionItem.id == item_id, ActionItem.user_id == user_id
-        )
+    async def update_action_item_status(session: AsyncSession, item_id: str, user_id: str, status: str) -> dict:
+        stmt = select(ActionItem).where(ActionItem.id == item_id, ActionItem.user_id == user_id)
         item = await session.scalar(stmt)
 
         if not item:
@@ -73,15 +69,9 @@ class AccountabilityService:
         return {"status": "updated"}
 
     @staticmethod
-    async def _record_action_completion(
-        session: AsyncSession, user_id: str
-    ) -> None:
+    async def _record_action_completion(session: AsyncSession, user_id: str) -> None:
         """Update activity tracking when an action item is completed."""
-        result = await session.execute(
-            select(UserActivityTracking).where(
-                UserActivityTracking.user_id == user_id
-            )
-        )
+        result = await session.execute(select(UserActivityTracking).where(UserActivityTracking.user_id == user_id))
         activity = result.scalar_one_or_none()
         if not activity:
             activity = UserActivityTracking(user_id=user_id)
@@ -126,19 +116,12 @@ class AccountabilityService:
         if category and category != "all":
             filters.append(Notification.category == category)
 
-        query = (
-            select(Notification)
-            .where(*filters)
-            .order_by(Notification.created_at.desc())
-            .limit(limit)
-        )
+        query = select(Notification).where(*filters).order_by(Notification.created_at.desc()).limit(limit)
         result = await session.execute(query)
         return result.scalars().all()
 
     @staticmethod
-    async def list_all_notifications(
-        session: AsyncSession, user_id: str, limit: int = 50
-    ) -> Sequence[Notification]:
+    async def list_all_notifications(session: AsyncSession, user_id: str, limit: int = 50) -> Sequence[Notification]:
         """Return both pending and read notifications (for notification center)."""
         query = (
             select(Notification)
@@ -153,12 +136,8 @@ class AccountabilityService:
         return result.scalars().all()
 
     @staticmethod
-    async def mark_notification_read(
-        session: AsyncSession, notification_id: str, user_id: str
-    ) -> dict:
-        stmt = select(Notification).where(
-            Notification.id == notification_id, Notification.user_id == user_id
-        )
+    async def mark_notification_read(session: AsyncSession, notification_id: str, user_id: str) -> dict:
+        stmt = select(Notification).where(Notification.id == notification_id, Notification.user_id == user_id)
         notification = await session.scalar(stmt)
         if not notification:
             raise ValueError("Notification not found")
@@ -185,9 +164,7 @@ class AccountabilityService:
         return {"updated": result.rowcount}
 
     @staticmethod
-    async def dismiss_notification(
-        session: AsyncSession, notification_id: str, user_id: str
-    ) -> dict:
+    async def dismiss_notification(session: AsyncSession, notification_id: str, user_id: str) -> dict:
         """Permanently dismiss a notification."""
         stmt = (
             update(Notification)
@@ -207,22 +184,14 @@ class AccountabilityService:
     # User Preferences
     # ------------------------------------------------------------------
     @staticmethod
-    async def get_preferences(
-        session: AsyncSession, user_id: str
-    ) -> UserPreferences | None:
-        result = await session.execute(
-            select(UserPreferences).where(UserPreferences.user_id == user_id)
-        )
+    async def get_preferences(session: AsyncSession, user_id: str) -> UserPreferences | None:
+        result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
         return result.scalar_one_or_none()
 
     @staticmethod
-    async def upsert_preferences(
-        session: AsyncSession, user_id: str, data: dict[str, Any]
-    ) -> UserPreferences:
+    async def upsert_preferences(session: AsyncSession, user_id: str, data: dict[str, Any]) -> UserPreferences:
         """Create or update user notification preferences."""
-        result = await session.execute(
-            select(UserPreferences).where(UserPreferences.user_id == user_id)
-        )
+        result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
         prefs = result.scalar_one_or_none()
 
         if not prefs:
@@ -258,15 +227,9 @@ class AccountabilityService:
     # Activity tracking
     # ------------------------------------------------------------------
     @staticmethod
-    async def record_activity(
-        session: AsyncSession, user_id: str, activity_type: str
-    ) -> None:
+    async def record_activity(session: AsyncSession, user_id: str, activity_type: str) -> None:
         """Record a user activity (login, conversation, course, etc.)."""
-        result = await session.execute(
-            select(UserActivityTracking).where(
-                UserActivityTracking.user_id == user_id
-            )
-        )
+        result = await session.execute(select(UserActivityTracking).where(UserActivityTracking.user_id == user_id))
         activity = result.scalar_one_or_none()
         if not activity:
             activity = UserActivityTracking(user_id=user_id)
@@ -285,12 +248,6 @@ class AccountabilityService:
         await session.commit()
 
     @staticmethod
-    async def get_activity(
-        session: AsyncSession, user_id: str
-    ) -> UserActivityTracking | None:
-        result = await session.execute(
-            select(UserActivityTracking).where(
-                UserActivityTracking.user_id == user_id
-            )
-        )
+    async def get_activity(session: AsyncSession, user_id: str) -> UserActivityTracking | None:
+        result = await session.execute(select(UserActivityTracking).where(UserActivityTracking.user_id == user_id))
         return result.scalar_one_or_none()

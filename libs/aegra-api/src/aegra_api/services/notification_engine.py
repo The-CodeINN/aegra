@@ -106,9 +106,7 @@ class NotificationEngine:
         5. Quiet hours respected (unless critical)
         """
         # Load preferences
-        prefs_row = await session.execute(
-            select(UserPreferences).where(UserPreferences.user_id == user_id)
-        )
+        prefs_row = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
         prefs = prefs_row.scalar_one_or_none()
 
         # No prefs → allow (defaults)
@@ -272,9 +270,7 @@ class NotificationEngine:
     # ------------------------------------------------------------------
     # Inactivity detection
     # ------------------------------------------------------------------
-    def compute_inactivity_tier(
-        self, days_inactive: int
-    ) -> tuple[str | None, str, str, str]:
+    def compute_inactivity_tier(self, days_inactive: int) -> tuple[str | None, str, str, str]:
         """Return (tier, priority, title, content) for inactivity."""
         if days_inactive >= 15:
             return (
@@ -309,17 +305,13 @@ class NotificationEngine:
     # ------------------------------------------------------------------
     # Progress celebrations
     # ------------------------------------------------------------------
-    async def check_celebrations(
-        self, session: AsyncSession, user_id: str
-    ) -> list[dict[str, Any]]:
+    async def check_celebrations(self, session: AsyncSession, user_id: str) -> list[dict[str, Any]]:
         """Detect celebration-worthy events for a user."""
         celebrations: list[dict[str, Any]] = []
 
         # Check streak milestones
         activity_result = await session.execute(
-            select(UserActivityTracking).where(
-                UserActivityTracking.user_id == user_id
-            )
+            select(UserActivityTracking).where(UserActivityTracking.user_id == user_id)
         )
         activity = activity_result.scalar_one_or_none()
         if activity and activity.current_streak in STREAK_MILESTONES:

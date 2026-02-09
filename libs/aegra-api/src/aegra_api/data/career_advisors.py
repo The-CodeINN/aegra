@@ -99,14 +99,10 @@ CAREER_ADVISORS: list[dict[str, Any]] = [
 ]
 
 # Create a lookup dict for quick access by track
-ADVISORS_BY_TRACK: dict[str, dict[str, Any]] = {
-    advisor["track"]: advisor for advisor in CAREER_ADVISORS
-}
+ADVISORS_BY_TRACK: dict[str, dict[str, Any]] = {advisor["track"]: advisor for advisor in CAREER_ADVISORS}
 
 # Create a lookup dict for quick access by id
-ADVISORS_BY_ID: dict[str, dict[str, Any]] = {
-    advisor["id"]: advisor for advisor in CAREER_ADVISORS
-}
+ADVISORS_BY_ID: dict[str, dict[str, Any]] = {advisor["id"]: advisor for advisor in CAREER_ADVISORS}
 
 
 def get_all_advisors() -> list[dict[str, Any]]:

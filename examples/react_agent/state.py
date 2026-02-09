@@ -68,9 +68,7 @@ class State(InputState):
     It is set to 'True' when the step count reaches recursion_limit - 1.
     """
 
-    tool_call_counts: Annotated[dict[str, int], merge_tool_counts] = field(
-        default_factory=dict
-    )
+    tool_call_counts: Annotated[dict[str, int], merge_tool_counts] = field(default_factory=dict)
     """
     Tracks the number of times each tool has been called in this run.
 

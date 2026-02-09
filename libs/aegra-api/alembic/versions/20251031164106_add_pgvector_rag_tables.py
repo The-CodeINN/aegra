@@ -45,12 +45,8 @@ def upgrade() -> None:
     )
     op.create_index("idx_course_chunks_course_id", "course_chunks", ["course_id"])
     op.create_index("idx_course_chunks_content_type", "course_chunks", ["content_type"])
-    op.create_index(
-        "idx_course_chunks_level", "course_chunks", ["course_id", "level_title"]
-    )
-    op.create_index(
-        "idx_course_chunks_chunk_id", "course_chunks", ["chunk_id"], unique=True
-    )
+    op.create_index("idx_course_chunks_level", "course_chunks", ["course_id", "level_title"])
+    op.create_index("idx_course_chunks_chunk_id", "course_chunks", ["chunk_id"], unique=True)
 
     # Create HNSW index for vector similarity search
     op.execute(
@@ -74,9 +70,7 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(
-        "idx_indexing_status_course_id", "indexing_status", ["course_id"], unique=True
-    )
+    op.create_index("idx_indexing_status_course_id", "indexing_status", ["course_id"], unique=True)
 
 
 def downgrade() -> None:

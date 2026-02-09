@@ -35,14 +35,10 @@ class OpportunityService:
         base_filter = [DiscoveredOpportunity.user_id == user_id]
 
         if opportunity_type:
-            base_filter.append(
-                DiscoveredOpportunity.opportunity_type == opportunity_type
-            )
+            base_filter.append(DiscoveredOpportunity.opportunity_type == opportunity_type)
 
         if status == "new":
-            base_filter.append(
-                DiscoveredOpportunity.status.in_(["new", "notified"])
-            )
+            base_filter.append(DiscoveredOpportunity.status.in_(["new", "notified"]))
         elif status == "saved":
             base_filter.append(DiscoveredOpportunity.status == "saved")
         elif status:
@@ -72,9 +68,7 @@ class OpportunityService:
         return opportunities, total, has_more
 
     @staticmethod
-    async def get_opportunity(
-        session: AsyncSession, opportunity_id: str, user_id: str
-    ) -> DiscoveredOpportunity | None:
+    async def get_opportunity(session: AsyncSession, opportunity_id: str, user_id: str) -> DiscoveredOpportunity | None:
         result = await session.execute(
             select(DiscoveredOpportunity).where(
                 DiscoveredOpportunity.id == opportunity_id,
@@ -88,9 +82,7 @@ class OpportunityService:
         session: AsyncSession, opportunity_id: str, user_id: str
     ) -> dict[str, Any] | None:
         """Return opportunity data including embedded AI strategy from metadata."""
-        opp = await OpportunityService.get_opportunity(
-            session, opportunity_id, user_id
-        )
+        opp = await OpportunityService.get_opportunity(session, opportunity_id, user_id)
         if not opp:
             return None
 
@@ -142,57 +134,35 @@ class OpportunityService:
         return {"status": status}
 
     @staticmethod
-    async def dismiss_opportunity(
-        session: AsyncSession, opportunity_id: str, user_id: str
-    ) -> dict[str, Any]:
-        return await OpportunityService.update_opportunity_status(
-            session, opportunity_id, user_id, "dismissed"
-        )
+    async def dismiss_opportunity(session: AsyncSession, opportunity_id: str, user_id: str) -> dict[str, Any]:
+        return await OpportunityService.update_opportunity_status(session, opportunity_id, user_id, "dismissed")
 
     @staticmethod
-    async def mark_opportunity_applied(
-        session: AsyncSession, opportunity_id: str, user_id: str
-    ) -> dict[str, Any]:
-        return await OpportunityService.update_opportunity_status(
-            session, opportunity_id, user_id, "applied"
-        )
+    async def mark_opportunity_applied(session: AsyncSession, opportunity_id: str, user_id: str) -> dict[str, Any]:
+        return await OpportunityService.update_opportunity_status(session, opportunity_id, user_id, "applied")
 
     @staticmethod
-    async def save_opportunity(
-        session: AsyncSession, opportunity_id: str, user_id: str
-    ) -> dict[str, Any]:
+    async def save_opportunity(session: AsyncSession, opportunity_id: str, user_id: str) -> dict[str, Any]:
         """Bookmark / save an opportunity for later."""
-        return await OpportunityService.update_opportunity_status(
-            session, opportunity_id, user_id, "saved"
-        )
+        return await OpportunityService.update_opportunity_status(session, opportunity_id, user_id, "saved")
 
     # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
     @staticmethod
-    async def get_stats(
-        session: AsyncSession, user_id: str
-    ) -> dict[str, Any]:
+    async def get_stats(session: AsyncSession, user_id: str) -> dict[str, Any]:
         """Return aggregated opportunity stats for the user."""
         base = [DiscoveredOpportunity.user_id == user_id]
 
         async def _count(*extra_filters):
-            q = select(func.count(DiscoveredOpportunity.id)).where(
-                *base, *extra_filters
-            )
+            q = select(func.count(DiscoveredOpportunity.id)).where(*base, *extra_filters)
             return (await session.execute(q)).scalar() or 0
 
         return {
             "total": await _count(),
-            "events": await _count(
-                DiscoveredOpportunity.opportunity_type == "event"
-            ),
-            "jobs": await _count(
-                DiscoveredOpportunity.opportunity_type == "job"
-            ),
-            "learning": await _count(
-                DiscoveredOpportunity.opportunity_type == "learning"
-            ),
+            "events": await _count(DiscoveredOpportunity.opportunity_type == "event"),
+            "jobs": await _count(DiscoveredOpportunity.opportunity_type == "job"),
+            "learning": await _count(DiscoveredOpportunity.opportunity_type == "learning"),
             "saved": await _count(DiscoveredOpportunity.status == "saved"),
             "applied": await _count(DiscoveredOpportunity.status == "applied"),
             "dismissed": await _count(DiscoveredOpportunity.status == "dismissed"),

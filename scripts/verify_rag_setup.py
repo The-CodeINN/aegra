@@ -76,9 +76,7 @@ def check_database_connection():
 
         # Convert asyncpg to psycopg if needed
         if "asyncpg" in database_url:
-            database_url = database_url.replace(
-                "postgresql+asyncpg://", "postgresql+psycopg://"
-            )
+            database_url = database_url.replace("postgresql+asyncpg://", "postgresql+psycopg://")
 
         engine = create_engine(database_url)
 
@@ -90,9 +88,7 @@ def check_database_connection():
             print(f"     {version[:50]}...")
 
             # Check pgvector extension
-            result = conn.execute(
-                text("SELECT * FROM pg_extension WHERE extname = 'vector'")
-            )
+            result = conn.execute(text("SELECT * FROM pg_extension WHERE extname = 'vector'"))
             if result.fetchone():
                 print("  ✅ pgvector extension enabled")
             else:

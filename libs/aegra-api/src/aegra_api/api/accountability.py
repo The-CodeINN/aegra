@@ -31,6 +31,7 @@ router = APIRouter(tags=["Accountability"])
 
 # ── Pydantic models ──────────────────────────────────────────────────
 
+
 class ActionItemResponse(BaseModel):
     id: str
     description: str
@@ -96,6 +97,7 @@ class ActivityRequest(BaseModel):
 
 # ── Action Items ─────────────────────────────────────────────────────
 
+
 @router.get("/action-items", response_model=list[ActionItemResponse])
 async def list_action_items(
     session: AsyncSession = Depends(get_session),
@@ -113,14 +115,13 @@ async def update_action_item(
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     try:
-        return await AccountabilityService.update_action_item_status(
-            session, item_id, user.identity, status
-        )
+        return await AccountabilityService.update_action_item_status(session, item_id, user.identity, status)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
 
 # ── Notifications ────────────────────────────────────────────────────
+
 
 @router.get("/notifications", response_model=list[NotificationResponse])
 async def list_notifications(
@@ -143,9 +144,7 @@ async def list_all_notifications(
     user: User = Depends(get_current_user),
 ) -> Any:
     """List all notifications (pending + read) for notification center."""
-    items = await AccountabilityService.list_all_notifications(
-        session, user.identity, limit
-    )
+    items = await AccountabilityService.list_all_notifications(session, user.identity, limit)
     return [NotificationResponse.from_orm_model(n) for n in items]
 
 
@@ -156,9 +155,7 @@ async def mark_notification_read(
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     try:
-        return await AccountabilityService.mark_notification_read(
-            session, notification_id, user.identity
-        )
+        return await AccountabilityService.mark_notification_read(session, notification_id, user.identity)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
@@ -170,9 +167,7 @@ async def dismiss_notification(
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     try:
-        return await AccountabilityService.dismiss_notification(
-            session, notification_id, user.identity
-        )
+        return await AccountabilityService.dismiss_notification(session, notification_id, user.identity)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
@@ -186,6 +181,7 @@ async def mark_all_read(
 
 
 # ── Preferences ──────────────────────────────────────────────────────
+
 
 @router.get("/preferences")
 async def get_preferences(
@@ -214,9 +210,7 @@ async def update_preferences(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    prefs = await AccountabilityService.upsert_preferences(
-        session, user.identity, body.model_dump(exclude_none=True)
-    )
+    prefs = await AccountabilityService.upsert_preferences(session, user.identity, body.model_dump(exclude_none=True))
     return {
         "user_id": prefs.user_id,
         "notifications_enabled": prefs.notifications_enabled,
@@ -227,15 +221,14 @@ async def update_preferences(
 
 # ── Activity tracking ────────────────────────────────────────────────
 
+
 @router.post("/activity")
 async def record_activity(
     body: ActivityRequest,
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> dict[str, str]:
-    await AccountabilityService.record_activity(
-        session, user.identity, body.activity_type
-    )
+    await AccountabilityService.record_activity(session, user.identity, body.activity_type)
     return {"status": "recorded"}
 
 
@@ -256,19 +249,9 @@ async def get_activity_stats(
         "longest_streak": activity.longest_streak,
         "engagement_score": float(activity.engagement_score),
         "last_login": activity.last_login.isoformat() if activity.last_login else None,
-        "last_conversation": (
-            activity.last_conversation.isoformat()
-            if activity.last_conversation
-            else None
-        ),
-        "last_course_activity": (
-            activity.last_course_activity.isoformat()
-            if activity.last_course_activity
-            else None
-        ),
+        "last_conversation": (activity.last_conversation.isoformat() if activity.last_conversation else None),
+        "last_course_activity": (activity.last_course_activity.isoformat() if activity.last_course_activity else None),
         "last_action_completed": (
-            activity.last_action_completed.isoformat()
-            if activity.last_action_completed
-            else None
+            activity.last_action_completed.isoformat() if activity.last_action_completed else None
         ),
     }

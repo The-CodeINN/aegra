@@ -26,9 +26,7 @@ def require_admin_role(user: User = Depends(get_current_user)) -> User:
     Raises 403 Forbidden if user doesn't have required role.
     """
     user_role = getattr(user, "role", None) or (
-        getattr(user, "permissions", [])[0]
-        if getattr(user, "permissions", None)
-        else None
+        getattr(user, "permissions", [])[0] if getattr(user, "permissions", None) else None
     )
 
     if user_role not in ["admin", "superadmin"]:

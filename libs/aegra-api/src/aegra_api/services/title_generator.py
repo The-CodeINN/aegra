@@ -53,9 +53,7 @@ def extract_first_user_message(input_data: dict[str, Any]) -> str | None:
     return None
 
 
-async def generate_thread_title(
-    user_message: str, model_name: str | None = None
-) -> str:
+async def generate_thread_title(user_message: str, model_name: str | None = None) -> str:
     """Generate a concise title for a thread based on the user's first message.
 
     Args:
@@ -111,9 +109,7 @@ Examples:
         if len(title) > 50:
             title = title[:47] + "..."
 
-        logger.info(
-            "Generated thread title", title=title, message_preview=user_message[:100]
-        )
+        logger.info("Generated thread title", title=title, message_preview=user_message[:100])
         return title
 
     except Exception as e:

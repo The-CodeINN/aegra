@@ -28,9 +28,7 @@ def require_admin_role(user: User = Depends(get_current_user)) -> User:
     Raises 403 Forbidden if user doesn't have required role.
     """
     user_role = getattr(user, "role", None) or (
-        getattr(user, "permissions", [])[0]
-        if getattr(user, "permissions", None)
-        else None
+        getattr(user, "permissions", [])[0] if getattr(user, "permissions", None) else None
     )
 
     if user_role not in ["admin", "superadmin"]:
@@ -105,9 +103,9 @@ async def get_dashboard_overview(
     total_users = len(all_user_ids)
 
     # Count active users (users with activities, excluding pings)
-    active_users_query = select(
-        func.count(func.distinct(ActivityLogORM.user_id))
-    ).where(ActivityLogORM.action_type != "ping")
+    active_users_query = select(func.count(func.distinct(ActivityLogORM.user_id))).where(
+        ActivityLogORM.action_type != "ping"
+    )
     if conditions:
         active_users_query = active_users_query.where(and_(*conditions))
     active_users = await session.scalar(active_users_query) or 0
@@ -122,17 +120,13 @@ async def get_dashboard_overview(
     total_runs = await session.scalar(total_runs_query) or 0
 
     # Count completed runs
-    completed_runs_query = select(func.count(RunORM.run_id)).where(
-        RunORM.status == "completed"
-    )
+    completed_runs_query = select(func.count(RunORM.run_id)).where(RunORM.status == "completed")
     if run_conditions:
         completed_runs_query = completed_runs_query.where(and_(*run_conditions))
     completed_runs = await session.scalar(completed_runs_query) or 0
 
     # Count failed runs
-    failed_runs_query = select(func.count(RunORM.run_id)).where(
-        RunORM.status == "failed"
-    )
+    failed_runs_query = select(func.count(RunORM.run_id)).where(RunORM.status == "failed")
     if run_conditions:
         failed_runs_query = failed_runs_query.where(and_(*run_conditions))
     failed_runs = await session.scalar(failed_runs_query) or 0
@@ -169,9 +163,7 @@ async def get_dashboard_overview(
         action_query = action_query.where(and_(*conditions))
 
     action_results = await session.execute(action_query)
-    common_actions = [
-        {"action": action, "count": count} for action, count in action_results
-    ]
+    common_actions = [{"action": action, "count": count} for action, count in action_results]
 
     time_period = {
         "start": start_date.isoformat() if start_date else None,
@@ -240,9 +232,7 @@ async def get_user_statistics(
         user_query = user_query.where(and_(*conditions))
 
     user_results = await session.execute(user_query)
-    top_users_from_logs = [
-        {"user_id": user_id, "activity_count": count} for user_id, count in user_results
-    ]
+    top_users_from_logs = [{"user_id": user_id, "activity_count": count} for user_id, count in user_results]
 
     # Get top users by runs (legacy runs before activity logging)
     run_user_query = (
@@ -275,9 +265,7 @@ async def get_user_statistics(
     # Sort and take top N
     top_users = [
         {"user_id": user_id, "activity_count": count}
-        for user_id, count in sorted(
-            top_users_dict.items(), key=lambda x: x[1], reverse=True
-        )[:limit]
+        for user_id, count in sorted(top_users_dict.items(), key=lambda x: x[1], reverse=True)[:limit]
     ]
 
     # Get total unique users from both sources
@@ -298,9 +286,7 @@ async def get_user_statistics(
     return {"top_users": top_users, "total_unique_users": total_users}
 
 
-@router.get(
-    "/dashboard/run-metrics", description="Get run execution metrics (Admin only)"
-)
+@router.get("/dashboard/run-metrics", description="Get run execution metrics (Admin only)")
 async def get_run_metrics(
     start_date: datetime | None = Query(None, description="Filter by start date"),
     end_date: datetime | None = Query(None, description="Filter by end date"),
@@ -353,10 +339,7 @@ async def get_run_metrics(
         assistant_query = assistant_query.where(and_(*conditions))
 
     assistant_results = await session.execute(assistant_query)
-    runs_by_assistant = [
-        {"assistant_id": asst_id or "unknown", "count": count}
-        for asst_id, count in assistant_results
-    ]
+    runs_by_assistant = [{"assistant_id": asst_id or "unknown", "count": count} for asst_id, count in assistant_results]
 
     # Average runs per user
     users_query = select(func.count(func.distinct(RunORM.user_id)))
@@ -380,9 +363,7 @@ async def get_run_metrics(
     }
 
 
-@router.get(
-    "/dashboard/daily-metrics", description="Get daily activity metrics (Admin only)"
-)
+@router.get("/dashboard/daily-metrics", description="Get daily activity metrics (Admin only)")
 async def get_daily_metrics(
     days: int = Query(7, ge=1, le=90, description="Number of days to include"),
     session: AsyncSession = Depends(get_session),
@@ -450,9 +431,7 @@ async def get_daily_metrics(
     }
 
 
-@router.get(
-    "/dashboard/assistant-usage", description="Get assistant usage metrics (Admin only)"
-)
+@router.get("/dashboard/assistant-usage", description="Get assistant usage metrics (Admin only)")
 async def get_assistant_usage(
     start_date: datetime | None = Query(None, description="Filter by start date"),
     end_date: datetime | None = Query(None, description="Filter by end date"),

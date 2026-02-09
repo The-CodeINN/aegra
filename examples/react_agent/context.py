@@ -31,9 +31,7 @@ class Context:
 
     learning_track: str | None = field(
         default=None,
-        metadata={
-            "description": "The student's current learning track (e.g., 'data-analytics', 'data-science')."
-        },
+        metadata={"description": "The student's current learning track (e.g., 'data-analytics', 'data-science')."},
     )
 
     model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
@@ -68,23 +66,17 @@ class Context:
 
     user_token: str | None = field(
         default=None,
-        metadata={
-            "description": "JWT access token for authenticating with external LMS API."
-        },
+        metadata={"description": "JWT access token for authenticating with external LMS API."},
     )
 
     user_id: str | None = field(
         default=None,
-        metadata={
-            "description": "User ID extracted from JWT token for memory namespacing."
-        },
+        metadata={"description": "User ID extracted from JWT token for memory namespacing."},
     )
 
     lms_api_url: str = field(
         default="https://dedatahub-api.vercel.app",
-        metadata={
-            "description": "Base URL for the LMS API to fetch student information."
-        },
+        metadata={"description": "Base URL for the LMS API to fetch student information."},
     )
 
     brave_search_api_key: str | None = field(

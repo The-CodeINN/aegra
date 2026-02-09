@@ -55,9 +55,7 @@ class WebPushService:
 
         subscription_info should contain: endpoint, keys.p256dh, keys.auth
         """
-        result = await session.execute(
-            select(UserPreferences).where(UserPreferences.user_id == user_id)
-        )
+        result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
         prefs = result.scalar_one_or_none()
 
         if not prefs:
@@ -73,13 +71,9 @@ class WebPushService:
             endpoint=subscription_info.get("endpoint", "")[:60],
         )
 
-    async def remove_subscription(
-        self, session: AsyncSession, user_id: str
-    ) -> None:
+    async def remove_subscription(self, session: AsyncSession, user_id: str) -> None:
         """Remove push subscription for a user."""
-        result = await session.execute(
-            select(UserPreferences).where(UserPreferences.user_id == user_id)
-        )
+        result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
         prefs = result.scalar_one_or_none()
         if prefs:
             prefs.push_subscription = None
@@ -87,14 +81,10 @@ class WebPushService:
 
         logger.info("push_subscription_removed", user_id=user_id)
 
-    async def get_subscription(
-        self, session: AsyncSession, user_id: str
-    ) -> dict[str, Any] | None:
+    async def get_subscription(self, session: AsyncSession, user_id: str) -> dict[str, Any] | None:
         """Get the stored push subscription for a user."""
         result = await session.execute(
-            select(UserPreferences.push_subscription).where(
-                UserPreferences.user_id == user_id
-            )
+            select(UserPreferences.push_subscription).where(UserPreferences.user_id == user_id)
         )
         return result.scalar_one_or_none()
 

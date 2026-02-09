@@ -40,9 +40,7 @@ try:
     logger.info("RAG course search module loaded successfully")
 except ImportError as e:
     RAG_AVAILABLE = False
-    logger.warning(
-        f"RAG CourseRetriever not available: {e}. Course search will be disabled."
-    )
+    logger.warning(f"RAG CourseRetriever not available: {e}. Course search will be disabled.")
 
 
 async def brave_search(query: str) -> str:
@@ -228,9 +226,7 @@ async def get_student_profile() -> dict[str, Any]:
                 "onboardingSkipped": data.get("onboardingSkipped"),
             }
 
-            logger.info(
-                f"Successfully fetched profile for student: {profile.get('name')}"
-            )
+            logger.info(f"Successfully fetched profile for student: {profile.get('name')}")
             return profile
 
     except httpx.HTTPStatusError as e:
@@ -303,15 +299,11 @@ async def get_student_onboarding() -> dict[str, Any]:
                 "completedSteps": onboarding_data.get("completedSteps", []),
             }
 
-            logger.info(
-                f"Successfully fetched onboarding for learning track: {onboarding.get('learningTrack')}"
-            )
+            logger.info(f"Successfully fetched onboarding for learning track: {onboarding.get('learningTrack')}")
             return onboarding
 
     except httpx.HTTPStatusError as e:
-        logger.error(
-            f"HTTP error fetching student onboarding: {e.response.status_code}"
-        )
+        logger.error(f"HTTP error fetching student onboarding: {e.response.status_code}")
         return {
             "error": "API request failed",
             "status_code": e.response.status_code,
@@ -324,9 +316,7 @@ async def get_student_onboarding() -> dict[str, Any]:
             "message": "The LMS API took too long to respond",
         }
     except Exception as e:
-        logger.error(
-            f"Unexpected error fetching student onboarding: {e}", exc_info=True
-        )
+        logger.error(f"Unexpected error fetching student onboarding: {e}", exc_info=True)
         return {"error": "Unexpected error", "message": str(e)}
 
 
@@ -362,9 +352,7 @@ async def get_student_ai_career_advisor_onboarding() -> dict[str, Any]:
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            logger.info(
-                f"Fetching AI career advisor onboarding from {career_advisor_endpoint}"
-            )
+            logger.info(f"Fetching AI career advisor onboarding from {career_advisor_endpoint}")
 
             response = await client.get(
                 career_advisor_endpoint,
@@ -399,9 +387,7 @@ async def get_student_ai_career_advisor_onboarding() -> dict[str, Any]:
             return career_advisor_onboarding
 
     except httpx.HTTPStatusError as e:
-        logger.error(
-            f"HTTP error fetching AI career advisor onboarding: {e.response.status_code}"
-        )
+        logger.error(f"HTTP error fetching AI career advisor onboarding: {e.response.status_code}")
         return {
             "error": "API request failed",
             "status_code": e.response.status_code,
