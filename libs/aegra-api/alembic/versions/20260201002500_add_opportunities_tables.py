@@ -31,9 +31,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("user_id", sa.Text(), nullable=False),
-        sa.Column(
-            "opportunity_type", sa.Text(), nullable=False
-        ),  # 'event' or 'job'
+        sa.Column("opportunity_type", sa.Text(), nullable=False),  # 'event' or 'job'
         sa.Column("title", sa.Text(), nullable=False),
         sa.Column("description", sa.Text(), nullable=True),
         sa.Column("url", sa.Text(), nullable=True),
@@ -41,9 +39,7 @@ def upgrade() -> None:
         sa.Column("event_date", sa.TIMESTAMP(timezone=True), nullable=True),
         sa.Column("company", sa.Text(), nullable=True),
         sa.Column("salary_range", sa.Text(), nullable=True),
-        sa.Column(
-            "match_score", sa.Numeric(precision=3, scale=2), nullable=True
-        ),  # 0.00 - 1.00
+        sa.Column("match_score", sa.Numeric(precision=3, scale=2), nullable=True),  # 0.00 - 1.00
         sa.Column("matched_track", sa.Text(), nullable=True),  # Track that triggered match
         sa.Column(
             "status",
@@ -66,9 +62,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(
-        "idx_opportunities_user", "discovered_opportunities", ["user_id"], unique=False
-    )
+    op.create_index("idx_opportunities_user", "discovered_opportunities", ["user_id"], unique=False)
     op.create_index(
         "idx_opportunities_status",
         "discovered_opportunities",
@@ -98,12 +92,8 @@ def upgrade() -> None:
         sa.Column("last_conversation", sa.TIMESTAMP(timezone=True), nullable=True),
         sa.Column("last_course_activity", sa.TIMESTAMP(timezone=True), nullable=True),
         sa.Column("last_action_completed", sa.TIMESTAMP(timezone=True), nullable=True),
-        sa.Column(
-            "current_streak", sa.Integer(), server_default=sa.text("0"), nullable=False
-        ),
-        sa.Column(
-            "longest_streak", sa.Integer(), server_default=sa.text("0"), nullable=False
-        ),
+        sa.Column("current_streak", sa.Integer(), server_default=sa.text("0"), nullable=False),
+        sa.Column("longest_streak", sa.Integer(), server_default=sa.text("0"), nullable=False),
         sa.Column("last_streak_date", sa.Date(), nullable=True),
         sa.Column(
             "engagement_score",

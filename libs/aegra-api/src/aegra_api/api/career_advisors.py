@@ -88,9 +88,7 @@ async def get_my_career_advisor(
         token = authorization.split("Bearer ", 1)[1]
         advisor, learning_track = await get_cached_advisor(user.identity, token)
 
-        track_display = (
-            learning_track.replace("-", " ").title() if learning_track else None
-        )
+        track_display = learning_track.replace("-", " ").title() if learning_track else None
         message = (
             f"Your career advisor is {advisor['name']}, specialized in {track_display}."
             if learning_track

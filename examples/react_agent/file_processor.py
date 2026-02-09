@@ -16,9 +16,7 @@ MAX_CONTENT_LENGTH = 50000  # ~50KB of text
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB max file size for processing
 
 
-def extract_text_from_base64(
-    data: str, mime_type: str, filename: str = "unknown"
-) -> str:
+def extract_text_from_base64(data: str, mime_type: str, filename: str = "unknown") -> str:
     """Extract text content from base64-encoded files.
 
     Args:
@@ -46,9 +44,7 @@ def extract_text_from_base64(
         ]:
             text = decoded.decode("utf-8", errors="replace")
             return text[:MAX_CONTENT_LENGTH] + (
-                "\n\n[...content truncated for length...]"
-                if len(text) > MAX_CONTENT_LENGTH
-                else ""
+                "\n\n[...content truncated for length...]" if len(text) > MAX_CONTENT_LENGTH else ""
             )
 
         # CSV files
@@ -59,9 +55,7 @@ def extract_text_from_base64(
             reader = csv.reader(text_io)
             rows = list(reader)
             content = "\n".join([", ".join(row) for row in rows[:100]])  # Limit rows
-            return content[:MAX_CONTENT_LENGTH] + (
-                "\n\n[...rows truncated...]" if len(rows) > 100 else ""
-            )
+            return content[:MAX_CONTENT_LENGTH] + ("\n\n[...rows truncated...]" if len(rows) > 100 else "")
 
         # PDF files
         if mime_type == "application/pdf":
@@ -78,9 +72,7 @@ def extract_text_from_base64(
                     if text:
                         text_parts.append(f"--- Page {page_num + 1} ---\n{text}")
 
-                full_text = (
-                    "\n\n".join(text_parts) if text_parts else "[No text found in PDF]"
-                )
+                full_text = "\n\n".join(text_parts) if text_parts else "[No text found in PDF]"
                 truncated = full_text[:MAX_CONTENT_LENGTH]
                 suffix = ""
                 if len(full_text) > MAX_CONTENT_LENGTH:
@@ -96,10 +88,7 @@ def extract_text_from_base64(
                 return f"[Error extracting PDF content: {str(e)}]"
 
         # DOCX files
-        if (
-            mime_type
-            == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        ):
+        if mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             try:
                 from docx import Document
 
@@ -123,10 +112,7 @@ def extract_text_from_base64(
                 return f"[Error extracting DOCX content: {str(e)}]"
 
         # XLSX files
-        if (
-            mime_type
-            == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ):
+        if mime_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
             try:
                 import openpyxl
 
@@ -138,23 +124,13 @@ def extract_text_from_base64(
                     rows = []
                     for row_num, row in enumerate(ws.iter_rows(values_only=True), 1):
                         if row_num > 50:  # Limit to 50 rows per sheet
-                            rows.append(
-                                f"[...{ws.max_row - 50} more rows not shown...]"
-                            )
+                            rows.append(f"[...{ws.max_row - 50} more rows not shown...]")
                             break
-                        rows.append(
-                            ", ".join(
-                                [str(cell) if cell is not None else "" for cell in row]
-                            )
-                        )
-                    sheets_content.append(
-                        f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows)
-                    )
+                        rows.append(", ".join([str(cell) if cell is not None else "" for cell in row]))
+                    sheets_content.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows))
                 full_text = "\n\n".join(sheets_content)
                 return full_text[:MAX_CONTENT_LENGTH] + (
-                    "\n\n[...content truncated for length...]"
-                    if len(full_text) > MAX_CONTENT_LENGTH
-                    else ""
+                    "\n\n[...content truncated for length...]" if len(full_text) > MAX_CONTENT_LENGTH else ""
                 )
             except ImportError:
                 logger.warning("openpyxl not installed, cannot extract XLSX content")

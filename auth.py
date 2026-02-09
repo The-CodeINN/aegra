@@ -37,9 +37,7 @@ if AUTH_TYPE == "noop":
         }
 
     @auth.on
-    async def authorize(
-        ctx: Auth.types.AuthContext, value: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def authorize(ctx: Auth.types.AuthContext, value: dict[str, Any]) -> dict[str, Any]:
         """No-op authorization that allows access to all resources."""
         _ = ctx, value  # Suppress unused warnings
         return {}  # Empty filter = no access restrictions
@@ -53,9 +51,7 @@ elif AUTH_TYPE == "custom":
     # Get JWT secret from settings
     JWT_SECRET = settings.app.LMS_JWT_SECRET
     if not JWT_SECRET:
-        raise ValueError(
-            "LMS_JWT_SECRET environment variable is required for custom auth"
-        )
+        raise ValueError("LMS_JWT_SECRET environment variable is required for custom auth")
 
     @auth.authenticate
     async def authenticate(headers: dict[str, str]) -> Auth.types.MinimalUserDict:
@@ -79,9 +75,7 @@ elif AUTH_TYPE == "custom":
 
         if not authorization:
             logger.warning("Missing Authorization header")
-            raise Auth.exceptions.HTTPException(
-                status_code=401, detail="Authorization header required"
-            )
+            raise Auth.exceptions.HTTPException(status_code=401, detail="Authorization header required")
 
         # Extract token from Bearer format
         if not authorization.startswith("Bearer "):
@@ -103,9 +97,7 @@ elif AUTH_TYPE == "custom":
             role = payload.get("role")
 
             if not user_id:
-                raise Auth.exceptions.HTTPException(
-                    status_code=401, detail="Invalid token: missing user ID"
-                )
+                raise Auth.exceptions.HTTPException(status_code=401, detail="Invalid token: missing user ID")
 
             logger.info(f"Successfully authenticated user: {user_id} ({email})")
 
@@ -120,24 +112,16 @@ elif AUTH_TYPE == "custom":
 
         except ExpiredSignatureError:
             logger.warning("Token has expired")
-            raise Auth.exceptions.HTTPException(
-                status_code=401, detail="Token has expired"
-            ) from None
+            raise Auth.exceptions.HTTPException(status_code=401, detail="Token has expired") from None
         except InvalidTokenError as e:
             logger.warning(f"Invalid token: {e}")
-            raise Auth.exceptions.HTTPException(
-                status_code=401, detail="Invalid authentication token"
-            ) from e
+            raise Auth.exceptions.HTTPException(status_code=401, detail="Invalid authentication token") from e
         except Exception as e:
             logger.error(f"Token validation error: {e}", exc_info=True)
-            raise Auth.exceptions.HTTPException(
-                status_code=401, detail="Authentication failed"
-            ) from e
+            raise Auth.exceptions.HTTPException(status_code=401, detail="Authentication failed") from e
 
     @auth.on
-    async def authorize(
-        ctx: Auth.types.AuthContext, value: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def authorize(ctx: Auth.types.AuthContext, value: dict[str, Any]) -> dict[str, Any]:
         """
         Multi-tenant authorization with user-scoped access control.
         """
@@ -147,9 +131,7 @@ elif AUTH_TYPE == "custom":
 
             if not user_id:
                 logger.error("Missing user identity in auth context")
-                raise Auth.exceptions.HTTPException(
-                    status_code=401, detail="Invalid user identity"
-                )
+                raise Auth.exceptions.HTTPException(status_code=401, detail="Invalid user identity")
 
             # Create owner filter for resource access control
             owner_filter = {"owner": user_id}
@@ -165,11 +147,7 @@ elif AUTH_TYPE == "custom":
             raise
         except Exception as e:
             logger.error(f"Authorization error: {e}", exc_info=True)
-            raise Auth.exceptions.HTTPException(
-                status_code=500, detail="Authorization system error"
-            ) from e
+            raise Auth.exceptions.HTTPException(status_code=500, detail="Authorization system error") from e
 
 else:
-    raise ValueError(
-        f"Unknown AUTH_TYPE: {AUTH_TYPE}. Supported values: 'noop', 'custom'"
-    )
+    raise ValueError(f"Unknown AUTH_TYPE: {AUTH_TYPE}. Supported values: 'noop', 'custom'")

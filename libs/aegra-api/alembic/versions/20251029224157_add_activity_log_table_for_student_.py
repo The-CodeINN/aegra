@@ -59,18 +59,10 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("activity_id"),
     )
-    op.create_index(
-        "idx_activity_log_action_type", "activity_log", ["action_type"], unique=False
-    )
-    op.create_index(
-        "idx_activity_log_assistant", "activity_log", ["assistant_id"], unique=False
-    )
-    op.create_index(
-        "idx_activity_log_created", "activity_log", ["created_at"], unique=False
-    )
-    op.create_index(
-        "idx_activity_log_thread", "activity_log", ["thread_id"], unique=False
-    )
+    op.create_index("idx_activity_log_action_type", "activity_log", ["action_type"], unique=False)
+    op.create_index("idx_activity_log_assistant", "activity_log", ["assistant_id"], unique=False)
+    op.create_index("idx_activity_log_created", "activity_log", ["created_at"], unique=False)
+    op.create_index("idx_activity_log_thread", "activity_log", ["thread_id"], unique=False)
     op.create_index("idx_activity_log_user", "activity_log", ["user_id"], unique=False)
     op.create_index(
         "idx_activity_log_user_created",
@@ -229,9 +221,7 @@ def downgrade() -> None:
             nullable=False,
         ),
         sa.Column("checkpoint_id", sa.TEXT(), autoincrement=False, nullable=False),
-        sa.Column(
-            "parent_checkpoint_id", sa.TEXT(), autoincrement=False, nullable=True
-        ),
+        sa.Column("parent_checkpoint_id", sa.TEXT(), autoincrement=False, nullable=True),
         sa.Column("type", sa.TEXT(), autoincrement=False, nullable=True),
         sa.Column(
             "checkpoint",
@@ -246,13 +236,9 @@ def downgrade() -> None:
             autoincrement=False,
             nullable=False,
         ),
-        sa.PrimaryKeyConstraint(
-            "thread_id", "checkpoint_ns", "checkpoint_id", name=op.f("checkpoints_pkey")
-        ),
+        sa.PrimaryKeyConstraint("thread_id", "checkpoint_ns", "checkpoint_id", name=op.f("checkpoints_pkey")),
     )
-    op.create_index(
-        op.f("checkpoints_thread_id_idx"), "checkpoints", ["thread_id"], unique=False
-    )
+    op.create_index(op.f("checkpoints_thread_id_idx"), "checkpoints", ["thread_id"], unique=False)
     op.drop_index("idx_activity_log_user_created", table_name="activity_log")
     op.drop_index("idx_activity_log_user", table_name="activity_log")
     op.drop_index("idx_activity_log_thread", table_name="activity_log")

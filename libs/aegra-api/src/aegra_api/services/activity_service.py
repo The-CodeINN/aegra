@@ -102,9 +102,7 @@ class ActivityService:
             query = query.where(ActivityLogORM.created_at <= end_date)
 
         # Get total count
-        count_query = select(func.count(ActivityLogORM.activity_id)).where(
-            ActivityLogORM.user_id == user_id
-        )
+        count_query = select(func.count(ActivityLogORM.activity_id)).where(ActivityLogORM.user_id == user_id)
 
         if action_type:
             count_query = count_query.where(ActivityLogORM.action_type == action_type)
@@ -116,9 +114,7 @@ class ActivityService:
         total = await session.scalar(count_query)
 
         # Get paginated results
-        query = (
-            query.order_by(desc(ActivityLogORM.created_at)).limit(limit).offset(offset)
-        )
+        query = query.order_by(desc(ActivityLogORM.created_at)).limit(limit).offset(offset)
         activities = await session.scalars(query)
 
         return (
@@ -181,9 +177,7 @@ class ActivityService:
         total = await session.scalar(count_query)
 
         # Get paginated results
-        query = (
-            query.order_by(desc(ActivityLogORM.created_at)).limit(limit).offset(offset)
-        )
+        query = query.order_by(desc(ActivityLogORM.created_at)).limit(limit).offset(offset)
         activities = await session.scalars(query)
 
         return (
@@ -226,20 +220,14 @@ class ActivityService:
 
         for activity in activities_list:
             # Count by action type
-            action_counts[activity.action_type] = (
-                action_counts.get(activity.action_type, 0) + 1
-            )
+            action_counts[activity.action_type] = action_counts.get(activity.action_type, 0) + 1
 
             # Count by status
-            status_counts[activity.action_status] = (
-                status_counts.get(activity.action_status, 0) + 1
-            )
+            status_counts[activity.action_status] = status_counts.get(activity.action_status, 0) + 1
 
             # Count by assistant
             if activity.assistant_id:
-                assistant_counts[activity.assistant_id] = (
-                    assistant_counts.get(activity.assistant_id, 0) + 1
-                )
+                assistant_counts[activity.assistant_id] = assistant_counts.get(activity.assistant_id, 0) + 1
 
         return {
             "total_activities": len(activities_list),

@@ -84,6 +84,7 @@ class DatabaseManager:
 
         # Initialize the session maker for ORM operations
         from .orm import initialize_session_maker
+
         initialize_session_maker()
 
         logger.info("✅ Database and LangGraph components initialized")
@@ -104,6 +105,7 @@ class DatabaseManager:
 
         # Reset the session maker cache
         from .orm import reset_session_maker
+
         reset_session_maker()
 
         logger.info("✅ Database connections closed")

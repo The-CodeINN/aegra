@@ -18,12 +18,8 @@ class ActivityLogCreate(BaseModel):
         description="Type of action (e.g., 'prompt', 'query', 'run_started', 'run_completed', 'run_failed')",
     )
     action_status: str = Field("success", description="Status of the action")
-    details: dict[str, Any] = Field(
-        default_factory=dict, description="Additional details about the action"
-    )
-    metadata_json: dict[str, Any] = Field(
-        default_factory=dict, description="Metadata for the action"
-    )
+    details: dict[str, Any] = Field(default_factory=dict, description="Additional details about the action")
+    metadata_json: dict[str, Any] = Field(default_factory=dict, description="Metadata for the action")
 
 
 class ActivityLog(BaseModel):

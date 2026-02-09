@@ -147,9 +147,7 @@ class ActivityLog(Base):
 
     __tablename__ = "activity_log"
 
-    activity_id: Mapped[str] = mapped_column(
-        Text, primary_key=True, server_default=text("uuid_generate_v4()::text")
-    )
+    activity_id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("uuid_generate_v4()::text"))
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     assistant_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     thread_id: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -161,12 +159,8 @@ class ActivityLog(Base):
         Text, server_default=text("'success'")
     )  # "success", "failed", "interrupted"
     details: Mapped[dict] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
-    metadata_json: Mapped[dict] = mapped_column(
-        "metadata_json", JSONB, server_default=text("'{}'::jsonb")
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), server_default=text("now()")
-    )
+    metadata_json: Mapped[dict] = mapped_column("metadata_json", JSONB, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 
     # Indexes for performance and common queries
     __table_args__ = (
@@ -194,9 +188,7 @@ def _get_session_maker() -> async_sessionmaker[AsyncSession]:
 
         # Ensure database is initialized before getting engine
         if not db_manager.engine:
-            raise RuntimeError(
-                "Database not initialized. Call db_manager.initialize() during app startup."
-            )
+            raise RuntimeError("Database not initialized. Call db_manager.initialize() during app startup.")
         async_session_maker = async_sessionmaker(db_manager.engine, expire_on_commit=False)
     return async_session_maker
 

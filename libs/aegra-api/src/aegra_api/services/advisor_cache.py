@@ -61,9 +61,7 @@ async def _get_from_redis(key: str) -> str | None:
         return None
 
 
-async def _set_in_redis(
-    key: str, value: str, ttl: int = LEARNING_TRACK_CACHE_TTL
-) -> bool:
+async def _set_in_redis(key: str, value: str, ttl: int = LEARNING_TRACK_CACHE_TTL) -> bool:
     """Set value in Redis cache with TTL."""
     if not redis_manager.is_available():
         return False
@@ -114,15 +112,11 @@ async def _fetch_learning_track_from_lms(token: str) -> str | None:
             onboarding_data = data.get("onboarding", {})
             learning_track = cast(str | None, onboarding_data.get("learningTrack"))
 
-            logger.info(
-                "Fetched learning track from LMS", learning_track=learning_track
-            )
+            logger.info("Fetched learning track from LMS", learning_track=learning_track)
             return learning_track
 
     except httpx.HTTPStatusError as e:
-        logger.error(
-            "HTTP error fetching learning track", status_code=e.response.status_code
-        )
+        logger.error("HTTP error fetching learning track", status_code=e.response.status_code)
         return None
     except httpx.TimeoutException:
         logger.error("Timeout while fetching learning track")
@@ -173,9 +167,7 @@ async def get_cached_learning_track(user_id: str, token: str) -> str | None:
     return learning_track
 
 
-async def get_cached_advisor(
-    user_id: str, token: str
-) -> tuple[dict[str, Any], str | None]:
+async def get_cached_advisor(user_id: str, token: str) -> tuple[dict[str, Any], str | None]:
     """Get the student's career advisor, using cache when available.
 
     Args:

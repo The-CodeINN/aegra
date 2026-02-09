@@ -188,11 +188,7 @@ class OpportunityDiscoveryEngine:
                 track_names = []
                 for e in enrollments:
                     course = e.get("course", {})
-                    name = (
-                        course.get("title")
-                        or course.get("track")
-                        or e.get("trackName")
-                    )
+                    name = course.get("title") or course.get("track") or e.get("trackName")
                     track_names.append(name)
 
                 logger.info(
@@ -206,13 +202,9 @@ class OpportunityDiscoveryEngine:
             logger.error("Failed to fetch enrollments", error=str(e), user_id=user_id)
             return []
 
-    async def get_user_location(
-        self, session: AsyncSession, user_id: str
-    ) -> str | None:
+    async def get_user_location(self, session: AsyncSession, user_id: str) -> str | None:
         """Get user's location from user_preferences."""
-        result = await session.execute(
-            select(UserPreferences).where(UserPreferences.user_id == user_id)
-        )
+        result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
         prefs = result.scalar_one_or_none()
         return prefs.location if prefs else None
 
@@ -252,9 +244,7 @@ class OpportunityDiscoveryEngine:
     # ------------------------------------------------------------------
     # Brave Search
     # ------------------------------------------------------------------
-    async def brave_search(
-        self, query: str, freshness: str = "pw", count: int = 5
-    ) -> list[dict[str, Any]]:
+    async def brave_search(self, query: str, freshness: str = "pw", count: int = 5) -> list[dict[str, Any]]:
         """Execute a Brave Search API query.
 
         Args:
@@ -363,9 +353,7 @@ class OpportunityDiscoveryEngine:
                                     {
                                         "title": getattr(item, "title", ""),
                                         "url": getattr(item, "url", ""),
-                                        "description": getattr(
-                                            item, "page_age", ""
-                                        ),
+                                        "description": getattr(item, "page_age", ""),
                                     }
                                 )
 
@@ -385,9 +373,7 @@ class OpportunityDiscoveryEngine:
             # Merge cited descriptions into results
             for r in results:
                 url = r.get("url", "")
-                if url in url_to_desc and len(url_to_desc[url]) > len(
-                    r.get("description", "")
-                ):
+                if url in url_to_desc and len(url_to_desc[url]) > len(r.get("description", "")):
                     r["description"] = url_to_desc[url]
 
             # Deduplicate by URL
@@ -409,9 +395,7 @@ class OpportunityDiscoveryEngine:
                     0,
                 )
                 if hasattr(response.usage, "server_tool_use")
-                else response.usage.__dict__.get("server_tool_use", {}).get(
-                    "web_search_requests", 0
-                ),
+                else response.usage.__dict__.get("server_tool_use", {}).get("web_search_requests", 0),
             )
             return unique
 
@@ -450,9 +434,7 @@ class OpportunityDiscoveryEngine:
             return await self.claude_web_search(query, location=location)
 
         if provider == "both":
-            brave_results = await self.brave_search(
-                query, freshness=freshness, count=count
-            )
+            brave_results = await self.brave_search(query, freshness=freshness, count=count)
             claude_results = await self.claude_web_search(query, location=location)
             # Merge, deduplicate by URL (brave results get priority)
             seen = {r.get("url") for r in brave_results if r.get("url")}
@@ -490,9 +472,7 @@ class OpportunityDiscoveryEngine:
                 return parts[-1].strip()
         return None
 
-    def parse_event_result(
-        self, result: dict[str, Any], track: str, location: str
-    ) -> dict[str, Any] | None:
+    def parse_event_result(self, result: dict[str, Any], track: str, location: str) -> dict[str, Any] | None:
         title = result.get("title", "")
         desc = result.get("description", "")
         url = result.get("url", "")
@@ -511,9 +491,7 @@ class OpportunityDiscoveryEngine:
             "match_score": self._score(result, track),
         }
 
-    def parse_job_result(
-        self, result: dict[str, Any], track: str, location: str
-    ) -> dict[str, Any] | None:
+    def parse_job_result(self, result: dict[str, Any], track: str, location: str) -> dict[str, Any] | None:
         title = result.get("title", "")
         desc = result.get("description", "")
         url = result.get("url", "")
@@ -523,12 +501,7 @@ class OpportunityDiscoveryEngine:
         if not is_linkedin and not any(kw in content for kw in JOB_SIGNALS):
             return None
 
-        clean_title = (
-            title.replace(" | LinkedIn", "")
-            .replace(" | Indeed", "")
-            .replace(" | Glassdoor", "")
-            .strip()
-        )
+        clean_title = title.replace(" | LinkedIn", "").replace(" | Indeed", "").replace(" | Glassdoor", "").strip()
 
         return {
             "opportunity_type": "job",
@@ -541,9 +514,7 @@ class OpportunityDiscoveryEngine:
             "match_score": self._score(result, track),
         }
 
-    def parse_learning_result(
-        self, result: dict[str, Any], track: str
-    ) -> dict[str, Any] | None:
+    def parse_learning_result(self, result: dict[str, Any], track: str) -> dict[str, Any] | None:
         title = result.get("title", "")
         desc = result.get("description", "")
         url = result.get("url", "")
@@ -565,9 +536,7 @@ class OpportunityDiscoveryEngine:
     def _score(self, result: dict[str, Any], track: str) -> Decimal:
         """Deterministic relevance score 0.00–1.00."""
         score = 0.50
-        content = (
-            f"{result.get('title', '')} {result.get('description', '')}".lower()
-        )
+        content = f"{result.get('title', '')} {result.get('description', '')}".lower()
         keywords = self._keywords_for_track(track)
         for kw in keywords:
             if kw.lower() in content:
@@ -577,9 +546,7 @@ class OpportunityDiscoveryEngine:
     # ------------------------------------------------------------------
     # AI enrichment helpers
     # ------------------------------------------------------------------
-    async def generate_networking_strategy(
-        self, opportunity: dict[str, Any], user_track: str
-    ) -> dict[str, Any] | None:
+    async def generate_networking_strategy(self, opportunity: dict[str, Any], user_track: str) -> dict[str, Any] | None:
         """Generate a personalised networking strategy for an event.
 
         Returns a dict with keys: why_relevant, preparation, conversation_starters,
@@ -683,17 +650,13 @@ class OpportunityDiscoveryEngine:
         3. Fallback: all known tracks
         """
         # 1 — Try LMS
-        if auth_token and auth_token != "scheduled_job_token":
+        if auth_token and auth_token != "scheduled_job_token":  # nosec B105
             enrollments = await self.get_user_enrollments(user_id, auth_token)
             if enrollments:
                 tracks = []
                 for e in enrollments:
                     course = e.get("course", {})
-                    name = (
-                        course.get("title")
-                        or course.get("track")
-                        or e.get("trackName", "")
-                    )
+                    name = course.get("title") or course.get("track") or e.get("trackName", "")
                     if name:
                         tracks.append(name)
                 if tracks:
@@ -701,9 +664,7 @@ class OpportunityDiscoveryEngine:
                     return tracks
 
         # 2 — Try preferences JSONB
-        result = await session.execute(
-            select(UserPreferences).where(UserPreferences.user_id == user_id)
-        )
+        result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
         prefs = result.scalar_one_or_none()
         if prefs and prefs.preferences:
             stored = prefs.preferences
@@ -795,9 +756,7 @@ class OpportunityDiscoveryEngine:
                     seen_urls.add(url)
                     parsed = self.parse_event_result(result, track_name, location)
                     if parsed:
-                        strategy = await self.generate_networking_strategy(
-                            parsed, track_name
-                        )
+                        strategy = await self.generate_networking_strategy(parsed, track_name)
                         opp = DiscoveredOpportunity(
                             user_id=user_id,
                             opportunity_type="event",
@@ -834,9 +793,7 @@ class OpportunityDiscoveryEngine:
                     seen_urls.add(url)
                     parsed = self.parse_job_result(result, track_name, location)
                     if parsed:
-                        strategy = await self.generate_application_strategy(
-                            parsed, track_name
-                        )
+                        strategy = await self.generate_application_strategy(parsed, track_name)
                         opp = DiscoveredOpportunity(
                             user_id=user_id,
                             opportunity_type="job",
@@ -858,7 +815,7 @@ class OpportunityDiscoveryEngine:
                         discovered.append(opp)
 
             # --- Learning opportunities ---
-            for query in self.build_learning_queries(track_name)[:max(1, queries_per_category - 1)]:
+            for query in self.build_learning_queries(track_name)[: max(1, queries_per_category - 1)]:
                 logger.debug("discovery_search_query", category="learning", query=query)
                 search_results = await self.search(
                     query,
@@ -866,7 +823,9 @@ class OpportunityDiscoveryEngine:
                     freshness="pm",
                     location=location,
                 )
-                logger.info("discovery_search_results", category="learning", query=query[:60], count=len(search_results))
+                logger.info(
+                    "discovery_search_results", category="learning", query=query[:60], count=len(search_results)
+                )
                 for result in search_results:
                     url = result.get("url", "")
                     if url in seen_urls:
@@ -900,9 +859,7 @@ class OpportunityDiscoveryEngine:
             total=len(discovered),
             events=len([o for o in discovered if o.opportunity_type == "event"]),
             jobs=len([o for o in discovered if o.opportunity_type == "job"]),
-            learning=len(
-                [o for o in discovered if o.opportunity_type == "learning"]
-            ),
+            learning=len([o for o in discovered if o.opportunity_type == "learning"]),
         )
         return discovered
 
@@ -919,10 +876,7 @@ class OpportunityDiscoveryEngine:
 
         if type_label == "event":
             title = "🎯 New Event Matches Your Track"
-            content = (
-                f"We found a {opportunity.matched_track} event for you: "
-                f"{opportunity.title}"
-            )
+            content = f"We found a {opportunity.matched_track} event for you: {opportunity.title}"
             action_buttons = [
                 {"action": "view", "title": "View Event", "url": opportunity.url},
                 {
@@ -935,10 +889,7 @@ class OpportunityDiscoveryEngine:
         elif type_label == "job":
             company_part = f" at {opportunity.company}" if opportunity.company else ""
             title = "💼 Job Opportunity Alert"
-            content = (
-                f"New {opportunity.matched_track} role: "
-                f"{opportunity.title}{company_part}"
-            )
+            content = f"New {opportunity.matched_track} role: {opportunity.title}{company_part}"
             action_buttons = [
                 {"action": "view", "title": "View Job", "url": opportunity.url},
                 {
@@ -950,10 +901,7 @@ class OpportunityDiscoveryEngine:
             ]
         else:
             title = "🎓 Learning Opportunity"
-            content = (
-                f"Free resource for your {opportunity.matched_track} journey: "
-                f"{opportunity.title}"
-            )
+            content = f"Free resource for your {opportunity.matched_track} journey: {opportunity.title}"
             action_buttons = [
                 {"action": "view", "title": "Check It Out", "url": opportunity.url},
                 {"action": "dismiss", "title": "Not Interested"},

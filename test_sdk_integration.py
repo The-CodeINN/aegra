@@ -127,9 +127,7 @@ async def stream_once(
         "chunks": chunk_records,
         "chunk_count": len(chunk_records),
         "total_duration": end_time - start_time,
-        "first_chunk_latency": None
-        if first_chunk_time is None
-        else first_chunk_time - start_time,
+        "first_chunk_latency": None if first_chunk_time is None else first_chunk_time - start_time,
         "inter_chunk_deltas": deltas,
     }
 
@@ -167,20 +165,14 @@ def percentile(values: Sequence[float], pct: float) -> float:
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="Aegra server URL")
-    parser.add_argument(
-        "--api-key", default=os.getenv("AEGRA_API_KEY"), help="Optional API key"
-    )
-    parser.add_argument(
-        "--graph-id", default=DEFAULT_GRAPH_ID, help="Graph identifier to target"
-    )
+    parser.add_argument("--api-key", default=os.getenv("AEGRA_API_KEY"), help="Optional API key")
+    parser.add_argument("--graph-id", default=DEFAULT_GRAPH_ID, help="Graph identifier to target")
     parser.add_argument(
         "--assistant-id",
         default=os.getenv("AEGRA_ASSISTANT_ID"),
         help="Assistant ID override",
     )
-    parser.add_argument(
-        "--prompt", default=DEFAULT_PROMPT, help="Prompt content to send"
-    )
+    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Prompt content to send")
     parser.add_argument(
         "--stream-mode",
         default=DEFAULT_STREAM_MODE,
@@ -208,9 +200,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
 async def main(argv: Iterable[str]) -> int:
     args = parse_args(argv)
 
-    assistant_id = args.assistant_id or str(
-        uuid5(ASSISTANT_NAMESPACE_UUID, args.graph_id)
-    )
+    assistant_id = args.assistant_id or str(uuid5(ASSISTANT_NAMESPACE_UUID, args.graph_id))
 
     print(
         "Streaming benchmark starting...",
@@ -238,19 +228,11 @@ async def main(argv: Iterable[str]) -> int:
 
     if args.iterations > 1:
         totals = [item["total_duration"] for item in results]
-        firsts = [
-            item["first_chunk_latency"]
-            for item in results
-            if item["first_chunk_latency"] is not None
-        ]
+        firsts = [item["first_chunk_latency"] for item in results if item["first_chunk_latency"] is not None]
         print("\nBatch summary:")
-        print(
-            f"  total mean={statistics.mean(totals):.3f}s p95={percentile(totals, 95):.3f}s"
-        )
+        print(f"  total mean={statistics.mean(totals):.3f}s p95={percentile(totals, 95):.3f}s")
         if firsts:
-            print(
-                f"  first-chunk mean={statistics.mean(firsts):.3f}s p95={percentile(firsts, 95):.3f}s"
-            )
+            print(f"  first-chunk mean={statistics.mean(firsts):.3f}s p95={percentile(firsts, 95):.3f}s")
 
     return 0
 

@@ -70,9 +70,7 @@ class RedisManager:
                 )
                 await self._client.ping()  # type: ignore[misc]
             except Exception as exc:  # pragma: no cover - network failure path
-                logger.error(
-                    "Failed to connect to Redis", url=self._redis_url, error=str(exc)
-                )
+                logger.error("Failed to connect to Redis", url=self._redis_url, error=str(exc))
                 await self._safe_close()
                 self._client = None
                 self._available = False

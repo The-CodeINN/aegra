@@ -23,14 +23,17 @@ router = APIRouter(prefix="/push", tags=["Web Push"])
 
 # ── Models ───────────────────────────────────────────────────────────
 
+
 class PushSubscriptionRequest(BaseModel):
     """Standard PushSubscription JSON from browser Push API."""
+
     endpoint: str
     keys: dict[str, str]  # p256dh, auth
     expirationTime: int | None = None
 
 
 # ── VAPID Public Key ─────────────────────────────────────────────────
+
 
 @router.get("/vapid-key")
 async def get_vapid_key() -> dict[str, Any]:
@@ -45,6 +48,7 @@ async def get_vapid_key() -> dict[str, Any]:
 
 
 # ── Subscribe ────────────────────────────────────────────────────────
+
 
 @router.post("/subscribe")
 async def subscribe(
@@ -64,13 +68,12 @@ async def subscribe(
     if body.expirationTime is not None:
         subscription_info["expirationTime"] = body.expirationTime
 
-    await web_push_service.save_subscription(
-        session, user.identity, subscription_info
-    )
+    await web_push_service.save_subscription(session, user.identity, subscription_info)
     return {"status": "subscribed"}
 
 
 # ── Unsubscribe ──────────────────────────────────────────────────────
+
 
 @router.post("/unsubscribe")
 async def unsubscribe(
@@ -83,6 +86,7 @@ async def unsubscribe(
 
 
 # ── Test Push ────────────────────────────────────────────────────────
+
 
 @router.post("/test")
 async def test_push(
@@ -100,8 +104,6 @@ async def test_push(
     return {
         "status": "sent" if sent else "no_subscription",
         "message": (
-            "Test notification sent!"
-            if sent
-            else "No push subscription found. Enable push notifications first."
+            "Test notification sent!" if sent else "No push subscription found. Enable push notifications first."
         ),
     }

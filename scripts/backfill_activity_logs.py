@@ -34,17 +34,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Database configuration - use environment variable like the main app
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", "postgresql+asyncpg://user:password@localhost:5432/aegra"
-)
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:password@localhost:5432/aegra")
 
 
 async def backfill_activity_logs():
     """Backfill activity logs for all existing runs."""
     engine = create_async_engine(DATABASE_URL, echo=False)
-    async_session_maker = async_sessionmaker(
-        engine, class_=AsyncSession, expire_on_commit=False
-    )
+    async_session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     try:
         async with async_session_maker() as session:
@@ -90,9 +86,7 @@ async def backfill_activity_logs():
                     },
                     metadata_json={
                         "backfill_timestamp": datetime.now(UTC).isoformat(),
-                        "run_created_at": run.created_at.isoformat()
-                        if run.created_at
-                        else None,
+                        "run_created_at": run.created_at.isoformat() if run.created_at else None,
                     },
                 )
                 # Set created_at to match run start time (minus 1 second for ordering)
@@ -116,9 +110,7 @@ async def backfill_activity_logs():
                         },
                         metadata_json={
                             "backfill_timestamp": datetime.now(UTC).isoformat(),
-                            "run_updated_at": run.updated_at.isoformat()
-                            if run.updated_at
-                            else None,
+                            "run_updated_at": run.updated_at.isoformat() if run.updated_at else None,
                         },
                     )
                     # Set created_at to match run end time
@@ -135,13 +127,9 @@ async def backfill_activity_logs():
             # Commit all changes
             if backfilled_count > 0:
                 await session.commit()
-                logger.info(
-                    f"✅ Successfully backfilled {backfilled_count} runs with activity logs"
-                )
+                logger.info(f"✅ Successfully backfilled {backfilled_count} runs with activity logs")
             else:
-                logger.info(
-                    "No new runs to backfill (all existing runs already have activity logs)"
-                )
+                logger.info("No new runs to backfill (all existing runs already have activity logs)")
 
     finally:
         await engine.dispose()

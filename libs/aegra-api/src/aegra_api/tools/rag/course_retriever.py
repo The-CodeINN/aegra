@@ -40,9 +40,7 @@ class CourseRetriever:
 
         # Convert asyncpg URL to psycopg (for pgvector compatibility)
         if "asyncpg" in self.database_url:
-            self.database_url = self.database_url.replace(
-                "postgresql+asyncpg://", "postgresql+psycopg://"
-            )
+            self.database_url = self.database_url.replace("postgresql+asyncpg://", "postgresql+psycopg://")
 
         self.engine = create_engine(self.database_url)
         self.Session = sessionmaker(bind=self.engine)
@@ -64,9 +62,7 @@ class CourseRetriever:
         chunk_index: int,
     ) -> str:
         """Generate a unique ID for a chunk."""
-        content_hash = hashlib.md5(content.encode(), usedforsecurity=False).hexdigest()[
-            :8
-        ]
+        content_hash = hashlib.md5(content.encode(), usedforsecurity=False).hexdigest()[:8]
         return f"{course_id}_{chunk_index}_{content_hash}"
 
     async def index_course(
@@ -88,9 +84,7 @@ class CourseRetriever:
 
         try:
             # Check if already indexed
-            status = (
-                session.query(IndexingStatus).filter_by(course_id=course_id).first()
-            )
+            status = session.query(IndexingStatus).filter_by(course_id=course_id).first()
 
             if status and status.status == "completed":
                 print(f"⚠️  Course {course_id} already indexed")
@@ -139,9 +133,7 @@ class CourseRetriever:
             for chunk_data in chunks:
                 try:
                     # Generate embedding
-                    embedding = await self.embeddings.aembed_query(
-                        chunk_data["content"]
-                    )
+                    embedding = await self.embeddings.aembed_query(chunk_data["content"])
 
                     # Generate chunk ID
                     chunk_id = self._generate_chunk_id(
@@ -151,9 +143,7 @@ class CourseRetriever:
                     )
 
                     # Check if chunk already exists
-                    existing = (
-                        session.query(CourseChunk).filter_by(chunk_id=chunk_id).first()
-                    )
+                    existing = session.query(CourseChunk).filter_by(chunk_id=chunk_id).first()
 
                     if existing:
                         # Update existing chunk
@@ -167,9 +157,7 @@ class CourseRetriever:
                             course_id=course_id,
                             chunk_id=chunk_id,
                             content=chunk_data["content"],
-                            content_type=chunk_data["metadata"].get(
-                                "content_type", "unknown"
-                            ),
+                            content_type=chunk_data["metadata"].get("content_type", "unknown"),
                             title=chunk_data["metadata"].get("title")
                             or chunk_data["metadata"].get("lesson_title")
                             or chunk_data["metadata"].get("material_title"),
@@ -204,9 +192,7 @@ class CourseRetriever:
             status.completed_at = datetime.utcnow()  # type: ignore[assignment]
             session.commit()
 
-            print(
-                f"✅ Successfully indexed {indexed_count} chunks for course {course_id}"
-            )
+            print(f"✅ Successfully indexed {indexed_count} chunks for course {course_id}")
 
             return {
                 "course_id": course_id,
@@ -266,11 +252,7 @@ class CourseRetriever:
                 filters.append(CourseChunk.content_type == content_type)
 
             # Vector similarity search using cosine distance
-            query_obj = (
-                select(CourseChunk)
-                .order_by(CourseChunk.embedding.cosine_distance(query_embedding))
-                .limit(k)
-            )
+            query_obj = select(CourseChunk).order_by(CourseChunk.embedding.cosine_distance(query_embedding)).limit(k)
 
             if filters:
                 query_obj = query_obj.where(and_(*filters))
@@ -301,9 +283,7 @@ class CourseRetriever:
         session = self.Session()
 
         try:
-            status = (
-                session.query(IndexingStatus).filter_by(course_id=course_id).first()
-            )
+            status = session.query(IndexingStatus).filter_by(course_id=course_id).first()
 
             if not status:
                 return None
@@ -313,12 +293,8 @@ class CourseRetriever:
                 "status": status.status,
                 "total_chunks": status.total_chunks,
                 "indexed_chunks": status.indexed_chunks,
-                "started_at": status.started_at.isoformat()
-                if status.started_at
-                else None,
-                "completed_at": status.completed_at.isoformat()
-                if status.completed_at
-                else None,
+                "started_at": status.started_at.isoformat() if status.started_at else None,
+                "completed_at": status.completed_at.isoformat() if status.completed_at else None,
                 "error_message": status.error_message,
             }
 

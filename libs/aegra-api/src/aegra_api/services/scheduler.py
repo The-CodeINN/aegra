@@ -112,9 +112,7 @@ class SchedulerService:
                     if not item.due_date:
                         continue
 
-                    tier, priority, title, content_tpl = (
-                        notification_engine.compute_deadline_tier(item.due_date, now)
-                    )
+                    tier, priority, title, content_tpl = notification_engine.compute_deadline_tier(item.due_date, now)
                     if not tier:
                         continue
 
@@ -126,9 +124,7 @@ class SchedulerService:
                     # Compute template values
                     hours_diff = (item.due_date - now).total_seconds() / 3600
                     days = max(1, abs(int(hours_diff / 24)))
-                    content = content_tpl.format(
-                        description=item.description, days=days
-                    )
+                    content = content_tpl.format(description=item.description, days=days)
 
                     notif = await notification_engine.create_notification(
                         session=session,
@@ -165,9 +161,7 @@ class SchedulerService:
         except Exception as e:
             logger.error("check_deadlines error", error=str(e), exc_info=True)
 
-    async def _should_send_reminder(
-        self, item: ActionItem, tier: str, now: datetime
-    ) -> bool:
+    async def _should_send_reminder(self, item: ActionItem, tier: str, now: datetime) -> bool:
         if item.reminder_sent_count == 0:
             return True
         if item.last_reminder_sent:
@@ -214,9 +208,7 @@ class SchedulerService:
                         continue
 
                     days_inactive = (now - last_activity).days
-                    tier, priority, title, content_tpl = (
-                        notification_engine.compute_inactivity_tier(days_inactive)
-                    )
+                    tier, priority, title, content_tpl = notification_engine.compute_inactivity_tier(days_inactive)
                     if not tier:
                         continue
 
@@ -280,9 +272,7 @@ class SchedulerService:
                 user_ids = result.scalars().all()
 
                 for user_id in user_ids:
-                    celebrations = await notification_engine.check_celebrations(
-                        session, user_id
-                    )
+                    celebrations = await notification_engine.check_celebrations(session, user_id)
                     for cel in celebrations:
                         # Deduplicate by type
                         exists = await session.execute(
@@ -290,10 +280,8 @@ class SchedulerService:
                                 and_(
                                     Notification.user_id == user_id,
                                     Notification.category == "celebration",
-                                    Notification.metadata_json["celebration_type"].astext
-                                    == cel["type"],
-                                    Notification.created_at
-                                    > (datetime.now(UTC) - timedelta(days=1)),
+                                    Notification.metadata_json["celebration_type"].astext == cel["type"],
+                                    Notification.created_at > (datetime.now(UTC) - timedelta(days=1)),
                                 )
                             )
                         )
@@ -359,9 +347,7 @@ class SchedulerService:
                     .where(
                         and_(
                             DiscoveredOpportunity.expires_at < now,
-                            DiscoveredOpportunity.status.notin_(
-                                ["expired", "dismissed", "applied"]
-                            ),
+                            DiscoveredOpportunity.status.notin_(["expired", "dismissed", "applied"]),
                         )
                     )
                     .values(status="expired")
@@ -399,7 +385,7 @@ class SchedulerService:
                         discovered = await opportunity_engine.discover_for_user(
                             session=session,
                             user_id=user_id,
-                            auth_token="",
+                            auth_token="",  # nosec B106
                             max_tracks=2,
                             queries_per_category=1,
                         )
@@ -413,23 +399,14 @@ class SchedulerService:
                             type_label = opp.opportunity_type
                             if type_label == "event":
                                 title = "🎯 New Event Matches Your Track"
-                                content = (
-                                    f"We found a {opp.matched_track} event: "
-                                    f"{opp.title}"
-                                )
+                                content = f"We found a {opp.matched_track} event: {opp.title}"
                             elif type_label == "job":
                                 company_part = f" at {opp.company}" if opp.company else ""
                                 title = "💼 Job Opportunity Alert"
-                                content = (
-                                    f"New {opp.matched_track} role: "
-                                    f"{opp.title}{company_part}"
-                                )
+                                content = f"New {opp.matched_track} role: {opp.title}{company_part}"
                             else:
                                 title = "🎓 Learning Opportunity"
-                                content = (
-                                    f"Free resource for your {opp.matched_track} journey: "
-                                    f"{opp.title}"
-                                )
+                                content = f"Free resource for your {opp.matched_track} journey: {opp.title}"
 
                             await notification_engine.create_notification(
                                 session=session,
@@ -465,4 +442,3 @@ class SchedulerService:
 
 # Global instance
 scheduler_service = SchedulerService()
-
