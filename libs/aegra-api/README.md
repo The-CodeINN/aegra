@@ -28,7 +28,7 @@ The easiest way to get started is with the [aegra-cli](../aegra-cli/README.md):
 pip install aegra-cli
 
 # Initialize a new project
-aegra init --docker
+aegra init
 
 # Start services
 aegra up
@@ -195,7 +195,6 @@ libs/aegra-api/
 ## Related Packages
 
 - **aegra-cli**: Command-line interface for project management
-- **aegra**: Meta-package that installs both aegra-api and aegra-cli
 
 ## Documentation
 

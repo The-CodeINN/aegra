@@ -2,24 +2,24 @@
 
 Welcome to Aegra! This guide will help you get started with development, whether you're a newcomer to database migrations or an experienced developer.
 
-## 📋 Table of Contents
+## Table of Contents
 
-- [🚀 Quick Start for New Developers](#-quick-start-for-new-developers)
-- [✨ Code Quality & Standards](#-code-quality--standards)
-- [📚 Understanding Database Migrations](#-understanding-database-migrations)
-- [🔧 Database Migration Commands](#-database-migration-commands)
-- [🛠️ Development Workflow](#️-development-workflow)
-- [📁 Project Structure](#-project-structure)
-- [🔍 Understanding Migration Files](#-understanding-migration-files)
-- [🚨 Common Issues & Solutions](#-common-issues--solutions)
-- [🧪 Testing Your Changes](#-testing-your-changes)
-- [🚀 Production Deployment](#-production-deployment)
-- [📖 Best Practices](#-best-practices)
-- [🔗 Useful Resources](#-useful-resources)
-- [🆘 Getting Help](#-getting-help)
-- [📋 Quick Reference](#-quick-reference)
+- [Quick Start for New Developers](#quick-start-for-new-developers)
+- [Code Quality & Standards](#code-quality--standards)
+- [Understanding Database Migrations](#understanding-database-migrations)
+- [Database Migration Commands](#database-migration-commands)
+- [Development Workflow](#development-workflow)
+- [Project Structure](#project-structure)
+- [Understanding Migration Files](#understanding-migration-files)
+- [Common Issues & Solutions](#common-issues--solutions)
+- [Testing Your Changes](#testing-your-changes)
+- [Production Deployment](#production-deployment)
+- [Best Practices](#best-practices)
+- [Useful Resources](#useful-resources)
+- [Getting Help](#getting-help)
+- [Quick Reference](#quick-reference)
 
-## 🚀 Quick Start for New Developers
+## Quick Start for New Developers
 
 ### Prerequisites
 
@@ -34,19 +34,30 @@ Welcome to Aegra! This guide will help you get started with development, whether
 # 1. Clone and setup
 git clone https://github.com/ibbybuilds/aegra.git
 cd aegra
-uv sync
+uv sync --all-packages
 
-# 2. Activate environment (IMPORTANT!)
-source .venv/bin/activate  # Mac/Linux
-# OR .venv/Scripts/activate  # Windows
-
-# 3. Start everything (database + migrations + server)
-docker compose up aegra
+# 2. Start the development server (starts PostgreSQL + auto-migrates + hot reload)
+aegra dev
 ```
 
-🎉 **You're ready to develop!** Visit http://localhost:8000/docs to see the API.
+You're ready to develop! Visit http://localhost:8000/docs to see the API.
 
-## ✨ Code Quality & Standards
+> **Note:** `aegra dev` automatically starts PostgreSQL, applies any pending database migrations, and launches the server with hot reload. No manual migration step needed.
+
+### Using the CLI
+
+```bash
+# Install the CLI
+pip install aegra-cli
+
+# Initialize a new project
+aegra init
+
+# Start development server
+aegra dev
+```
+
+## Code Quality & Standards
 
 Aegra uses automated code quality enforcement to maintain high standards and consistency.
 
@@ -61,7 +72,7 @@ make dev-install     # Installs dependencies + git hooks
 **Option 2: Using uv directly**
 
 ```bash
-uv sync
+uv sync --all-packages
 uv run pre-commit install
 uv run pre-commit install --hook-type commit-msg
 ```
@@ -72,23 +83,23 @@ The hooks will check your code before every commit.
 
 When you commit, these checks run automatically:
 
-- ✅ **Code formatting** (Ruff) - Auto-formats your code
-- ✅ **Linting** (Ruff) - Checks code quality
-- ✅ **Type checking** (mypy) - Validates type hints
-- ✅ **Security** (Bandit) - Scans for vulnerabilities
-- ✅ **Commit message** - Enforces format
+- **Code formatting** (Ruff) - Auto-formats your code
+- **Linting** (Ruff) - Checks code quality
+- **Type checking** (mypy) - Validates type hints
+- **Security** (Bandit) - Scans for vulnerabilities
+- **Commit message** - Enforces format
 
 ### Commit Message Format
 
 **Required format:** `type(scope): description`
 
 ```bash
-# Good examples ✅
+# Good examples
 git commit -m "feat: add user authentication"
 git commit -m "fix(api): resolve rate limiting bug"
 git commit -m "docs: update installation guide"
 
-# Bad examples ❌
+# Bad examples
 git commit -m "fixed stuff"
 git commit -m "WIP"
 ```
@@ -117,12 +128,12 @@ make test    # Verify tests pass
 make ci-check
 ```
 
-📖 **For detailed information**, see:
+For detailed information, see:
 
 - [Code Quality Quick Reference](code-quality.md) - Commands and troubleshooting
 - [CONTRIBUTING.md](../CONTRIBUTING.md) - Complete contribution guide
 
-## 📚 Understanding Database Migrations
+## Understanding Database Migrations
 
 ### What are Database Migrations?
 
@@ -133,6 +144,15 @@ Think of migrations as **version control for your database structure**. Instead 
 - Can be rolled back if needed
 - Are tracked in version control
 
+### Auto-Migrations on Startup
+
+**As of v0.3.0, Aegra automatically applies pending migrations when the server starts.** You do not need to run migrations manually for normal development. The server runs `alembic upgrade head` during startup before initializing the database.
+
+This means:
+- `aegra dev` applies migrations automatically
+- Docker deployments apply migrations automatically
+- You only need manual migration commands when **creating new migrations** or **troubleshooting**
+
 ### Why We Use Alembic
 
 - **Industry Standard**: Used by most Python projects
@@ -140,151 +160,170 @@ Think of migrations as **version control for your database structure**. Instead 
 - **Team-Friendly**: Everyone gets the same database structure
 - **Production-Ready**: Tested migration process
 
-## 🔧 Database Migration Commands
+## Database Migration Commands
 
-### Using Our Custom Script (Recommended)
-
-**⚠️ Important**: Make sure your virtual environment is activated before running migration commands:
-
-```bash
-source .venv/bin/activate  # Mac/Linux
-# OR .venv/Scripts/activate  # Windows
-```
-
-We've created a convenient script that wraps Alembic commands:
+### Using the CLI (Recommended)
 
 ```bash
 # Apply all pending migrations
-python3 scripts/migrate.py upgrade
+aegra db upgrade
 
-# Create a new migration
-python3 scripts/migrate.py revision --autogenerate -m "Add user preferences"
+# Create a new migration (from repo root)
+uv run --package aegra-api alembic revision --autogenerate -m "Add user preferences"
 
 # Rollback last migration
-python3 scripts/migrate.py downgrade
+aegra db downgrade
 
 # Show migration history
-python3 scripts/migrate.py history
+aegra db history
 
 # Show current version
-python3 scripts/migrate.py current
-
-# Reset database (⚠️ destructive - drops all data)
-python3 scripts/migrate.py reset
+aegra db current
 ```
 
 ### Direct Alembic Commands
 
-If you prefer using Alembic directly:
+If you prefer using Alembic directly (from repo root):
 
 ```bash
 # Apply migrations
-alembic upgrade head
+uv run --package aegra-api alembic upgrade head
 
 # Create new migration
-alembic revision --autogenerate -m "Description"
+uv run --package aegra-api alembic revision --autogenerate -m "Description"
 
 # Rollback
-alembic downgrade -1
+uv run --package aegra-api alembic downgrade -1
 
 # Show history
-alembic history
+uv run --package aegra-api alembic history
 ```
 
-## 🛠️ Development Workflow
+## Development Workflow
 
-### Option 1: Docker Development (Recommended for Beginners)
+### Option 1: CLI Development (Recommended)
 
 ```bash
-# Start everything (database + migrations + server)
-docker compose up aegra
-
-# Or start in background
-docker compose up -d aegra
+# Start everything (database + auto-migrations + server with hot reload)
+aegra dev
 ```
 
 **Benefits:**
 
-- ✅ One command to start everything
-- ✅ Migrations run automatically
-- ✅ Consistent environment
-- ✅ Production-like setup
+- One command to start everything
+- Migrations run automatically on startup
+- Hot reload on code changes
+- Docker PostgreSQL managed for you
 
-### Option 2: Local Development (Recommended for Advanced Users)
+### Option 2: Docker Compose Development
+
+```bash
+# Start everything with Docker
+docker compose up aegra
+```
+
+**Benefits:**
+
+- Fully containerized
+- Consistent environment
+- Production-like setup
+
+### Option 3: Manual Development
 
 ```bash
 # 1. Start database
 docker compose up postgres -d
 
 # 2. Apply any new migrations
-python3 scripts/migrate.py upgrade
+aegra db upgrade
 
 # 3. Start development server
-python3 run_server.py
+uv run --package aegra-api uvicorn aegra_api.main:app --reload
 ```
 
 **Benefits:**
 
-- ✅ Full control over each component
-- ✅ Easier debugging
-- ✅ Faster development cycle
-- ✅ Direct access to logs
+- Full control over each component
+- Easier debugging
+- Direct access to logs
 
 ### Making Database Changes
 
 When you need to change the database structure:
 
 ```bash
-# 1. Make changes to your code/models
+# 1. Make changes to your ORM models in libs/aegra-api/src/aegra_api/core/orm.py
 
 # 2. Generate migration
-python3 scripts/migrate.py revision --autogenerate -m "Add new feature"
+uv run --package aegra-api alembic revision --autogenerate -m "Add new feature"
 
 # 3. Review the generated migration file
-# Check: alembic/versions/XXXX_add_new_feature.py
+# Check: libs/aegra-api/alembic/versions/XXXX_add_new_feature.py
 
 # 4. Apply the migration
-python3 scripts/migrate.py upgrade
+aegra db upgrade
 
-# 5. Test your changes
-python3 run_server.py
+# 5. Restart the server to pick up changes
+aegra dev
 ```
 
 ### Testing Migrations
 
 ```bash
 # Test upgrade path
-python3 scripts/migrate.py reset  # Start fresh
-python3 scripts/migrate.py upgrade  # Apply all
+aegra db downgrade base   # Rollback all
+aegra db upgrade          # Apply all
 
 # Test downgrade path
-python3 scripts/migrate.py downgrade  # Rollback one
-python3 scripts/migrate.py upgrade    # Apply again
+aegra db downgrade        # Rollback one
+aegra db upgrade          # Apply again
 ```
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 aegra/
-├── alembic/                    # Database migrations
-│   ├── versions/              # Migration files
-│   ├── env.py                 # Alembic configuration
-│   └── script.py.mako         # Migration template
-├── src/agent_server/          # Main application code
-│   ├── core/database.py       # Database connection
-│   ├── api/                   # API endpoints
-│   ├── services/              # Core services (LangGraph, etc.)
-│   └── models/                # Data models
-├── scripts/
-│   └── migrate.py             # Migration helper script
-├── docs/
-│   ├── developer-guide.md     # This file
-│   └── migrations.md          # Detailed migration docs
-├── alembic.ini                # Alembic configuration
-└── docker compose.yml         # Database setup
+├── libs/
+│   ├── aegra-api/                    # Core API package
+│   │   ├── src/aegra_api/            # Main application code
+│   │   │   ├── api/                  # Agent Protocol endpoints
+│   │   │   │   ├── assistants.py     # /assistants CRUD
+│   │   │   │   ├── threads.py        # /threads and state management
+│   │   │   │   ├── runs.py           # /runs execution and streaming
+│   │   │   │   └── store.py          # /store vector storage
+│   │   │   ├── services/             # Business logic layer
+│   │   │   ├── core/                 # Infrastructure (database, auth, orm)
+│   │   │   ├── models/               # Pydantic request/response schemas
+│   │   │   ├── middleware/           # ASGI middleware
+│   │   │   ├── observability/        # OpenTelemetry tracing
+│   │   │   ├── utils/                # Helper functions
+│   │   │   ├── main.py               # FastAPI app entry point
+│   │   │   ├── config.py             # HTTP/store config loading
+│   │   │   └── settings.py           # Environment settings
+│   │   ├── tests/                    # Test suite
+│   │   ├── alembic/                  # Database migrations
+│   │   └── pyproject.toml
+│   │
+│   └── aegra-cli/                    # CLI package
+│       └── src/aegra_cli/
+│           ├── cli.py                # Main CLI entry point
+│           └── commands/             # Command implementations
+│               ├── db.py             # Database migration commands
+│               └── init.py           # Project initialization
+│
+├── examples/                         # Example agents and configs
+│   ├── react_agent/                  # Basic ReAct agent
+│   ├── react_agent_hitl/             # ReAct with human-in-loop
+│   ├── subgraph_agent/               # Hierarchical agents
+│   └── subgraph_hitl_agent/          # Hierarchical with HITL
+│
+├── docs/                             # Documentation
+├── deployments/                      # Docker configs
+├── aegra.json                        # Agent graph definitions
+└── docker-compose.yml                # Local development setup
 ```
 
-## 🔄 LangGraph Service Architecture
+## LangGraph Service Architecture
 
 The `LangGraphService` is the core component that manages graph loading, caching, and execution.
 
@@ -322,11 +361,11 @@ schemas = extract_schemas(graph)
 
 Each request gets its own graph copy, ensuring isolation and thread-safety.
 
-## 🔍 Understanding Migration Files
+## Understanding Migration Files
 
 ### Migration File Structure
 
-Each migration file in `alembic/versions/` contains:
+Each migration file in `libs/aegra-api/alembic/versions/` contains:
 
 ```python
 """Add user preferences table
@@ -359,7 +398,7 @@ def downgrade() -> None:
 - **upgrade()**: What to do when applying the migration
 - **downgrade()**: What to do when rolling back the migration
 
-## 🚨 Common Issues & Solutions
+## Common Issues & Solutions
 
 ### Database Version Upgrade (Postgres 15 -> 18)
 
@@ -381,8 +420,7 @@ docker compose logs aegra
 
 # Solution: Run migrations manually for debugging
 docker compose up postgres -d
-python3 scripts/migrate.py upgrade
-python3 run_server.py
+aegra db upgrade
 ```
 
 **Problem**: Database connection issues in Docker
@@ -420,71 +458,64 @@ docker compose up postgres -d
 
 ```bash
 # Solution: Check current state
-python3 scripts/migrate.py current
+aegra db current
 
-# If needed, reset and reapply
-python3 scripts/migrate.py reset
+# If needed, downgrade to base and reapply
+aegra db downgrade base
+aegra db upgrade
 ```
 
 **Problem**: Migration conflicts
 
 ```bash
 # Solution: Check migration history
-python3 scripts/migrate.py history
+aegra db history
 
-# Reset if needed (⚠️ destructive)
-python3 scripts/migrate.py reset
+# Downgrade to base and reapply if needed (loses all data)
+aegra db downgrade base
+aegra db upgrade
 ```
 
-### Permission Issues
-
-**Problem**: "Permission denied" on migration script
-
-```bash
-# Solution: Make script executable
-chmod +x scripts/migrate.py
-```
-
-## 🧪 Testing Your Changes
+## Testing Your Changes
 
 ### Running Tests
 
 ```bash
-# Run all tests
-pytest
+# Run all tests (or use: make test)
+uv run --package aegra-api pytest libs/aegra-api/tests/
+uv run --package aegra-cli pytest libs/aegra-cli/tests/
 
 # Run specific test file
-pytest tests/test_api/test_assistants.py
+uv run --package aegra-api pytest libs/aegra-api/tests/unit/test_api/test_assistants.py
 
-# Run with coverage
-pytest --cov=src/agent_server
+# Run with coverage (or use: make test-cov)
+uv run --package aegra-api pytest libs/aegra-api/tests/ --cov=libs/aegra-api/src --cov-report=html
 ```
 
 ### Testing Database Changes
 
 ```bash
 # 1. Create a test migration
-python3 scripts/migrate.py revision --autogenerate -m "Test feature"
+uv run --package aegra-api alembic revision --autogenerate -m "Test feature"
 
 # 2. Apply it
-python3 scripts/migrate.py upgrade
+aegra db upgrade
 
 # 3. Test your application
-python3 run_server.py
+aegra dev
 
 # 4. If something breaks, rollback
-python3 scripts/migrate.py downgrade
+aegra db downgrade
 ```
 
-## 🚀 Production Deployment
+## Production Deployment
 
 ### Before Deploying
 
 1. **Test migrations on staging**:
 
    ```bash
-   # Apply to staging database
-   python3 scripts/migrate.py upgrade
+   aegra db upgrade
    ```
 
 2. **Backup production database**:
@@ -494,9 +525,9 @@ python3 scripts/migrate.py downgrade
    pg_dump your_database > backup.sql
    ```
 
-3. **Deploy with migrations**:
+3. **Deploy**:
    ```bash
-   # Docker automatically runs migrations
+   # Migrations run automatically on server startup
    docker compose up aegra
    ```
 
@@ -504,20 +535,20 @@ python3 scripts/migrate.py downgrade
 
 ```bash
 # Check migration status
-python3 scripts/migrate.py current
+aegra db current
 
 # View migration history
-python3 scripts/migrate.py history
+aegra db history
 ```
 
-## 📖 Best Practices
+## Best Practices
 
 ### Creating Migrations
 
 1. **Always use autogenerate** when possible:
 
    ```bash
-   python3 scripts/migrate.py revision --autogenerate -m "Descriptive message"
+   uv run --package aegra-api alembic revision --autogenerate -m "Descriptive message"
    ```
 
 2. **Review generated migrations**:
@@ -530,10 +561,10 @@ python3 scripts/migrate.py history
 
    ```bash
    # Good
-   python3 scripts/migrate.py revision --autogenerate -m "Add user preferences table"
+   uv run --package aegra-api alembic revision --autogenerate -m "Add user preferences table"
 
    # Bad
-   python3 scripts/migrate.py revision --autogenerate -m "fix"
+   uv run --package aegra-api alembic revision --autogenerate -m "fix"
    ```
 
 ### Code Organization
@@ -543,14 +574,14 @@ python3 scripts/migrate.py history
 3. **Document changes**: Use clear migration messages
 4. **Version control**: Commit migration files with your code changes
 
-## 🔗 Useful Resources
+## Useful Resources
 
 - [Alembic Documentation](https://alembic.sqlalchemy.org/)
 - [SQLAlchemy Documentation](https://docs.sqlalchemy.org/)
 - [FastAPI Documentation](https://fastapi.tiangolo.com/)
 - [Agent Protocol Specification](https://github.com/langchain-ai/agent-protocol)
 
-## 🆘 Getting Help
+## Getting Help
 
 ### When You're Stuck
 
@@ -563,17 +594,11 @@ python3 scripts/migrate.py history
 2. **Verify database state**:
 
    ```bash
-   python3 scripts/migrate.py current
-   python3 scripts/migrate.py history
+   aegra db current
+   aegra db history
    ```
 
-3. **Reset if needed** (⚠️ destructive):
-
-   ```bash
-   python3 scripts/migrate.py reset
-   ```
-
-4. **Ask for help**:
+3. **Ask for help**:
    - Check existing issues on GitHub
    - Create a new issue with details
    - Join our community discussions
@@ -581,56 +606,53 @@ python3 scripts/migrate.py history
 ### Common Questions
 
 **Q: Do I need to run migrations every time I start development?**
-A: Only if there are new migrations. The Docker setup automatically runs them.
+A: No. As of v0.3.0, migrations run automatically when the server starts via `aegra dev` or Docker.
 
 **Q: What if I accidentally break the database?**
-A: Use `python3 scripts/migrate.py reset` to start fresh (⚠️ loses all data).
+A: Use `aegra db downgrade base` to rollback all migrations, then `aegra db upgrade` to reapply (this loses all data).
 
 **Q: How do I know what migrations are pending?**
-A: Use `python3 scripts/migrate.py history` to see all migrations and their status.
+A: Use `aegra db history` to see all migrations and their status.
 
 **Q: Can I modify an existing migration?**
 A: Generally no - create a new migration instead. Modifying existing migrations can cause issues.
 
 ---
 
-🎉 **You're now ready to contribute to Aegra!**
+You're now ready to contribute to Aegra!
 
 Start with small changes, test your migrations, and don't hesitate to ask for help. Happy coding!
 
 ---
 
-## 📋 Quick Reference
+## Quick Reference
 
 ### Essential Commands
 
 ```bash
 # Apply all pending migrations
-python3 scripts/migrate.py upgrade
+aegra db upgrade
 
 # Create new migration
-python3 scripts/migrate.py revision --autogenerate -m "Description"
+uv run --package aegra-api alembic revision --autogenerate -m "Description"
 
 # Rollback last migration
-python3 scripts/migrate.py downgrade
+aegra db downgrade
 
 # Show migration history
-python3 scripts/migrate.py history
+aegra db history
 
 # Show current version
-python3 scripts/migrate.py current
-
-# Reset database (⚠️ DESTRUCTIVE - loses all data)
-python3 scripts/migrate.py reset
+aegra db current
 ```
 
 ### Daily Development Workflow
 
-**Docker (Recommended):**
+**CLI (Recommended):**
 
 ```bash
-# Start everything
-docker compose up aegra
+# Start everything (postgres + auto-migrations + hot reload)
+aegra dev
 ```
 
 **Local Development:**
@@ -640,10 +662,10 @@ docker compose up aegra
 docker compose up postgres -d
 
 # Apply migrations
-python3 scripts/migrate.py upgrade
+aegra db upgrade
 
 # Start server
-python3 run_server.py
+uv run --package aegra-api uvicorn aegra_api.main:app --reload
 ```
 
 ### Common Patterns
@@ -651,22 +673,22 @@ python3 run_server.py
 **Adding a New Table:**
 
 ```bash
-python3 scripts/migrate.py revision --autogenerate -m "Add users table"
-python3 scripts/migrate.py upgrade
+uv run --package aegra-api alembic revision --autogenerate -m "Add users table"
+aegra db upgrade
 ```
 
 **Adding a Column:**
 
 ```bash
-python3 scripts/migrate.py revision --autogenerate -m "Add email to users"
-python3 scripts/migrate.py upgrade
+uv run --package aegra-api alembic revision --autogenerate -m "Add email to users"
+aegra db upgrade
 ```
 
 **Testing Migrations:**
 
 ```bash
-python3 scripts/migrate.py reset
-python3 scripts/migrate.py upgrade
+aegra db downgrade base
+aegra db upgrade
 ```
 
 ### Troubleshooting Quick Reference
@@ -675,39 +697,15 @@ python3 scripts/migrate.py upgrade
 | ------------------------- | ------------------------------------------------------------------------------- |
 | **Incompatible DB version** | **See [PostgreSQL 18 Migration Guide](postgres-18-migration.md)** |
 | Can't connect to database | `docker compose up postgres -d`       |
-| Migration fails           | `python3 scripts/migrate.py current`  |
-| Permission denied         | `chmod +x scripts/migrate.py`         |
-| Database broken           | `python3 scripts/migrate.py reset` ⚠️ |
+| Migration fails           | `aegra db current`                    |
+| Database broken           | `aegra db downgrade base` then `aegra db upgrade` |
 
 ### Environment Setup
 
-**For Docker Development:**
-
 ```bash
-# Activate virtual environment (IMPORTANT!)
-source .venv/bin/activate  # Mac/Linux
-# OR .venv/Scripts/activate  # Windows
+# Install all workspace dependencies
+uv sync --all-packages
 
-# Install dependencies
-uv sync
-
-# Start everything
-docker compose up aegra
-```
-
-**For Local Development:**
-
-```bash
-# Activate virtual environment (IMPORTANT!)
-source .venv/bin/activate  # Mac/Linux
-# OR .venv/Scripts/activate  # Windows
-
-# Install dependencies
-uv sync
-
-# Start database
-docker compose up postgres -d
-
-# Apply migrations
-python3 scripts/migrate.py upgrade
+# Start development server
+aegra dev
 ```
