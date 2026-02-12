@@ -8,21 +8,24 @@ Endpoints:
 - POST  /opportunities/{id}/save     bookmark / save
 - POST  /opportunities/{id}/dismiss  not interested
 - POST  /opportunities/{id}/applied  mark applied
-- POST  /opportunities/discover      manual scan
+- POST  /opportunities/discover      manual scan (max 4/day per user)
 """
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from aegra_api.core.accountability_orm import DiscoveredOpportunity
+from aegra_api.core.accountability_orm import DiscoveredOpportunity, UserPreferences
 from aegra_api.core.auth_deps import get_current_user
 from aegra_api.core.orm import get_session
 from aegra_api.models import User
 from aegra_api.services.opportunity_discovery import opportunity_engine
 from aegra_api.services.opportunity_service import OpportunityService
+from aegra_api.settings import settings
 
 router = APIRouter(prefix="/opportunities")
 
@@ -32,7 +35,7 @@ router = APIRouter(prefix="/opportunities")
 
 class OpportunityResponse(BaseModel):
     id: str
-    opportunity_type: str  # event | job | learning
+    opportunity_type: str  # event | job
     title: str
     description: str | None = None
     url: str | None = None
@@ -85,7 +88,42 @@ class OpportunityListResponse(BaseModel):
 
 class DiscoverRequest(BaseModel):
     auth_token: str | None = None
-    search_provider: str = "auto"  # brave | claude | both | auto
+
+
+# ── Rate limiting helpers ────────────────────────────────────────────
+
+
+async def _get_scan_count_today(session: AsyncSession, user_id: str) -> int:
+    """Return how many manual scans the user has done today."""
+    result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
+    prefs = result.scalar_one_or_none()
+    if not prefs or not prefs.preferences:
+        return 0
+    scan_log = prefs.preferences.get("scan_log", {})
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    return scan_log.get(today, 0)
+
+
+async def _record_scan(session: AsyncSession, user_id: str) -> None:
+    """Increment the user's manual scan count for today."""
+    result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
+    prefs = result.scalar_one_or_none()
+    if not prefs:
+        prefs = UserPreferences(user_id=user_id, preferences={})
+        session.add(prefs)
+
+    preferences = dict(prefs.preferences or {})
+    scan_log = dict(preferences.get("scan_log", {}))
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    scan_log[today] = scan_log.get(today, 0) + 1
+
+    # Keep only the last 7 days
+    cutoff = (datetime.now(UTC) - timedelta(days=7)).strftime("%Y-%m-%d")
+    scan_log = {k: v for k, v in scan_log.items() if k >= cutoff}
+
+    preferences["scan_log"] = scan_log
+    prefs.preferences = preferences
+    await session.commit()
 
 
 # ── List / Filter ────────────────────────────────────────────────────
@@ -93,7 +131,7 @@ class DiscoverRequest(BaseModel):
 
 @router.get("", response_model=OpportunityListResponse)
 async def list_opportunities(
-    opportunity_type: str | None = Query(None, description="Filter by type: event, job, learning"),
+    opportunity_type: str | None = Query(None, description="Filter by type: event, job"),
     status: str = Query("new", description="Filter by status: new, notified, saved, dismissed, applied"),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
@@ -209,7 +247,16 @@ async def trigger_discovery(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Manually trigger opportunity discovery scan."""
+    """Manually trigger opportunity discovery scan (max 4/day per user)."""
+    # Rate limiting
+    max_scans = settings.discovery.DISCOVERY_MAX_MANUAL_SCANS_PER_DAY
+    count = await _get_scan_count_today(session, user.identity)
+    if count >= max_scans:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily scan limit reached ({max_scans} per day). Try again tomorrow.",
+        )
+
     token = request.auth_token if request and request.auth_token else None
 
     if not token and authorization:
@@ -219,25 +266,24 @@ async def trigger_discovery(
     if not token:
         raise HTTPException(status_code=401, detail="Authentication token required for discovery")
 
-    provider = request.search_provider if request else "auto"
-    if provider not in ("brave", "claude", "both", "auto"):
-        provider = "auto"
-
     discovered = await opportunity_engine.discover_for_user(
         session=session,
         user_id=user.identity,
         auth_token=token,
-        search_provider=provider,
+        max_tracks=2,
+        queries_per_category=2,
     )
 
-    for opp in discovered:
-        await opportunity_engine.create_opportunity_notification(session, opp)
+    # Batch-create all notifications in a single commit
+    await opportunity_engine.create_notifications_batch(session, discovered)
+
+    # Record the scan for rate limiting
+    await _record_scan(session, user.identity)
 
     return {
         "status": "success",
         "discovered_count": len(discovered),
         "events": len([o for o in discovered if o.opportunity_type == "event"]),
         "jobs": len([o for o in discovered if o.opportunity_type == "job"]),
-        "learning": len([o for o in discovered if o.opportunity_type == "learning"]),
-        "search_provider": provider,
+        "scans_remaining_today": max_scans - count - 1,
     }

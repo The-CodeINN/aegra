@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from pydantic import BeforeValidator, Field, computed_field
+from pydantic import BeforeValidator, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -132,11 +132,24 @@ class PushNotificationSettings(EnvBase):
 class DiscoverySettings(EnvBase):
     """Opportunity discovery settings."""
 
-    BRAVE_API_KEY: str | None = Field(None, validation_alias="BRAVE_SEARCH_API_KEY")
-    ANTHROPIC_API_KEY: str | None = None
+    SERPER_API_KEY: str | None = None
+    OPENAI_API_KEY: str | None = None
     DISCOVERY_MAX_TRACKS: int = 2
-    DISCOVERY_QUERIES_PER_CATEGORY: int = 1
-    DISCOVERY_PROVIDER: str = "brave"  # brave, claude, or auto
+    DISCOVERY_QUERIES_PER_CATEGORY: int = 2
+    DISCOVERY_MAX_MANUAL_SCANS_PER_DAY: int = 4
+
+
+class EmailSettings(EnvBase):
+    """Email notification settings (SMTP)."""
+
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_USE_TLS: bool = True
+    EMAIL_FROM_ADDRESS: str = "noreply@dedatahub.com"
+    EMAIL_FROM_NAME: str = "DeDataHub AI Advisor"
+    EMAIL_ENABLED: bool = False  # Must be explicitly enabled
 
 
 class RedisSettings(EnvBase):
@@ -154,6 +167,7 @@ class Settings:
         self.observability = ObservabilitySettings()
         self.push = PushNotificationSettings()
         self.discovery = DiscoverySettings()
+        self.email = EmailSettings()
         self.redis = RedisSettings()
 
 

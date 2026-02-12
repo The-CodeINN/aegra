@@ -1,28 +1,30 @@
-"""Opportunity Discovery Engine — v2.
+"""Opportunity Discovery Engine — v7.
 
-AI-powered discovery of events, jobs, and learning opportunities
-matched to each user's enrolled tracks and location.
+AI-powered discovery of events and job opportunities
+matched to each user's enrolled courses, career goals, and profile.
 
-Features
---------
-* Brave Search API integration with freshness filtering
-* Claude web search tool (Anthropic Messages API) for real-time results
-* Dual-provider support: brave | claude | both
-* Track-aware keyword expansion for events, jobs and learning
-* AI-powered relevance scoring via LLM (with deterministic fallback)
-* Networking strategy generation for events
-* Application strategy generation for jobs
-* Deduplication by URL
-* Notification creation per discovered opportunity
+Changes in v7
+--------------
+* Both events AND jobs use Serper.dev (Google Search via google.serper.dev)
+* Brave, SerpAPI, Claude all REMOVED
+* Provider selection REMOVED — single backend: Serper.dev
+* Auto scan: 2× per day (scheduler)
+* Manual scan: max 4 per user per day (rate-limited at API layer)
+* AI strategy generation restored DURING discovery (per requirement.md)
+  - Events → generate_networking_strategy()
+  - Jobs → generate_application_strategy()
+* Redundant LMS calls removed — profile.enrolled_tracks reused for tracks
+* Parallel search per track via asyncio.gather for speed
 """
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -34,9 +36,57 @@ from aegra_api.core.accountability_orm import (
     Notification,
     UserPreferences,
 )
+from aegra_api.services.student_profile import StudentProfile, fetch_student_profile
 from aegra_api.settings import settings
 
 logger = structlog.get_logger()
+
+# ---------------------------------------------------------------------------
+# Country code → readable name (common ones)
+# ---------------------------------------------------------------------------
+COUNTRY_NAMES: dict[str, str] = {
+    "GB": "United Kingdom",
+    "UK": "United Kingdom",
+    "US": "United States",
+    "CA": "Canada",
+    "AU": "Australia",
+    "DE": "Germany",
+    "FR": "France",
+    "NL": "Netherlands",
+    "IE": "Ireland",
+    "NG": "Nigeria",
+    "KE": "Kenya",
+    "ZA": "South Africa",
+    "IN": "India",
+    "SG": "Singapore",
+    "AE": "United Arab Emirates",
+    "SE": "Sweden",
+    "NO": "Norway",
+    "DK": "Denmark",
+    "FI": "Finland",
+    "ES": "Spain",
+    "IT": "Italy",
+    "PT": "Portugal",
+    "PL": "Poland",
+    "CH": "Switzerland",
+    "AT": "Austria",
+    "BE": "Belgium",
+    "NZ": "New Zealand",
+    "JP": "Japan",
+    "BR": "Brazil",
+    "MX": "Mexico",
+}
+
+
+def _readable_location(raw: str) -> str:
+    """Convert a raw location (could be a 2-letter code) to a readable name."""
+    stripped = raw.strip()
+    upper = stripped.upper()
+    if upper in COUNTRY_NAMES:
+        return COUNTRY_NAMES[upper]
+    # Already a readable name like "Glasgow, Scotland"
+    return stripped
+
 
 # ---------------------------------------------------------------------------
 # Track → keyword mapping
@@ -44,53 +94,92 @@ logger = structlog.get_logger()
 TRACK_KEYWORDS: dict[str, list[str]] = {
     "data-analytics": [
         "data analytics",
-        "SQL",
+        "data analyst",
+        "business intelligence",
         "Power BI",
         "Tableau",
-        "Excel",
-        "business intelligence",
-        "BI analyst",
-        "data analyst",
+        "SQL analyst",
     ],
     "data-science": [
         "data science",
-        "machine learning",
-        "Python",
-        "ML engineer",
         "data scientist",
-        "statistics",
+        "machine learning",
+        "ML engineer",
         "predictive analytics",
     ],
     "data-engineering": [
         "data engineering",
+        "data engineer",
         "ETL",
+        "data pipeline",
         "Spark",
         "Airflow",
-        "data pipeline",
-        "data engineer",
-        "dbt",
-        "Snowflake",
     ],
     "ai-engineering": [
         "AI engineer",
-        "LLM",
-        "GenAI",
         "artificial intelligence",
-        "prompt engineering",
-        "ML Ops",
+        "LLM",
         "deep learning",
+        "ML Ops",
     ],
     "business-intelligence": [
         "business intelligence",
         "BI developer",
-        "reporting",
-        "dashboards",
         "Power BI",
         "Looker",
+        "reporting",
+    ],
+    "dev": [
+        "software developer",
+        "software engineer",
+        "web developer",
+        "full stack developer",
+        "frontend developer",
+        "backend developer",
     ],
 }
 
-# Keywords that signal an event result
+# ---------------------------------------------------------------------------
+# Domain-based classification
+# ---------------------------------------------------------------------------
+EVENT_DOMAINS = frozenset(
+    [
+        "eventbrite.com",
+        "eventbrite.co.uk",
+        "eventbrite.co",
+        "meetup.com",
+        "10times.com",
+        "confs.tech",
+        "dev.events",
+        "lu.ma",
+        "luma.com",
+        "conference-service.com",
+        "techmeetups.com",
+    ]
+)
+
+JOB_DOMAINS = frozenset(
+    [
+        "linkedin.com",
+        "indeed.com",
+        "indeed.co.uk",
+        "glassdoor.com",
+        "glassdoor.co.uk",
+        "jobs.ashbyhq.com",
+        "boards.greenhouse.io",
+        "lever.co",
+        "jobs.workable.com",
+        "jobs.smartrecruiters.com",
+        "wellfound.com",
+        "otta.com",
+        "reed.co.uk",
+        "totaljobs.com",
+        "cwjobs.co.uk",
+        "monster.com",
+    ]
+)
+
+# Content keywords as fallback when domain is not in either set
 EVENT_SIGNALS = frozenset(
     [
         "meetup",
@@ -109,14 +198,12 @@ EVENT_SIGNALS = frozenset(
     ]
 )
 
-# Keywords that signal a job result
 JOB_SIGNALS = frozenset(
     [
         "job",
         "career",
         "hiring",
         "position",
-        "role",
         "apply",
         "vacancy",
         "opening",
@@ -125,44 +212,71 @@ JOB_SIGNALS = frozenset(
     ]
 )
 
-LEARNING_SIGNALS = frozenset(
-    [
-        "course",
-        "certification",
-        "free",
-        "tutorial",
-        "training",
-        "scholarship",
-        "voucher",
-        "exam",
-        "credential",
-        "mooc",
-    ]
-)
-
 
 def _normalise_track(track: str) -> str:
-    """Normalise a track name to a key in TRACK_KEYWORDS."""
     return track.lower().strip().replace(" ", "-")
 
 
-def _content_hash(url: str) -> str:
-    return hashlib.sha256(url.encode()).hexdigest()[:16]
+def _domain_of(url: str) -> str:
+    """Extract the registerable domain from a URL."""
+    try:
+        host = urlparse(url).hostname or ""
+        # Strip www. prefix
+        if host.startswith("www."):
+            host = host[4:]
+        return host.lower()
+    except Exception:
+        return ""
+
+
+def _classify_result(url: str, title: str, description: str) -> str | None:
+    """Classify a search result as 'event', 'job', or None (skip).
+
+    Priority:
+    1. Domain match (most reliable)
+    2. Content keyword match (fallback)
+    """
+    domain = _domain_of(url)
+
+    # Check domain first — most reliable signal
+    for ed in EVENT_DOMAINS:
+        if domain == ed or domain.endswith("." + ed):
+            return "event"
+    for jd in JOB_DOMAINS:
+        if domain == jd or domain.endswith("." + jd):
+            return "job"
+
+    # Fallback to content analysis
+    content = f"{title} {description}".lower()
+    event_hits = sum(1 for kw in EVENT_SIGNALS if kw in content)
+    job_hits = sum(1 for kw in JOB_SIGNALS if kw in content)
+
+    if event_hits > job_hits and event_hits >= 2:
+        return "event"
+    if job_hits > event_hits and job_hits >= 2:
+        return "job"
+    if event_hits > 0:
+        return "event"
+    if job_hits > 0:
+        return "job"
+
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Main engine
 # ---------------------------------------------------------------------------
 class OpportunityDiscoveryEngine:
-    """Discovers relevant opportunities (events, jobs, learning) for users."""
+    """Discovers relevant opportunities (events, jobs) for users.
+
+    Architecture: Serper.dev (google.serper.dev) for both events and jobs.
+    """
 
     def __init__(
         self,
-        brave_api_key: str | None = None,
-        anthropic_api_key: str | None = None,
+        serper_api_key: str | None = None,
     ) -> None:
-        self.brave_api_key = brave_api_key or settings.discovery.BRAVE_API_KEY
-        self.anthropic_api_key = anthropic_api_key or settings.discovery.ANTHROPIC_API_KEY
+        self.serper_api_key = serper_api_key or settings.discovery.SERPER_API_KEY
         self.lms_base_url = settings.app.LMS_URL
 
     # ------------------------------------------------------------------
@@ -215,248 +329,120 @@ class OpportunityDiscoveryEngine:
         key = _normalise_track(track)
         return TRACK_KEYWORDS.get(key, [track.lower()])
 
-    def build_event_queries(self, track: str, location: str) -> list[str]:
+    def _primary_keyword(self, track: str) -> str:
+        """Get the single best keyword for a track."""
         keywords = self._keywords_for_track(track)
-        queries: list[str] = []
-        for kw in keywords[:3]:
-            queries.append(f"site:linkedin.com/events {kw} {location}")
-            queries.append(f"{kw} meetup OR networking event {location} 2026")
-            queries.append(f"{kw} hackathon OR workshop {location}")
-        return queries
+        return keywords[0] if keywords else track.replace("-", " ")
 
-    def build_job_queries(self, track: str, location: str) -> list[str]:
-        keywords = self._keywords_for_track(track)
-        queries: list[str] = []
-        for kw in keywords[:3]:
-            queries.append(f"{kw} job {location} junior OR entry level")
-            queries.append(f"{kw} internship OR graduate {location}")
-            queries.append(f"hiring {kw} {location}")
-        return queries
+    def build_event_queries(
+        self,
+        track: str,
+        location: str,
+        profile: StudentProfile | None = None,
+    ) -> list[str]:
+        """Build event discovery queries for Serper.dev.
 
-    def build_learning_queries(self, track: str) -> list[str]:
-        keywords = self._keywords_for_track(track)
-        queries: list[str] = []
-        for kw in keywords[:2]:
-            queries.append(f"free {kw} certification OR course 2026")
-            queries.append(f"{kw} exam voucher OR scholarship")
-        return queries
-
-    # ------------------------------------------------------------------
-    # Brave Search
-    # ------------------------------------------------------------------
-    async def brave_search(self, query: str, freshness: str = "pw", count: int = 5) -> list[dict[str, Any]]:
-        """Execute a Brave Search API query.
-
-        Args:
-            query: Search query string
-            freshness: 'pd' past day, 'pw' past week, 'pm' past month
-            count: Number of results (max 20)
+        Uses boolean OR operators for broad coverage across event types.
         """
-        if not self.brave_api_key:
-            logger.warning("brave_search_skipped", reason="BRAVE_SEARCH_API_KEY not set")
+        kw = self._primary_keyword(track)
+        loc = _readable_location(location)
+        alt_keywords = self._keywords_for_track(track)[:3]
+        kw_or = " OR ".join(f'"{k}"' for k in alt_keywords)
+        queries: list[str] = []
+
+        # Broad event query with boolean operators
+        queries.append(f'({kw_or}) ("conference" OR "summit" OR "meetup" OR "workshop") ("{loc}")')
+
+        # Platform-targeted
+        queries.append(f'site:eventbrite.com "{kw}" "{loc}"')
+        queries.append(f'site:meetup.com "{kw}" "{loc}"')
+
+        # Career fairs if relevant
+        if profile and profile.primary_goal:
+            goal = profile.primary_goal.lower()
+            if any(w in goal for w in ["job", "career", "hire", "transition"]):
+                queries.append(f'"career fair" OR "hiring event" "{kw}" "{loc}"')
+
+        return queries
+
+    def build_job_queries(
+        self,
+        track: str,
+        location: str,
+        profile: StudentProfile | None = None,
+    ) -> list[str]:
+        """Build job discovery queries for Serper.dev.
+
+        Uses site: operators for specific job boards + a general query.
+        """
+        loc = _readable_location(location)
+
+        # Determine job title
+        title = self._primary_keyword(track)
+        if profile and profile.target_role:
+            title = profile.target_role
+        elif profile and profile.target_job_titles:
+            title = profile.target_job_titles[0]
+
+        # Experience level hint
+        level_hint = ""
+        if profile and profile.experience_level in ("entry-level", "junior"):
+            level_hint = "junior"
+
+        search_title = f"{level_hint} {title}".strip() if level_hint else title
+        queries: list[str] = []
+
+        # Site-specific job board queries
+        job_boards = [
+            "boards.greenhouse.io",
+            "jobs.lever.co",
+            "jobs.ashbyhq.com",
+        ]
+        for board in job_boards:
+            queries.append(f'site:{board} "{search_title}" "{loc}"')
+
+        # General job query
+        queries.append(f'"{search_title}" "hiring" OR "job" "{loc}"')
+
+        return queries
+
+    # ------------------------------------------------------------------
+    # Serper.dev Google Search (for both events and jobs)
+    # ------------------------------------------------------------------
+    async def serper_search(self, query: str, num: int = 10) -> list[dict[str, Any]]:
+        """Execute a Google search via Serper.dev POST API."""
+        if not self.serper_api_key:
+            logger.warning("serper_search_skipped", reason="SERPER_API_KEY not set")
             return []
 
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
+                resp = await client.post(
+                    "https://google.serper.dev/search",
                     headers={
-                        "Accept": "application/json",
-                        "X-Subscription-Token": self.brave_api_key,
+                        "X-API-KEY": self.serper_api_key,
+                        "Content-Type": "application/json",
                     },
-                    params={"q": query, "count": count, "freshness": freshness},
-                    timeout=10.0,
+                    json={"q": query, "num": num},
+                    timeout=15.0,
                 )
                 resp.raise_for_status()
-                results = resp.json().get("web", {}).get("results", [])
-                logger.info("brave_search_completed", query=query[:80], result_count=len(results))
+                data = resp.json()
+                results = data.get("organic", [])
+                logger.info(
+                    "serper_search_completed",
+                    query=query[:80],
+                    result_count=len(results),
+                )
                 return results
         except httpx.HTTPError as e:
-            logger.error("brave_search_failed", error=str(e), query=query[:80])
+            logger.error("serper_search_failed", error=str(e), query=query[:80])
             return []
 
     # ------------------------------------------------------------------
-    # Claude Web Search (Anthropic Messages API)
-    # ------------------------------------------------------------------
-    async def claude_web_search(
-        self,
-        query: str,
-        *,
-        max_uses: int = 3,
-        location: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Execute a search using Claude's built-in web search tool.
-
-        Returns a list of dicts with keys: title, url, description — same shape
-        as brave_search results so the rest of the pipeline can consume them
-        interchangeably.
-
-        Args:
-            query: Natural-language search query
-            max_uses: Max web searches Claude may issue (controls cost)
-            location: Optional user location for result localisation
-        """
-        if not self.anthropic_api_key:
-            logger.warning("ANTHROPIC_API_KEY not set — skipping Claude web search")
-            return []
-
-        try:
-            import anthropic
-
-            client = anthropic.AsyncAnthropic(api_key=self.anthropic_api_key)
-
-            # Build the web_search tool definition
-            web_search_tool: dict[str, Any] = {
-                "type": "web_search_20250305",
-                "name": "web_search",
-                "max_uses": max_uses,
-            }
-
-            # Add location hints if available
-            if location and location.lower() not in ("remote", "online", ""):
-                parts = [p.strip() for p in location.split(",")]
-                loc_spec: dict[str, Any] = {"type": "approximate"}
-                if len(parts) >= 1:
-                    loc_spec["city"] = parts[0]
-                if len(parts) >= 2:
-                    loc_spec["region"] = parts[1]
-                if len(parts) >= 3:
-                    loc_spec["country"] = parts[2]
-                web_search_tool["user_location"] = loc_spec
-
-            response = await client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1024,
-                tools=[web_search_tool],
-                messages=[
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Search the web for: {query}\n\n"
-                            "Return ONLY a concise list of the results you find. "
-                            "For each result include the title, URL, and a short description."
-                        ),
-                    }
-                ],
-            )
-
-            # Extract search results from response content blocks
-            results: list[dict[str, Any]] = []
-            for block in response.content:
-                # Grab raw web_search_tool_result items
-                if getattr(block, "type", "") == "web_search_tool_result":
-                    search_content = getattr(block, "content", [])
-                    if isinstance(search_content, list):
-                        for item in search_content:
-                            if getattr(item, "type", "") == "web_search_result":
-                                results.append(
-                                    {
-                                        "title": getattr(item, "title", ""),
-                                        "url": getattr(item, "url", ""),
-                                        "description": getattr(item, "page_age", ""),
-                                    }
-                                )
-
-            # Also extract cited information from text blocks for richer descriptions
-            url_to_desc: dict[str, str] = {}
-            for block in response.content:
-                if getattr(block, "type", "") == "text":
-                    citations = getattr(block, "citations", None) or []
-                    for cite in citations:
-                        cite_url = getattr(cite, "url", "")
-                        cited_text = getattr(cite, "cited_text", "")
-                        if cite_url and cited_text:
-                            existing = url_to_desc.get(cite_url, "")
-                            if len(cited_text) > len(existing):
-                                url_to_desc[cite_url] = cited_text
-
-            # Merge cited descriptions into results
-            for r in results:
-                url = r.get("url", "")
-                if url in url_to_desc and len(url_to_desc[url]) > len(r.get("description", "")):
-                    r["description"] = url_to_desc[url]
-
-            # Deduplicate by URL
-            seen: set[str] = set()
-            unique: list[dict[str, Any]] = []
-            for r in results:
-                u = r.get("url", "")
-                if u and u not in seen:
-                    seen.add(u)
-                    unique.append(r)
-
-            logger.info(
-                "claude_web_search_completed",
-                query=query,
-                result_count=len(unique),
-                web_search_requests=getattr(
-                    getattr(response.usage, "server_tool_use", None),
-                    "web_search_requests",
-                    0,
-                )
-                if hasattr(response.usage, "server_tool_use")
-                else response.usage.__dict__.get("server_tool_use", {}).get("web_search_requests", 0),
-            )
-            return unique
-
-        except Exception as e:
-            logger.error("Claude web search failed", error=str(e), query=query)
-            return []
-
-    # ------------------------------------------------------------------
-    # Unified search dispatcher
-    # ------------------------------------------------------------------
-    async def search(
-        self,
-        query: str,
-        *,
-        provider: str = "auto",
-        freshness: str = "pw",
-        count: int = 5,
-        location: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Unified search interface — dispatches to brave, claude, or both.
-
-        Args:
-            query: Search query
-            provider: 'brave', 'claude', 'both', or 'auto' (tries brave first,
-                      falls back to claude)
-            freshness: Brave freshness filter (ignored for claude)
-            count: Number of results for Brave
-            location: User location for Claude localisation
-        """
-        logger.info("search_dispatch", provider=provider, query=query[:80])
-
-        if provider == "brave":
-            return await self.brave_search(query, freshness=freshness, count=count)
-
-        if provider == "claude":
-            return await self.claude_web_search(query, location=location)
-
-        if provider == "both":
-            brave_results = await self.brave_search(query, freshness=freshness, count=count)
-            claude_results = await self.claude_web_search(query, location=location)
-            # Merge, deduplicate by URL (brave results get priority)
-            seen = {r.get("url") for r in brave_results if r.get("url")}
-            merged = list(brave_results)
-            for r in claude_results:
-                if r.get("url") not in seen:
-                    seen.add(r.get("url"))
-                    merged.append(r)
-            return merged
-
-        # auto: prefer brave, fall back to claude
-        results = await self.brave_search(query, freshness=freshness, count=count)
-        if not results and self.anthropic_api_key:
-            logger.info("Brave returned no results — falling back to Claude web search")
-            results = await self.claude_web_search(query, location=location)
-        return results
-
-    # ------------------------------------------------------------------
-    # Result parsing
+    # Result parsing (URL-domain based classification)
     # ------------------------------------------------------------------
     def _extract_company(self, title: str, url: str) -> str | None:
-        """Best-effort company extraction from title."""
         clean = title.replace(" | LinkedIn", "").replace(" | Indeed", "").strip()
         is_linkedin = "linkedin.com" in url
 
@@ -472,91 +458,65 @@ class OpportunityDiscoveryEngine:
                 return parts[-1].strip()
         return None
 
-    def parse_event_result(self, result: dict[str, Any], track: str, location: str) -> dict[str, Any] | None:
-        title = result.get("title", "")
-        desc = result.get("description", "")
-        url = result.get("url", "")
-        content = f"{title} {desc}".lower()
-
-        if not any(kw in content for kw in EVENT_SIGNALS):
-            return None
-
-        return {
-            "opportunity_type": "event",
-            "title": title,
-            "description": desc,
-            "url": url,
-            "location": location,
-            "matched_track": track,
-            "match_score": self._score(result, track),
-        }
-
-    def parse_job_result(self, result: dict[str, Any], track: str, location: str) -> dict[str, Any] | None:
-        title = result.get("title", "")
-        desc = result.get("description", "")
-        url = result.get("url", "")
-        content = f"{title} {desc}".lower()
-
-        is_linkedin = "linkedin.com/jobs" in url
-        if not is_linkedin and not any(kw in content for kw in JOB_SIGNALS):
-            return None
-
-        clean_title = title.replace(" | LinkedIn", "").replace(" | Indeed", "").replace(" | Glassdoor", "").strip()
-
-        return {
-            "opportunity_type": "job",
-            "title": clean_title,
-            "description": desc,
-            "url": url,
-            "location": location,
-            "company": self._extract_company(title, url),
-            "matched_track": track,
-            "match_score": self._score(result, track),
-        }
-
-    def parse_learning_result(self, result: dict[str, Any], track: str) -> dict[str, Any] | None:
-        title = result.get("title", "")
-        desc = result.get("description", "")
-        url = result.get("url", "")
-        content = f"{title} {desc}".lower()
-
-        if not any(kw in content for kw in LEARNING_SIGNALS):
-            return None
-
-        return {
-            "opportunity_type": "learning",
-            "title": title,
-            "description": desc,
-            "url": url,
-            "location": "online",
-            "matched_track": track,
-            "match_score": self._score(result, track),
-        }
-
     def _score(self, result: dict[str, Any], track: str) -> Decimal:
         """Deterministic relevance score 0.00–1.00."""
         score = 0.50
-        content = f"{result.get('title', '')} {result.get('description', '')}".lower()
+        desc = result.get("description", "") or result.get("snippet", "")
+        content = f"{result.get('title', '')} {desc}".lower()
         keywords = self._keywords_for_track(track)
         for kw in keywords:
             if kw.lower() in content:
                 score += 0.08
         return Decimal(str(min(round(score, 2), 1.0)))
 
+    def parse_result(
+        self,
+        result: dict[str, Any],
+        track: str,
+        location: str,
+    ) -> dict[str, Any] | None:
+        """Parse and classify a Serper.dev organic result.
+
+        Serper returns: title, link, snippet, position, etc.
+        """
+        title = result.get("title", "")
+        desc = result.get("snippet", "") or result.get("description", "")
+        url = result.get("link", "") or result.get("url", "")
+
+        if not url or not title:
+            return None
+
+        opp_type = _classify_result(url, title, desc)
+        if not opp_type:
+            return None
+
+        clean_title = title.replace(" | LinkedIn", "").replace(" | Indeed", "").replace(" | Glassdoor", "").strip()
+
+        parsed: dict[str, Any] = {
+            "opportunity_type": opp_type,
+            "title": clean_title,
+            "description": desc,
+            "url": url,
+            "location": _readable_location(location),
+            "matched_track": track,
+            "match_score": self._score(result, track),
+        }
+
+        if opp_type == "job":
+            parsed["company"] = self._extract_company(title, url)
+
+        return parsed
+
     # ------------------------------------------------------------------
-    # AI enrichment helpers
+    # AI enrichment helpers (called on-demand, NOT during discovery)
     # ------------------------------------------------------------------
     async def generate_networking_strategy(self, opportunity: dict[str, Any], user_track: str) -> dict[str, Any] | None:
-        """Generate a personalised networking strategy for an event.
-
-        Returns a dict with keys: why_relevant, preparation, conversation_starters,
-        goals, follow_up.  Returns None on failure.
-        """
+        """Generate a personalised networking strategy for an event."""
         try:
             from langchain_core.messages import HumanMessage, SystemMessage
             from langchain_openai import ChatOpenAI
 
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, max_tokens=600)
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, max_tokens=500, request_timeout=12)
             messages = [
                 SystemMessage(
                     content=(
@@ -580,7 +540,6 @@ class OpportunityDiscoveryEngine:
             ]
             resp = await llm.ainvoke(messages)
             text = resp.content.strip()
-            # Strip markdown fences if present
             if text.startswith("```"):
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             return json.loads(text)
@@ -591,16 +550,12 @@ class OpportunityDiscoveryEngine:
     async def generate_application_strategy(
         self, opportunity: dict[str, Any], user_track: str
     ) -> dict[str, Any] | None:
-        """Generate AI application strategy for a job opportunity.
-
-        Returns dict with keys: fit_assessment, priority, resume_points,
-        cover_letter_angle, gap_mitigation, timeline.
-        """
+        """Generate AI application strategy for a job opportunity."""
         try:
             from langchain_core.messages import HumanMessage, SystemMessage
             from langchain_openai import ChatOpenAI
 
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, max_tokens=600)
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, max_tokens=500, request_timeout=12)
             messages = [
                 SystemMessage(
                     content=(
@@ -634,21 +589,119 @@ class OpportunityDiscoveryEngine:
             return None
 
     # ------------------------------------------------------------------
+    # Batch strategy generation (runs during discovery)
+    # ------------------------------------------------------------------
+    async def _generate_strategies_batch(
+        self,
+        parsed_results: list[dict[str, Any]],
+        max_strategies: int = 15,
+    ) -> list[dict[str, Any]]:
+        """Generate AI strategies for top-scoring results in parallel.
+
+        Per requirement.md:
+        - Events → generate_networking_strategy()
+        - Jobs  → generate_application_strategy()
+
+        Only the top `max_strategies` results (by match_score) get strategies
+        generated during discovery — the rest can be loaded on-demand via
+        /opportunities/{id}/strategy.
+        """
+        if not parsed_results:
+            return parsed_results
+
+        # Sort by match_score descending, pick top N for strategy generation
+        scored = sorted(parsed_results, key=lambda x: x.get("match_score", 0), reverse=True)
+        to_generate = scored[:max_strategies]
+        remaining = scored[max_strategies:]
+
+        sem = asyncio.Semaphore(4)
+
+        async def _gen(item: dict[str, Any]) -> dict[str, Any]:
+            async with sem:
+                try:
+                    opp_type = item.get("opportunity_type")
+                    track = item.get("matched_track", "")
+                    if opp_type == "event":
+                        strategy = await self.generate_networking_strategy(item, track)
+                        if strategy:
+                            item["networking_strategy"] = strategy
+                    elif opp_type == "job":
+                        strategy = await self.generate_application_strategy(item, track)
+                        if strategy:
+                            item["application_strategy"] = strategy
+                except Exception as e:
+                    logger.warning(
+                        "batch_strategy_generation_failed",
+                        error=str(e),
+                        title=item.get("title", "")[:60],
+                    )
+            return item
+
+        results = await asyncio.gather(*[_gen(p) for p in to_generate])
+        succeeded = sum(1 for r in results if r.get("networking_strategy") or r.get("application_strategy"))
+        logger.info(
+            "batch_strategy_generation_complete",
+            total=len(parsed_results),
+            generated=len(to_generate),
+            with_strategy=succeeded,
+            skipped=len(remaining),
+        )
+        return list(results) + remaining
+
+    # ------------------------------------------------------------------
     # Core discovery flow
     # ------------------------------------------------------------------
+    async def _get_student_profile(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        auth_token: str | None = None,
+    ) -> StudentProfile:
+        if auth_token and auth_token != "scheduled_job_token":  # nosec B105
+            try:
+                return await fetch_student_profile(user_id, auth_token)
+            except Exception as e:
+                logger.warning("student_profile_fetch_failed", error=str(e), user_id=user_id)
+        return StudentProfile(user_id=user_id)
+
+    async def _get_tracks_from_prefs_or_fallback(
+        self,
+        session: AsyncSession,
+        user_id: str,
+    ) -> list[str]:
+        """Resolve track names from DB preferences or use fallback defaults.
+
+        Called only when profile.enrolled_tracks is empty (LMS had no data).
+        """
+        result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
+        prefs = result.scalar_one_or_none()
+        if prefs and prefs.preferences:
+            stored = prefs.preferences
+            tracks = stored.get("tracks", []) or []
+            if not tracks:
+                lt = stored.get("learning_track") or stored.get("track")
+                if lt:
+                    tracks = [lt] if isinstance(lt, str) else list(lt)
+            if tracks:
+                logger.info("discovery_tracks_from_prefs", user_id=user_id, tracks=tracks)
+                return tracks
+
+        fallback = list(TRACK_KEYWORDS.keys())
+        logger.warning(
+            "discovery_using_fallback_tracks",
+            user_id=user_id,
+            reason="no LMS enrollments or stored preferences",
+            tracks=fallback,
+        )
+        return fallback
+
     async def _get_tracks_for_user(
         self,
         session: AsyncSession,
         user_id: str,
         auth_token: str | None = None,
     ) -> list[str]:
-        """Resolve track names for a user.
-
-        Priority:
-        1. LMS enrollments (if auth_token is a real JWT)
-        2. UserPreferences.preferences JSONB (tracks / learning_track keys)
-        3. Fallback: all known tracks
-        """
+        """Resolve track names for a user."""
         # 1 — Try LMS
         if auth_token and auth_token != "scheduled_job_token":  # nosec B105
             enrollments = await self.get_user_enrollments(user_id, auth_token)
@@ -677,7 +730,7 @@ class OpportunityDiscoveryEngine:
                 logger.info("discovery_tracks_from_prefs", user_id=user_id, tracks=tracks)
                 return tracks
 
-        # 3 — Fallback: use all known tracks so the scheduler still produces results
+        # 3 — Fallback
         fallback = list(TRACK_KEYWORDS.keys())
         logger.warning(
             "discovery_using_fallback_tracks",
@@ -687,42 +740,130 @@ class OpportunityDiscoveryEngine:
         )
         return fallback
 
+    async def _discover_events(
+        self,
+        tracks: list[str],
+        location: str,
+        profile: StudentProfile | None,
+        seen_urls: set[str],
+        queries_per_category: int = 2,
+    ) -> list[dict[str, Any]]:
+        """Discover events via Serper.dev."""
+        sem = asyncio.Semaphore(4)
+
+        async def _search_one(query: str, track: str) -> list[dict[str, Any]]:
+            async with sem:
+                results = await self.serper_search(query, num=10)
+                parsed_list: list[dict[str, Any]] = []
+                for r in results:
+                    url = r.get("link", "") or r.get("url", "")
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    parsed = self.parse_result(r, track, location)
+                    if parsed and parsed["opportunity_type"] == "event" and parsed["match_score"] >= Decimal("0.50"):
+                        parsed["_query"] = query
+                        parsed["_source"] = "serper"
+                        parsed_list.append(parsed)
+                return parsed_list
+
+        tasks = []
+        for track_name in tracks:
+            event_queries = self.build_event_queries(track_name, location, profile)
+            for q in event_queries[:queries_per_category]:
+                tasks.append(_search_one(q, track_name))
+
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        all_events: list[dict[str, Any]] = []
+        for batch in gathered:
+            if isinstance(batch, list):
+                all_events.extend(batch)
+        return all_events
+
+    async def _discover_jobs(
+        self,
+        tracks: list[str],
+        location: str,
+        profile: StudentProfile | None,
+        seen_urls: set[str],
+        queries_per_category: int = 2,
+    ) -> list[dict[str, Any]]:
+        """Discover jobs via Serper.dev (site: operator queries)."""
+        sem = asyncio.Semaphore(4)
+
+        async def _search_one(query: str, track: str) -> list[dict[str, Any]]:
+            async with sem:
+                results = await self.serper_search(query, num=10)
+                parsed_list: list[dict[str, Any]] = []
+                for r in results:
+                    url = r.get("link", "") or r.get("url", "")
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    parsed = self.parse_result(r, track, location)
+                    if parsed and parsed["opportunity_type"] == "job" and parsed["match_score"] >= Decimal("0.50"):
+                        parsed["_query"] = query
+                        parsed["_source"] = "serper"
+                        parsed_list.append(parsed)
+                return parsed_list
+
+        tasks = []
+        for track_name in tracks:
+            job_queries = self.build_job_queries(track_name, location, profile)
+            for q in job_queries[:queries_per_category]:
+                tasks.append(_search_one(q, track_name))
+
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        all_jobs: list[dict[str, Any]] = []
+        for batch in gathered:
+            if isinstance(batch, list):
+                all_jobs.extend(batch)
+        return all_jobs
+
     async def discover_for_user(
         self,
         session: AsyncSession,
         user_id: str,
         auth_token: str = "",
-        search_provider: str = "auto",
         max_tracks: int = 0,
-        queries_per_category: int = 3,
+        queries_per_category: int = 2,
+        **_kwargs: Any,
     ) -> list[DiscoveredOpportunity]:
         """Run full discovery pipeline for a single user.
 
-        Args:
-            session: Database session
-            user_id: Authenticated user ID
-            auth_token: JWT for LMS API (optional for scheduled runs)
-            search_provider: 'brave', 'claude', 'both', or 'auto'
+        Events + Jobs → Serper.dev (google.serper.dev)
+        AI strategy generated for each opportunity (per requirement.md):
+        - Events → generate_networking_strategy()
+        - Jobs → generate_application_strategy()
         """
-        tracks = await self._get_tracks_for_user(session, user_id, auth_token)
+        profile = await self._get_student_profile(session, user_id, auth_token)
+
+        # Derive tracks from the profile that was already fetched (avoid
+        # a redundant LMS call). Fall back to DB prefs / defaults only
+        # if profile has no enrollment data.
+        tracks = profile.enrolled_tracks if profile.enrolled_tracks else []
+        if not tracks:
+            tracks = await self._get_tracks_from_prefs_or_fallback(session, user_id)
         if not tracks:
             logger.warning("discovery_no_tracks", user_id=user_id)
             return []
 
-        # Limit tracks if requested (e.g. scheduled job uses fewer)
         if max_tracks > 0:
             tracks = tracks[:max_tracks]
+
+        location = profile.location
+        if location == "remote":
+            location = await self.get_user_location(session, user_id) or "remote"
 
         logger.info(
             "discovery_starting",
             user_id=user_id,
-            provider=search_provider,
             track_count=len(tracks),
             tracks=tracks,
+            location=_readable_location(location),
+            target_role=profile.target_role,
+            is_job_searching=profile.is_job_searching,
         )
-
-        location = await self.get_user_location(session, user_id) or "remote"
-        logger.info("discovery_location", user_id=user_id, location=location)
 
         # Collect existing URLs to avoid duplicating
         existing = await session.execute(
@@ -734,122 +875,49 @@ class OpportunityDiscoveryEngine:
         seen_urls: set[str] = {r[0] for r in existing.all() if r[0]}
         logger.info("discovery_existing_urls", count=len(seen_urls))
 
+        # Run event and job discovery in parallel
+        event_results, job_results = await asyncio.gather(
+            self._discover_events(tracks, location, profile, seen_urls, queries_per_category),
+            self._discover_jobs(tracks, location, profile, seen_urls, queries_per_category),
+        )
+
+        all_parsed = event_results + job_results
+
+        # ── Generate AI strategies in parallel (per requirement.md) ──
+        all_parsed = await self._generate_strategies_batch(all_parsed)
+
+        # Create DB records
         discovered: list[DiscoveredOpportunity] = []
+        for parsed in all_parsed:
+            opp_type = parsed["opportunity_type"]
+            expires_days = 30 if opp_type == "event" else 14
 
-        for track_name in tracks:
-            logger.info("discovery_processing_track", track=track_name, user_id=user_id)
+            meta: dict[str, Any] = {
+                "source": parsed.get("_source", "unknown"),
+                "query": parsed.get("_query", ""),
+            }
+            # Attach strategy to metadata so frontend can display it
+            if parsed.get("networking_strategy"):
+                meta["networking_strategy"] = parsed["networking_strategy"]
+            if parsed.get("application_strategy"):
+                meta["application_strategy"] = parsed["application_strategy"]
 
-            # --- Events ---
-            for query in self.build_event_queries(track_name, location)[:queries_per_category]:
-                logger.debug("discovery_search_query", category="event", query=query)
-                search_results = await self.search(
-                    query,
-                    provider=search_provider,
-                    freshness="pw",
-                    location=location,
-                )
-                logger.info("discovery_search_results", category="event", query=query[:60], count=len(search_results))
-                for result in search_results:
-                    url = result.get("url", "")
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    parsed = self.parse_event_result(result, track_name, location)
-                    if parsed:
-                        strategy = await self.generate_networking_strategy(parsed, track_name)
-                        opp = DiscoveredOpportunity(
-                            user_id=user_id,
-                            opportunity_type="event",
-                            title=parsed["title"],
-                            description=parsed["description"],
-                            url=url,
-                            location=location,
-                            matched_track=track_name,
-                            match_score=parsed["match_score"],
-                            expires_at=datetime.now(UTC) + timedelta(days=30),
-                            metadata_json={
-                                "source": search_provider,
-                                "query": query,
-                                "networking_strategy": strategy,
-                            },
-                        )
-                        session.add(opp)
-                        discovered.append(opp)
-
-            # --- Jobs ---
-            for query in self.build_job_queries(track_name, location)[:queries_per_category]:
-                logger.debug("discovery_search_query", category="job", query=query)
-                search_results = await self.search(
-                    query,
-                    provider=search_provider,
-                    freshness="pw",
-                    location=location,
-                )
-                logger.info("discovery_search_results", category="job", query=query[:60], count=len(search_results))
-                for result in search_results:
-                    url = result.get("url", "")
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    parsed = self.parse_job_result(result, track_name, location)
-                    if parsed:
-                        strategy = await self.generate_application_strategy(parsed, track_name)
-                        opp = DiscoveredOpportunity(
-                            user_id=user_id,
-                            opportunity_type="job",
-                            title=parsed["title"],
-                            description=parsed["description"],
-                            url=url,
-                            location=location,
-                            company=parsed.get("company"),
-                            matched_track=track_name,
-                            match_score=parsed["match_score"],
-                            expires_at=datetime.now(UTC) + timedelta(days=14),
-                            metadata_json={
-                                "source": search_provider,
-                                "query": query,
-                                "application_strategy": strategy,
-                            },
-                        )
-                        session.add(opp)
-                        discovered.append(opp)
-
-            # --- Learning opportunities ---
-            for query in self.build_learning_queries(track_name)[: max(1, queries_per_category - 1)]:
-                logger.debug("discovery_search_query", category="learning", query=query)
-                search_results = await self.search(
-                    query,
-                    provider=search_provider,
-                    freshness="pm",
-                    location=location,
-                )
-                logger.info(
-                    "discovery_search_results", category="learning", query=query[:60], count=len(search_results)
-                )
-                for result in search_results:
-                    url = result.get("url", "")
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    parsed = self.parse_learning_result(result, track_name)
-                    if parsed:
-                        opp = DiscoveredOpportunity(
-                            user_id=user_id,
-                            opportunity_type="learning",
-                            title=parsed["title"],
-                            description=parsed["description"],
-                            url=url,
-                            location="online",
-                            matched_track=track_name,
-                            match_score=parsed["match_score"],
-                            expires_at=datetime.now(UTC) + timedelta(days=30),
-                            metadata_json={
-                                "source": search_provider,
-                                "query": query,
-                            },
-                        )
-                        session.add(opp)
-                        discovered.append(opp)
+            opp = DiscoveredOpportunity(
+                user_id=user_id,
+                opportunity_type=opp_type,
+                title=parsed["title"],
+                description=parsed["description"],
+                url=parsed["url"],
+                location=parsed["location"],
+                company=parsed.get("company"),
+                salary_range=parsed.get("salary_range"),
+                matched_track=parsed["matched_track"],
+                match_score=parsed["match_score"],
+                expires_at=datetime.now(UTC) + timedelta(days=expires_days),
+                metadata_json=meta,
+            )
+            session.add(opp)
+            discovered.append(opp)
 
         await session.commit()
 
@@ -859,7 +927,6 @@ class OpportunityDiscoveryEngine:
             total=len(discovered),
             events=len([o for o in discovered if o.opportunity_type == "event"]),
             jobs=len([o for o in discovered if o.opportunity_type == "job"]),
-            learning=len([o for o in discovered if o.opportunity_type == "learning"]),
         )
         return discovered
 
@@ -871,7 +938,6 @@ class OpportunityDiscoveryEngine:
         session: AsyncSession,
         opportunity: DiscoveredOpportunity,
     ) -> Notification:
-        """Create an in-app notification for a newly discovered opportunity."""
         type_label = opportunity.opportunity_type
 
         if type_label == "event":
@@ -886,7 +952,7 @@ class OpportunityDiscoveryEngine:
                 },
                 {"action": "dismiss", "title": "Not Interested"},
             ]
-        elif type_label == "job":
+        else:
             company_part = f" at {opportunity.company}" if opportunity.company else ""
             title = "💼 Job Opportunity Alert"
             content = f"New {opportunity.matched_track} role: {opportunity.title}{company_part}"
@@ -895,15 +961,8 @@ class OpportunityDiscoveryEngine:
                 {
                     "action": "strategy",
                     "title": "Application Strategy",
-                    "url": f"/dashboard/opportunities?id={opportunity.id}",
+                    "url": f"/dashboard/job-board?id={opportunity.id}",
                 },
-                {"action": "dismiss", "title": "Not Interested"},
-            ]
-        else:
-            title = "🎓 Learning Opportunity"
-            content = f"Free resource for your {opportunity.matched_track} journey: {opportunity.title}"
-            action_buttons = [
-                {"action": "view", "title": "Check It Out", "url": opportunity.url},
                 {"action": "dismiss", "title": "Not Interested"},
             ]
 
@@ -924,8 +983,20 @@ class OpportunityDiscoveryEngine:
         )
         session.add(notification)
         opportunity.status = "notified"
-        await session.commit()
         return notification
+
+    async def create_notifications_batch(
+        self,
+        session: AsyncSession,
+        opportunities: list[DiscoveredOpportunity],
+    ) -> list[Notification]:
+        """Create notifications for all opportunities in a single commit."""
+        notifications = []
+        for opp in opportunities:
+            n = await self.create_opportunity_notification(session, opp)
+            notifications.append(n)
+        await session.commit()
+        return notifications
 
 
 # ---------------------------------------------------------------------------

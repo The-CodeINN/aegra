@@ -10,9 +10,13 @@ consider implementing more robust and specialized tools tailored to your needs.
 """
 
 import asyncio
+import contextlib
+import json
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from langchain_community.tools import BraveSearch
@@ -22,6 +26,100 @@ from react_agent.context import Context
 from react_agent.memory import get_user_memory, save_user_memory, search_user_memories
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# LMS response caching (Redis + in-memory fallback)
+# ---------------------------------------------------------------------------
+# TTLs (seconds)
+_TTL_ONBOARDING = 86400  # 24 h — onboarding data rarely changes
+_TTL_PROFILE = 3600  # 1 h
+_TTL_ENROLLMENT = 900  # 15 min
+
+# In-memory fallback: key → (json_str, expiry_ts)
+_mem_cache: dict[str, tuple[str, float]] = {}
+
+# Lazy Redis client reference (set once on first use)
+_redis_client: Any = None
+_redis_checked = False
+
+
+def _ttl_for_path(path: str) -> int:
+    if "/onboarding" in path or "/ai-mentor/" in path:
+        return _TTL_ONBOARDING
+    if "/user/profile" in path:
+        return _TTL_PROFILE
+    if "/enrollment" in path:
+        return _TTL_ENROLLMENT
+    return _TTL_PROFILE
+
+
+def _cache_key(user_id: str, path: str) -> str:
+    return f"agent:{user_id}:{path}"
+
+
+def _get_redis_client() -> Any:
+    """Return the shared Redis client from aegra_api.core.redis, or None."""
+    global _redis_client, _redis_checked
+    if _redis_checked:
+        return _redis_client
+    _redis_checked = True
+    try:
+        from aegra_api.core.redis import redis_manager
+
+        if redis_manager.is_available():
+            _redis_client = redis_manager.get_client()
+    except Exception:
+        _redis_client = None
+    return _redis_client
+
+
+async def _cached_lms_get(
+    client: httpx.AsyncClient,
+    url: str,
+    token: str,
+    user_id: str | None,
+) -> dict[str, Any]:
+    """GET with Redis + in-memory caching. Falls back to live fetch."""
+    path = urlparse(url).path
+    uid = user_id or "anon"
+    key = _cache_key(uid, path)
+    ttl = _ttl_for_path(path)
+
+    # 1. Redis
+    rc = _get_redis_client()
+    if rc is not None:
+        with contextlib.suppress(Exception):
+            val = await rc.get(key)
+            if val is not None:
+                return json.loads(val)
+
+    # 2. Memory
+    entry = _mem_cache.get(key)
+    if entry is not None:
+        value, expiry = entry
+        if time.time() < expiry:
+            return json.loads(value)
+        else:
+            del _mem_cache[key]
+
+    # 3. Live fetch
+    resp = await client.get(
+        url,
+        headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
+    )
+    resp.raise_for_status()
+    data: dict[str, Any] = resp.json()
+
+    serialized = json.dumps(data)
+    # Store in Redis
+    if rc is not None:
+        with contextlib.suppress(Exception):
+            await rc.setex(key, ttl, serialized)
+    # Store in memory
+    _mem_cache[key] = (serialized, time.time() + ttl)
+
+    return data
+
 
 # Import RAG course retriever
 try:
@@ -210,13 +308,7 @@ async def get_student_profile() -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=10.0) as client:
             logger.info(f"Fetching student profile from {profile_endpoint}")
 
-            response = await client.get(
-                profile_endpoint,
-                headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
-            )
-
-            response.raise_for_status()
-            data = response.json()
+            data = await _cached_lms_get(client, profile_endpoint, token, runtime.context.user_id)
 
             # Extract only the required fields
             profile = {
@@ -278,13 +370,7 @@ async def get_student_onboarding() -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=10.0) as client:
             logger.info(f"Fetching student onboarding from {onboarding_endpoint}")
 
-            response = await client.get(
-                onboarding_endpoint,
-                headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
-            )
-
-            response.raise_for_status()
-            data = response.json()
+            data = await _cached_lms_get(client, onboarding_endpoint, token, runtime.context.user_id)
 
             # Extract the onboarding data
             onboarding_data = data.get("onboarding", {})
@@ -354,13 +440,7 @@ async def get_student_ai_career_advisor_onboarding() -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=10.0) as client:
             logger.info(f"Fetching AI career advisor onboarding from {career_advisor_endpoint}")
 
-            response = await client.get(
-                career_advisor_endpoint,
-                headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
-            )
-
-            response.raise_for_status()
-            data = response.json()
+            data = await _cached_lms_get(client, career_advisor_endpoint, token, runtime.context.user_id)
 
             # Extract the onboarding data
             onboarding_data = data.get("onboarding", {})
