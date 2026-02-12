@@ -166,13 +166,16 @@ class AccountabilityService:
     @staticmethod
     async def dismiss_notification(session: AsyncSession, notification_id: str, user_id: str) -> dict:
         """Permanently dismiss a notification."""
+        from datetime import UTC
+        from datetime import datetime as dt
+
         stmt = (
             update(Notification)
             .where(
                 Notification.id == notification_id,
                 Notification.user_id == user_id,
             )
-            .values(status="dismissed")
+            .values(status="dismissed", dismissed_at=dt.now(UTC))
         )
         result = await session.execute(stmt)
         if result.rowcount == 0:
@@ -214,6 +217,7 @@ class AccountabilityService:
             "quiet_hours_start",
             "quiet_hours_end",
             "disabled_categories",
+            "email_enabled",
         ):
             if key in data:
                 pref_json[key] = data[key]

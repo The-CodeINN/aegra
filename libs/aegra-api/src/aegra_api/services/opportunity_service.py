@@ -81,7 +81,7 @@ class OpportunityService:
     async def get_opportunity_with_strategy(
         session: AsyncSession, opportunity_id: str, user_id: str
     ) -> dict[str, Any] | None:
-        """Return opportunity data including embedded AI strategy from metadata."""
+        """Return opportunity data with AI strategy — generated on-demand if missing."""
         opp = await OpportunityService.get_opportunity(session, opportunity_id, user_id)
         if not opp:
             return None
@@ -104,11 +104,35 @@ class OpportunityService:
             "metadata": meta,
         }
 
-        # Attach strategy if present
+        # Generate strategy on-demand if not cached in metadata
+        from aegra_api.services.opportunity_discovery import opportunity_engine
+
+        opp_dict = {
+            "title": opp.title,
+            "description": opp.description,
+            "url": opp.url,
+            "company": opp.company,
+        }
+        track = opp.matched_track or ""
+
         if opp.opportunity_type == "event":
-            data["networking_strategy"] = meta.get("networking_strategy")
+            strategy = meta.get("networking_strategy")
+            if not strategy:
+                strategy = await opportunity_engine.generate_networking_strategy(opp_dict, track)
+                if strategy:
+                    meta["networking_strategy"] = strategy
+                    opp.metadata_json = meta
+                    await session.commit()
+            data["networking_strategy"] = strategy
         elif opp.opportunity_type == "job":
-            data["application_strategy"] = meta.get("application_strategy")
+            strategy = meta.get("application_strategy")
+            if not strategy:
+                strategy = await opportunity_engine.generate_application_strategy(opp_dict, track)
+                if strategy:
+                    meta["application_strategy"] = strategy
+                    opp.metadata_json = meta
+                    await session.commit()
+            data["application_strategy"] = strategy
 
         return data
 

@@ -231,7 +231,7 @@ def start_postgres_container(compose_file: Path | None = None) -> bool:
     if compose_file:
         cmd.extend(["-f", str(compose_file)])
 
-    cmd.extend(["up", "-d", "postgres"])
+    cmd.extend(["up", "-d", "--wait", "postgres"])
 
     console.print("[cyan]Starting PostgreSQL container...[/cyan]")
     console.print(f"[dim]Running: {' '.join(cmd)}[/dim]")
@@ -322,7 +322,7 @@ def ensure_postgres_running(compose_file: Path | None = None) -> bool:
         if compose_file is None:
             console.print(
                 "\n[bold red]No docker-compose.yml found![/bold red]\n\n"
-                "Create one with: [cyan]aegra init --docker[/cyan]\n"
+                "Create one with: [cyan]aegra init[/cyan]\n"
                 "Or create it manually with a postgres service."
             )
             return False

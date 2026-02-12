@@ -50,7 +50,7 @@ async def authenticate(headers: dict) -> dict:
 3. **Start the server**:
 
 ```bash
-python run_server.py
+aegra dev
 # OR with Docker:
 docker compose up
 ```
@@ -93,7 +93,7 @@ Example:
 
 ```bash
 # Use custom config file
-AEGRA_CONFIG=production.json python run_server.py
+AEGRA_CONFIG=production.json aegra dev
 ```
 
 ## Authentication
@@ -378,7 +378,7 @@ Auth tests are located in `tests/e2e/manual_auth_tests/` and are skipped by defa
 2. **Start server with auth**:
 
 ```bash
-AEGRA_CONFIG=my_auth_config.json python run_server.py
+AEGRA_CONFIG=my_auth_config.json aegra dev
 ```
 
 3. **Run auth tests**:

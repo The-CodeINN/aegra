@@ -1,31 +1,43 @@
 """Alembic environment configuration for Aegra database migrations."""
 
-import asyncio
+import os
+import threading
 from logging.config import fileConfig
+from pathlib import Path
 
-from sqlalchemy import pool
+from sqlalchemy import create_engine, pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
+
+from alembic import context
+
+# Ensure .env is loaded from the project root (two levels up from alembic/)
+_project_root = Path(__file__).resolve().parents[3]  # aegra/
+_env_path = _project_root / ".env"
+if _env_path.is_file():
+    os.environ.setdefault("_AEGRA_ENV_FILE", str(_env_path))
+    # Feed dotenv values into the environment so pydantic-settings picks them up
+    from dotenv import load_dotenv
+
+    load_dotenv(_env_path, override=False)
 
 # Import your SQLAlchemy models here
-from aegra_api.core.orm import Base
-from aegra_api.settings import settings
-from alembic import context
+from aegra_api.core.orm import Base  # noqa: E402
+from aegra_api.settings import settings  # noqa: E402
 
 # This is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
 
-section = config.config_ini_section
-config.set_section_option(section, "DB_HOST", settings.db.POSTGRES_HOST)
-config.set_section_option(section, "DB_PORT", settings.db.POSTGRES_PORT)
-config.set_section_option(section, "DB_USER", settings.db.POSTGRES_USER)
-config.set_section_option(section, "DB_NAME", settings.db.POSTGRES_DB)
-config.set_section_option(section, "DB_PASS", settings.db.POSTGRES_PASSWORD)
+# Override the URL from settings — this respects DATABASE_URL, individual
+# POSTGRES_* vars, and preserves query params (e.g. ?sslmode=require).
+config.set_main_option("sqlalchemy.url", settings.db.database_url)
 
 # Interpret the config file for Python logging.
-# This line sets up loggers basically.
-if config.config_file_name is not None:
+# Only reconfigure logging when running from CLI (main thread).
+# When invoked programmatically via asyncio.to_thread(), fileConfig()
+# causes a cross-thread deadlock with the application's logging.
+# See: https://github.com/sqlalchemy/alembic/discussions/1483
+if config.config_file_name is not None and threading.current_thread() is threading.main_thread():
     fileConfig(config.config_file_name)
 
 # add your model's MetaData object here
@@ -69,29 +81,23 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
-async def run_async_migrations() -> None:
-    """In this scenario we need to create an Engine
-    and associate a connection with the context.
-
-    """
-    configuration = config.get_section(config.config_ini_section)
-    configuration["sqlalchemy.url"] = config.get_main_option("sqlalchemy.url")
-
-    connectable = async_engine_from_config(
-        configuration,
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-
-    await connectable.dispose()
-
-
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode."""
-    asyncio.run(run_async_migrations())
+    """Run migrations in 'online' mode.
+
+    Uses the sync psycopg (v3) driver with SSL for Neon compatibility.
+    """
+    db = settings.db
+    url = (
+        f"postgresql+psycopg://{db.POSTGRES_USER}:{db.POSTGRES_PASSWORD}@"
+        f"{db.POSTGRES_HOST}:{db.POSTGRES_PORT}/{db.POSTGRES_DB}"
+        f"?sslmode=require"
+    )
+    connectable = create_engine(url, poolclass=pool.NullPool)
+
+    with connectable.connect() as connection:
+        do_run_migrations(connection)
+
+    connectable.dispose()
 
 
 if context.is_offline_mode():

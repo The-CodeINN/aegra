@@ -1,6 +1,6 @@
 [project]
 name = "aegra-cli"
-version = "0.2.0"
+version = "0.4.1"
 description = "Aegra CLI - Manage your self-hosted agent deployments"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,16 +22,17 @@ dependencies = [
     "click>=8.1.7",
     "rich>=13.0",
     "jinja2>=3.1",
+    "python-dotenv>=1.1.1",
 
     # Server (always included)
-    "aegra-api>=0.1.0",
+    "aegra-api~=0.4.0",
 ]
 
 [project.scripts]
 aegra = "aegra_cli.cli:cli"
 
 [tool.uv.sources]
-aegra-api = { path = "../aegra-api", editable = true }
+aegra-api = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

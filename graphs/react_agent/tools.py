@@ -300,6 +300,8 @@ async def get_student_profile() -> dict[str, Any]:
             "message": "Unable to fetch student profile without authentication token",
         }
 
+    logger.info(f"Attempting to fetch profile with token (length: {len(token)})")
+
     # Get LMS API URL from context
     lms_url = runtime.context.lms_api_url
     profile_endpoint = f"{lms_url}/api/v1/user/profile"
@@ -322,11 +324,12 @@ async def get_student_profile() -> dict[str, Any]:
             return profile
 
     except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error fetching student profile: {e.response.status_code}")
+        logger.error(f"HTTP error fetching student profile: {e.response.status_code} - {e.response.text[:200]}")
         return {
             "error": "API request failed",
             "status_code": e.response.status_code,
             "message": str(e),
+            "details": e.response.text[:200],
         }
     except httpx.TimeoutException:
         logger.error("Timeout while fetching student profile")

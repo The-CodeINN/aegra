@@ -1,6 +1,7 @@
+import re
 from typing import Annotated
 
-from pydantic import BeforeValidator, Field, computed_field
+from pydantic import BeforeValidator, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,8 +22,6 @@ UpperStr = Annotated[str, BeforeValidator(parse_upper)]
 
 class EnvBase(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
         extra="ignore",
     )
 
@@ -58,7 +57,14 @@ class AppSettings(EnvBase):
 
 
 class DatabaseSettings(EnvBase):
-    """Database connection settings."""
+    """Database connection settings.
+
+    Supports two configuration modes:
+    1. DATABASE_URL (standard for containerized deployments) — parsed into individual fields
+    2. Individual POSTGRES_* vars — used when DATABASE_URL is not set
+    """
+
+    DATABASE_URL: str | None = None
 
     POSTGRES_USER: str = "postgres"
     POSTGRES_PASSWORD: str = "postgres"
@@ -67,10 +73,17 @@ class DatabaseSettings(EnvBase):
     POSTGRES_DB: str = "aegra"
     DB_ECHO_LOG: bool = False
 
+    @staticmethod
+    def _normalize_scheme(url: str, target_scheme: str) -> str:
+        """Replace the URL scheme/driver prefix with the target scheme."""
+        return re.sub(r"^postgres(?:ql)?(\+\w+)?://", f"{target_scheme}://", url)
+
     @computed_field
     @property
     def database_url(self) -> str:
         """Async URL for SQLAlchemy (asyncpg)."""
+        if self.DATABASE_URL:
+            return self._normalize_scheme(self.DATABASE_URL, "postgresql+asyncpg")
         return (
             f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@"
             f"{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
@@ -80,6 +93,8 @@ class DatabaseSettings(EnvBase):
     @property
     def database_url_sync(self) -> str:
         """Sync URL for LangGraph/Psycopg (postgresql://)."""
+        if self.DATABASE_URL:
+            return self._normalize_scheme(self.DATABASE_URL, "postgresql")
         return (
             f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@"
             f"{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
@@ -132,11 +147,24 @@ class PushNotificationSettings(EnvBase):
 class DiscoverySettings(EnvBase):
     """Opportunity discovery settings."""
 
-    BRAVE_API_KEY: str | None = Field(None, validation_alias="BRAVE_SEARCH_API_KEY")
-    ANTHROPIC_API_KEY: str | None = None
+    SERPER_API_KEY: str | None = None
+    OPENAI_API_KEY: str | None = None
     DISCOVERY_MAX_TRACKS: int = 2
-    DISCOVERY_QUERIES_PER_CATEGORY: int = 1
-    DISCOVERY_PROVIDER: str = "brave"  # brave, claude, or auto
+    DISCOVERY_QUERIES_PER_CATEGORY: int = 2
+    DISCOVERY_MAX_MANUAL_SCANS_PER_DAY: int = 4
+
+
+class EmailSettings(EnvBase):
+    """Email notification settings (SMTP)."""
+
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_USE_TLS: bool = True
+    EMAIL_FROM_ADDRESS: str = "noreply@dedatahub.com"
+    EMAIL_FROM_NAME: str = "DeDataHub AI Advisor"
+    EMAIL_ENABLED: bool = False  # Must be explicitly enabled
 
 
 class RedisSettings(EnvBase):
@@ -154,6 +182,7 @@ class Settings:
         self.observability = ObservabilitySettings()
         self.push = PushNotificationSettings()
         self.discovery = DiscoverySettings()
+        self.email = EmailSettings()
         self.redis = RedisSettings()
 
 

@@ -35,6 +35,8 @@ class ActionItem(Base):
     source_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Enhanced reminder fields
     advisor_persona: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str | None] = mapped_column(Text, nullable=True)  # conversation, self_added, system_suggested
+    dependencies: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # IDs of prerequisite action items
     reminder_sent_count: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
     last_reminder_sent: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
@@ -54,20 +56,29 @@ class Notification(Base):
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    short_message: Mapped[str | None] = mapped_column(Text, nullable=True)  # ≤160 chars for push/in-app
+    full_message: Mapped[str | None] = mapped_column(Text, nullable=True)  # Full email-length version
+    subject_line: Mapped[str | None] = mapped_column(Text, nullable=True)  # Email subject line
+    advisor_persona: Mapped[str | None] = mapped_column(Text, nullable=True)  # Which persona generated this
     channel: Mapped[str] = mapped_column(Text, nullable=False)  # e.g. "in_app", "email", "push"
     priority: Mapped[str] = mapped_column(Text, server_default=text("'normal'"))
-    status: Mapped[str] = mapped_column(Text, server_default=text("'pending'"))  # pending, sent, read, failed
+    status: Mapped[str] = mapped_column(
+        Text, server_default=text("'pending'")
+    )  # pending, sent, read, dismissed, failed
     category: Mapped[str | None] = mapped_column(Text, nullable=True)  # deadline, opportunity, celebration, inactivity
     metadata_json: Mapped[dict] = mapped_column(
         "metadata",
         JSONB,
-        server_default=text("'{}'::jsonb"),  # action_item_id, etc.
+        server_default=text("'{}'::jsonb"),
     )
     action_buttons: Mapped[list | None] = mapped_column(JSONB, server_default=text("'[]'::jsonb"), nullable=True)
     scheduled_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     read_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    dismissed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    clicked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 
     __table_args__ = (
