@@ -1,6 +1,6 @@
 [project]
 name = "aegra-api"
-version = "0.2.0"
+version = "0.4.1"
 description = "Aegra core API - Self-hosted Agent Protocol server"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -45,7 +45,6 @@ dependencies = [
 
     # Utils
     "structlog>=25.4.0",
-    "python-dotenv>=1.1.1",
     "asgi-correlation-id>=4.3.4",
     "pyjwt>=2.10.1",
 
@@ -88,6 +87,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aegra_api"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"alembic.ini" = "aegra_api/alembic.ini"
+"alembic" = "aegra_api/alembic"
 
 [tool.ruff]
 line-length = 120

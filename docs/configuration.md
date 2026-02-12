@@ -14,10 +14,12 @@ Example:
 
 ```bash
 # Use custom config file
-AEGRA_CONFIG=production.json python run_server.py
+AEGRA_CONFIG=production.json aegra dev
+# Or with uvicorn directly:
+AEGRA_CONFIG=production.json uv run --package aegra-api uvicorn aegra_api.main:app
 
 # Use default aegra.json
-python run_server.py
+aegra dev
 ```
 
 ## Configuration Schema
@@ -149,11 +151,39 @@ See [Semantic Store](semantic-store.md) for more details.
 
 ## Environment Variables
 
-You can override configuration using environment variables:
+You can override configuration using environment variables. See `.env.example` for a complete reference.
+
+### Database
+
+Two configuration modes are supported:
+
+**Option 1: `DATABASE_URL`** (recommended for containerized/cloud deployments)
+
+```bash
+DATABASE_URL=postgresql://user:password@host:5432/aegra?sslmode=require
+```
+
+The URL is used directly by both SQLAlchemy (async) and LangGraph (sync) with the appropriate driver prefix applied automatically. Query parameters (e.g., `?sslmode=require`) are preserved.
+
+**Option 2: Individual `POSTGRES_*` vars** (used when `DATABASE_URL` is not set)
+
+```bash
+POSTGRES_USER=aegra
+POSTGRES_PASSWORD=secret
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=aegra
+```
+
+> **Note:** `DATABASE_URL` takes precedence. When set, individual `POSTGRES_*` vars are ignored for connection URLs.
+
+### Other Variables
 
 - **`AEGRA_CONFIG`**: Path to config file (overrides default resolution)
-- **`DATABASE_URL`**: PostgreSQL connection string
 - **`OPENAI_API_KEY`**: OpenAI API key for LLM operations
+- **`AUTH_TYPE`**: Authentication mode (`noop`, `custom`)
+- **`LOG_LEVEL`**: Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
+- **`ENV_MODE`**: Environment mode (`LOCAL`, `DEVELOPMENT`, `PRODUCTION`)
 
 ## Examples
 

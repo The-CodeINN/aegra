@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/aegra/"><img src="https://img.shields.io/pypi/v/aegra?label=aegra&color=blue" alt="PyPI"></a>
+  <a href="https://pypi.org/project/aegra-api/"><img src="https://img.shields.io/pypi/v/aegra-api?label=aegra-api&color=blue" alt="PyPI API"></a>
   <a href="https://pypi.org/project/aegra-cli/"><img src="https://img.shields.io/pypi/v/aegra-cli?label=aegra-cli&color=blue" alt="PyPI CLI"></a>
   <a href="https://github.com/ibbybuilds/aegra/actions/workflows/ci.yml"><img src="https://github.com/ibbybuilds/aegra/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://app.codecov.io/gh/ibbybuilds/aegra"><img src="https://codecov.io/gh/ibbybuilds/aegra/graph/badge.svg" alt="Codecov"></a>
@@ -35,16 +35,18 @@ Aegra is a drop-in replacement for LangGraph Platform. Use the same LangGraph SD
 **Prerequisites:** Python 3.11+, Docker (for PostgreSQL)
 
 ```bash
-pip install aegra
+pip install aegra-cli
 
 # Initialize a new project
-aegra init --docker
+aegra init
 cp .env.example .env
 # Add your OPENAI_API_KEY to .env
 
 # Start PostgreSQL and run the development server
 aegra dev
 ```
+
+> **Note:** Always install `aegra-cli` directly — not the `aegra` meta-package. The `aegra` package on PyPI is a convenience wrapper that does not support version pinning.
 
 ### From Source
 
@@ -104,7 +106,6 @@ async for chunk in client.runs.stream(
 
 ```bash
 aegra init              # Initialize a new project
-aegra init --docker     # Include Docker configuration
 
 aegra dev               # Start development server (hot reload)
 aegra up                # Start all services with Docker
