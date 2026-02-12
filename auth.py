@@ -108,6 +108,7 @@ elif AUTH_TYPE == "custom":
                 "role": role,
                 "permissions": [role] if role else [],
                 "is_authenticated": True,
+                "token": token,  # Include the JWT token for LMS API calls
             }
 
         except ExpiredSignatureError:

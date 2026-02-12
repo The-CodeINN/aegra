@@ -902,6 +902,20 @@ async def execute_run_async(
         else:
             stream_mode_list = stream_mode.copy()
 
+        # Inject user data into context for graph runtime
+        runtime_context = context.copy() if context else {}
+        if user:
+            runtime_context.setdefault("user_id", user.identity)
+            # Get token from user - handle Pydantic extra fields
+            user_dict = user.to_dict()
+            if "token" in user_dict:
+                runtime_context.setdefault("user_token", user_dict["token"])
+                logger.info(f"[execute_run_async] Injected user_token into context for run_id={run_id}")
+            else:
+                logger.warning(
+                    f"[execute_run_async] No token found in user dict for run_id={run_id} user_dict_keys={list(user_dict.keys())}"
+                )
+
         async with (
             langgraph_service.get_graph(graph_id) as graph,
             with_auth_ctx(user, []),
@@ -913,7 +927,7 @@ async def execute_run_async(
                     input_data=execution_input,
                     config=run_config,
                     stream_mode=stream_mode_list,
-                    context=context,
+                    context=runtime_context,
                     subgraphs=subgraphs,
                     on_checkpoint=lambda _: None,  # Can add checkpoint handling if needed
                     on_task_result=lambda _: None,  # Can add task result handling if needed
