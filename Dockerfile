@@ -41,6 +41,10 @@ RUN uv export --frozen --no-dev --no-emit-project \
 # Copy the actual project source code.
 COPY libs/aegra-api/src/ libs/aegra-api/src/
 
+# Copy alembic files required by the build (forced includes in pyproject.toml)
+COPY libs/aegra-api/alembic.ini libs/aegra-api/alembic.ini
+COPY libs/aegra-api/alembic/ libs/aegra-api/alembic/
+
 # Install the project package itself (from the aegra-api subdirectory).
 RUN uv pip install --system --compile-bytecode --no-deps libs/aegra-api/
 
