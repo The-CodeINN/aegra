@@ -10,15 +10,20 @@ from sqlalchemy.engine import Connection
 
 from alembic import context
 
-# Ensure .env is loaded from the project root (two levels up from alembic/)
-_project_root = Path(__file__).resolve().parents[3]  # aegra/
-_env_path = _project_root / ".env"
-if _env_path.is_file():
-    os.environ.setdefault("_AEGRA_ENV_FILE", str(_env_path))
-    # Feed dotenv values into the environment so pydantic-settings picks them up
-    from dotenv import load_dotenv
+# Ensure .env is loaded from the project root (if running locally)
+# In Docker/production, env vars are injected - no .env needed
+try:
+    _project_root = Path(__file__).resolve().parents[3]  # aegra/
+    _env_path = _project_root / ".env"
+    if _env_path.is_file():
+        os.environ.setdefault("_AEGRA_ENV_FILE", str(_env_path))
+        # Feed dotenv values into the environment so pydantic-settings picks them up
+        from dotenv import load_dotenv
 
-    load_dotenv(_env_path, override=False)
+        load_dotenv(_env_path, override=False)
+except (IndexError, OSError):
+    # Running in a flattened Docker environment or .env not found
+    pass
 
 # Import your SQLAlchemy models here
 from aegra_api.core.orm import Base  # noqa: E402
