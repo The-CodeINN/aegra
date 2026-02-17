@@ -19,7 +19,7 @@ This file provides context for AI coding agents working with this repository.
 uv sync --all-packages
 
 # Start dev server (postgres + auto-migrations + hot reload)
-aegra dev
+uv run aegra dev
 
 # Run tests
 uv run --package aegra-api pytest libs/aegra-api/tests/
@@ -35,11 +35,9 @@ uv run mypy libs/aegra-api/src/ libs/aegra-cli/src/
 # All CI checks at once
 make ci-check
 
-# Database migrations
-aegra db upgrade                    # Apply pending migrations
-aegra db current                    # Check current version
-aegra db history                    # Show history
-uv run --package aegra-api alembic revision --autogenerate -m "description"  # Create migration
+# Database migrations (run automatically on server startup)
+# To create a new migration:
+uv run --package aegra-api alembic revision --autogenerate -m "description"
 ```
 
 ## Project Structure
@@ -51,10 +49,13 @@ aegra/
 │   │   ├── src/aegra_api/            # Main application code
 │   │   │   ├── api/                  # Agent Protocol endpoints
 │   │   │   ├── services/             # Business logic layer
-│   │   │   ├── core/                 # Infrastructure (database, auth, orm, migrations)
+│   │   │   ├── core/                 # Infrastructure (database, auth, orm, health, migrations)
 │   │   │   ├── models/               # Pydantic request/response schemas
 │   │   │   ├── middleware/           # ASGI middleware
+│   │   │   ├── observability/        # OpenTelemetry tracing (Langfuse, Phoenix, OTLP)
+│   │   │   ├── utils/               # Helper functions
 │   │   │   ├── main.py               # FastAPI app entry point
+│   │   │   ├── config.py             # aegra.json config loading
 │   │   │   └── settings.py           # Environment settings
 │   │   ├── tests/                    # Test suite
 │   │   └── alembic/                  # Database migrations
@@ -62,11 +63,14 @@ aegra/
 │   └── aegra-cli/                    # CLI package
 │       └── src/aegra_cli/
 │           ├── cli.py                # Main CLI entry point
-│           └── commands/             # Command implementations
+│           ├── env.py                # .env file loading
+│           ├── commands/             # Command implementations (init)
+│           ├── utils/                # Docker utilities
+│           └── templates/            # Project templates for `aegra init`
 │
 ├── examples/                         # Example agents and configs
 ├── docs/                             # Documentation
-├── aegra.json                        # Agent graph definitions
+├── aegra.json                        # Project configuration (graphs, auth, http, store)
 └── docker-compose.yml                # Local development setup
 ```
 
@@ -211,7 +215,7 @@ graph = builder.compile()  # Must export as 'graph'
 1. Modify SQLAlchemy models in `libs/aegra-api/src/aegra_api/core/orm.py`
 2. Generate migration: `uv run --package aegra-api alembic revision --autogenerate -m "description"`
 3. Review generated migration in `libs/aegra-api/alembic/versions/`
-4. Apply: `aegra db upgrade`
+4. Apply: migrations run automatically on next server startup
 
 ## PR Guidelines
 
@@ -234,19 +238,22 @@ graph = builder.compile()  # Must export as 'graph'
 ### Environment Variable Files (STRICT)
 - There are **two `.env.example` files** that MUST be kept in sync:
   1. **`/.env.example`** — Root file used for development and documentation reference
-  2. **`libs/aegra-cli/src/aegra_cli/templates/env.example.template`** — Template used by `aegra init` to generate `.env.example` for new projects (uses `{slug}` placeholders for project-specific values)
+  2. **`libs/aegra-cli/src/aegra_cli/templates/env.example.template`** — Template used by `aegra init` to generate `.env.example` for new projects (uses `$slug` placeholders for project-specific values)
 - When adding, removing, or modifying any environment variable: **update BOTH files**.
-- The template uses `{slug}` in place of project-specific values (`PROJECT_NAME`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL` comment). All other values should be identical between the two files.
+- The template uses `$slug` in place of project-specific values (`PROJECT_NAME`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL` comment). All other values should be identical between the two files.
 
 ### Versioning (STRICT)
 - **`aegra-api` and `aegra-cli` MUST always have the same version.** Both versions live in their respective `pyproject.toml` files (`libs/aegra-api/pyproject.toml` and `libs/aegra-cli/pyproject.toml`).
-- **`aegra-cli` depends on `aegra-api~=X.Y.Z`** (compatible release). This allows patch updates (X.Y.Z+1) without changing the constraint, but a **minor or major bump requires updating the constraint** in `aegra-cli/pyproject.toml`.
-- **When to bump versions:**
-  - **Patch** (0.3.3 → 0.3.4): Bug fixes, small improvements, no breaking changes. Update `version` in BOTH `pyproject.toml` files.
-  - **Minor** (0.3.x → 0.4.0): New features, non-breaking additions. Update `version` in BOTH `pyproject.toml` files AND update the `aegra-api~=` constraint in `aegra-cli/pyproject.toml`.
-  - **Major** (0.x → 1.0): Breaking changes. Update `version` in BOTH `pyproject.toml` files AND update the `aegra-api~=` constraint in `aegra-cli/pyproject.toml`.
+- **`aegra-cli` depends on `aegra-api~=X.Y.Z`** (compatible release). This allows patch updates (X.Y.Z+1) without changing the constraint, but a **minor bump requires updating the constraint** in `aegra-cli/pyproject.toml`.
+- **Pre-1.0.0 versioning (current):** While in beta (`0.x.y`), the version scheme is `0.MAJOR.PATCH`:
+  - **Patch** (0.5.1 → 0.5.2): Bug fixes, small improvements, new features, non-breaking additions. Update `version` in BOTH `pyproject.toml` files.
+  - **Minor** (0.5.x → 0.6.0): Breaking changes (removed/renamed endpoints, changed behavior, schema migrations). Update `version` in BOTH `pyproject.toml` files AND update the `aegra-api~=` constraint in `aegra-cli/pyproject.toml`.
+  - **1.0.0**: Reserved for when the public API is considered stable and we commit to full SemVer guarantees. This is a deliberate decision, not triggered by a single change.
+- **Post-1.0.0 versioning (future):** Standard SemVer applies:
+  - **Patch** (1.0.0 → 1.0.1): Bug fixes only.
+  - **Minor** (1.0.x → 1.1.0): New features, non-breaking additions.
+  - **Major** (1.x.y → 2.0.0): Breaking changes.
 - **Always bump the version before creating a PR.** Determine the bump type from the changes:
-  - Bug fix / small improvement → patch bump
-  - New feature / non-breaking addition → minor bump
-  - Breaking change → major bump
+  - Bug fix, small improvement, or new non-breaking feature → patch bump
+  - Breaking change (removed/renamed API, changed defaults, schema migration) → minor bump
 - **`aegra` meta-package** (on PyPI, not in this repo) is a name reservation that points to `aegra-cli`. It does not need to be updated on every release.
