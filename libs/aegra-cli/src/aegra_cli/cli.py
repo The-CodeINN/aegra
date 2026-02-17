@@ -1,21 +1,23 @@
 """Aegra CLI - Command-line interface for managing self-hosted agent deployments."""
 
+import json
+import os
+import shutil
 import signal
 import subprocess
 import sys
 from pathlib import Path
 
 import click
-from dotenv import dotenv_values
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
 from aegra_cli import __version__
-from aegra_cli.commands import db, init
-from aegra_cli.commands.init import (
-    get_docker_compose_dev,
-    get_docker_compose_prod,
+from aegra_cli.commands import init
+from aegra_cli.env import load_env_file
+from aegra_cli.templates import (
+    get_docker_compose,
     get_dockerfile,
     slugify,
 )
@@ -56,37 +58,6 @@ def version():
     console.print()
 
 
-def load_env_file(env_file: Path | None) -> Path | None:
-    """Load environment variables from a .env file using python-dotenv.
-
-    Existing environment variables take precedence and are not overwritten.
-
-    Args:
-        env_file: Path to .env file, or None to use default (.env in cwd)
-
-    Returns:
-        Path to the loaded .env file, or None if not found
-    """
-    import os
-
-    # Determine which file to load
-    if env_file is not None:
-        target = env_file
-    else:
-        # Default: look for .env in current directory
-        target = Path.cwd() / ".env"
-
-    if not target.is_file():
-        return None
-
-    # Parse .env file and set vars (existing env vars take precedence)
-    for key, value in dotenv_values(target).items():
-        if key not in os.environ and value is not None:
-            os.environ[key] = value
-
-    return target
-
-
 def find_config_file() -> Path | None:
     """Find aegra.json or langgraph.json in current directory.
 
@@ -115,8 +86,6 @@ def get_project_slug(config_path: Path | None) -> str:
     Returns:
         Slugified project name
     """
-    import json
-
     if config_path and config_path.exists():
         try:
             with open(config_path, encoding="utf-8") as f:
@@ -130,8 +99,8 @@ def get_project_slug(config_path: Path | None) -> str:
     return slugify(Path.cwd().name)
 
 
-def ensure_docker_compose_dev(project_path: Path, slug: str) -> Path:
-    """Ensure docker-compose.yml exists for development.
+def ensure_docker_files(project_path: Path, slug: str) -> Path:
+    """Ensure docker-compose.yml and Dockerfile exist.
 
     Args:
         project_path: Project directory path
@@ -143,31 +112,12 @@ def ensure_docker_compose_dev(project_path: Path, slug: str) -> Path:
     compose_path = project_path / "docker-compose.yml"
     if not compose_path.exists():
         console.print(f"[cyan]Creating[/cyan] {compose_path}")
-        compose_path.write_text(get_docker_compose_dev(slug))
-    return compose_path
+        compose_path.write_text(get_docker_compose(slug), encoding="utf-8")
 
-
-def ensure_docker_files_prod(project_path: Path, slug: str) -> Path:
-    """Ensure production Docker files exist.
-
-    Args:
-        project_path: Project directory path
-        slug: Project slug for naming
-
-    Returns:
-        Path to docker-compose.prod.yml
-    """
-    # Create docker-compose.prod.yml if needed
-    compose_path = project_path / "docker-compose.prod.yml"
-    if not compose_path.exists():
-        console.print(f"[cyan]Creating[/cyan] {compose_path}")
-        compose_path.write_text(get_docker_compose_prod(slug))
-
-    # Create Dockerfile if needed
     dockerfile_path = project_path / "Dockerfile"
     if not dockerfile_path.exists():
         console.print(f"[cyan]Creating[/cyan] {dockerfile_path}")
-        dockerfile_path.write_text(get_dockerfile())
+        dockerfile_path.write_text(get_dockerfile(), encoding="utf-8")
 
     return compose_path
 
@@ -236,8 +186,8 @@ def dev(
     Starts uvicorn with --reload flag for development.
     The server will automatically restart when code changes are detected.
 
-    Aegra auto-discovers aegra.json by walking up the directory tree, so you
-    can run 'aegra dev' from any subdirectory of your project.
+    Aegra auto-discovers aegra.json in the current directory, so you
+    should run 'aegra dev' from your project root.
 
     By default, Aegra will check if Docker is running and start PostgreSQL
     automatically if needed. Use --no-db-check to skip this behavior.
@@ -252,14 +202,12 @@ def dev(
 
         aegra dev --no-db-check          # Start without database check
     """
-    import os
-
     # Discover or validate config file
     if config_file is not None:
         # User specified a config file explicitly
         resolved_config = config_file.resolve()
     else:
-        # Auto-discover config file by walking up directory tree
+        # Auto-discover config file in current directory
         resolved_config = find_config_file()
 
     if resolved_config is None:
@@ -288,8 +236,6 @@ def dev(
         dot_env = resolved_config.parent / ".env"
         dot_env_example = resolved_config.parent / ".env.example"
         if not dot_env.exists() and dot_env_example.exists():
-            import shutil
-
             shutil.copy2(dot_env_example, dot_env)
             console.print(f"[cyan]Created[/cyan] {dot_env} [dim](copied from .env.example)[/dim]")
 
@@ -308,9 +254,11 @@ def dev(
         if compose_file is None:
             project_path = resolved_config.parent
             default_compose = project_path / "docker-compose.yml"
-            if not default_compose.exists():
+            if default_compose.exists():
+                compose_file = default_compose
+            else:
                 slug = get_project_slug(resolved_config)
-                compose_file = ensure_docker_compose_dev(project_path, slug)
+                compose_file = ensure_docker_files(project_path, slug)
 
         if not ensure_postgres_running(compose_file):
             console.print(
@@ -423,15 +371,7 @@ def dev(
     type=click.Path(exists=True, path_type=Path),
     help="Path to aegra.json config file (auto-discovered if not specified).",
 )
-@click.option(
-    "--workers",
-    "-w",
-    default=1,
-    type=int,
-    help="Number of worker processes.",
-    show_default=True,
-)
-def serve(host: str, port: int, app: str, config_file: Path | None, workers: int):
+def serve(host: str, port: int, app: str, config_file: Path | None) -> None:
     """Run the production server.
 
     Starts uvicorn without --reload for production use.
@@ -443,10 +383,7 @@ def serve(host: str, port: int, app: str, config_file: Path | None, workers: int
 
         aegra serve --host 0.0.0.0 --port 8080
 
-        aegra serve -w 4                    # Use 4 workers
     """
-    import os
-
     # Discover or validate config file
     if config_file is not None:
         resolved_config = config_file.resolve()
@@ -472,7 +409,6 @@ def serve(host: str, port: int, app: str, config_file: Path | None, workers: int
         "[bold green]Starting Aegra production server[/bold green]\n",
         f"[cyan]Host:[/cyan] {host}",
         f"[cyan]Port:[/cyan] {port}",
-        f"[cyan]Workers:[/cyan] {workers}",
         f"[cyan]Config:[/cyan] {resolved_config}",
     ]
     if loaded_env:
@@ -497,9 +433,6 @@ def serve(host: str, port: int, app: str, config_file: Path | None, workers: int
         str(port),
     ]
 
-    if workers > 1:
-        cmd.extend(["--workers", str(workers)])
-
     try:
         result = subprocess.run(cmd, check=False)
         sys.exit(result.returncode)
@@ -521,47 +454,27 @@ def serve(host: str, port: int, app: str, config_file: Path | None, workers: int
     "compose_file",
     default=None,
     type=click.Path(path_type=Path),
-    help="Path to docker-compose file (default: docker-compose.prod.yml).",
+    help="Path to docker-compose file.",
 )
 @click.option(
-    "--build",
-    is_flag=True,
+    "--build/--no-build",
     default=True,
-    help="Build images before starting containers (default: true).",
-)
-@click.option(
-    "--no-build",
-    is_flag=True,
-    default=False,
-    help="Skip building images.",
-)
-@click.option(
-    "--dev",
-    "use_dev",
-    is_flag=True,
-    default=False,
-    help="Use development compose (docker-compose.yml with postgres only).",
+    help="Build images before starting containers.",
 )
 @click.argument("services", nargs=-1)
-def up(
-    compose_file: Path | None, build: bool, no_build: bool, use_dev: bool, services: tuple[str, ...]
-):
+def up(compose_file: Path | None, build: bool, services: tuple[str, ...]):
     """Start services with Docker Compose.
 
-    By default, uses docker-compose.prod.yml which builds and runs the full stack.
-    Use --dev to only start postgres (same as aegra dev without the local server).
-
-    Auto-generates Docker files if they don't exist:
-    - docker-compose.prod.yml (production stack)
-    - Dockerfile (for building the app image)
+    Uses docker-compose.yml which contains both postgres and the API service.
+    Auto-generates Docker files if they don't exist.
 
     Examples:
 
-        aegra up                    # Build and start all services (production)
-
-        aegra up --dev              # Start only postgres (development)
+        aegra up                    # Build and start all services
 
         aegra up --no-build         # Start without rebuilding
+
+        aegra up postgres           # Start only postgres
 
         aegra up -f ./custom.yml    # Use custom compose file
     """
@@ -571,18 +484,14 @@ def up(
     slug = get_project_slug(config_file)
 
     if compose_file is None:
-        if use_dev:
-            compose_file = ensure_docker_compose_dev(project_path, slug)
-        else:
-            compose_file = ensure_docker_files_prod(project_path, slug)
+        compose_file = ensure_docker_files(project_path, slug)
     elif not compose_file.exists():
         console.print(f"[bold red]Error:[/bold red] Compose file not found: {compose_file}")
         sys.exit(1)
 
-    mode = "development" if use_dev else "production"
     console.print(
         Panel(
-            f"[bold green]Starting Aegra services ({mode})[/bold green]\n\n"
+            "[bold green]Starting Aegra services[/bold green]\n\n"
             f"[cyan]Compose file:[/cyan] {compose_file}",
             title="[bold]Aegra Up[/bold]",
             border_style="green",
@@ -594,8 +503,8 @@ def up(
     cmd.append("up")
     cmd.append("-d")
 
-    # Build unless --no-build is specified (and not in dev mode)
-    if not no_build and not use_dev:
+    # Build unless --no-build is specified
+    if build:
         cmd.append("--build")
 
     if services:
@@ -644,28 +553,14 @@ def up(
     default=False,
     help="Remove named volumes declared in the compose file.",
 )
-@click.option(
-    "--all",
-    "stop_all",
-    is_flag=True,
-    default=False,
-    help="Stop services from both dev and prod compose files.",
-)
-@click.argument("services", nargs=-1)
-def down(compose_file: Path | None, volumes: bool, stop_all: bool, services: tuple[str, ...]):
+def down(compose_file: Path | None, volumes: bool):
     """Stop services with Docker Compose.
 
     Runs 'docker compose down' to stop and remove containers.
-    By default, stops services from docker-compose.prod.yml if it exists,
-    otherwise from docker-compose.yml.
-
-    Use --all to stop services from both compose files.
 
     Examples:
 
         aegra down                  # Stop services
-
-        aegra down --all            # Stop all dev and prod services
 
         aegra down -v               # Stop and remove volumes
 
@@ -683,70 +578,44 @@ def down(compose_file: Path | None, volumes: bool, stop_all: bool, services: tup
         console.print("[yellow]Warning:[/yellow] Removing volumes - data will be lost!")
 
     project_path = Path.cwd()
-    compose_files_to_stop: list[Path] = []
 
     if compose_file:
-        if compose_file.exists():
-            compose_files_to_stop.append(compose_file)
-        else:
+        if not compose_file.exists():
             console.print(f"[bold red]Error:[/bold red] Compose file not found: {compose_file}")
             sys.exit(1)
-    elif stop_all:
-        # Stop both dev and prod
-        dev_compose = project_path / "docker-compose.yml"
-        prod_compose = project_path / "docker-compose.prod.yml"
-        if prod_compose.exists():
-            compose_files_to_stop.append(prod_compose)
-        if dev_compose.exists():
-            compose_files_to_stop.append(dev_compose)
+        target_compose = compose_file
     else:
-        # Default: try prod first, then dev
-        prod_compose = project_path / "docker-compose.prod.yml"
-        dev_compose = project_path / "docker-compose.yml"
-        if prod_compose.exists():
-            compose_files_to_stop.append(prod_compose)
-        elif dev_compose.exists():
-            compose_files_to_stop.append(dev_compose)
+        target_compose = project_path / "docker-compose.yml"
+        if not target_compose.exists():
+            console.print("[yellow]No docker-compose.yml found. Nothing to stop.[/yellow]")
+            sys.exit(0)
 
-    if not compose_files_to_stop:
-        console.print("[yellow]No docker-compose files found. Nothing to stop.[/yellow]")
-        sys.exit(0)
+    console.print(f"\n[cyan]Stopping:[/cyan] {target_compose}")
 
-    overall_success = True
-    for cf in compose_files_to_stop:
-        console.print(f"\n[cyan]Stopping:[/cyan] {cf}")
+    cmd = ["docker", "compose", "-f", str(target_compose), "down"]
 
-        cmd = ["docker", "compose", "-f", str(cf), "down"]
+    if volumes:
+        cmd.append("-v")
 
-        if volumes:
-            cmd.append("-v")
+    console.print(f"[dim]Running: {' '.join(cmd)}[/dim]")
 
-        if services:
-            cmd.extend(services)
-
-        console.print(f"[dim]Running: {' '.join(cmd)}[/dim]")
-
-        try:
-            result = subprocess.run(cmd, check=False)
-            if result.returncode != 0:
-                overall_success = False
-        except FileNotFoundError:
-            console.print(
-                "[bold red]Error:[/bold red] docker is not installed or not in PATH.\n"
-                "Please install Docker Desktop or Docker Engine."
-            )
+    try:
+        result = subprocess.run(cmd, check=False)
+        if result.returncode == 0:
+            console.print("\n[bold green]Services stopped successfully![/bold green]")
+            sys.exit(0)
+        else:
+            console.print("\n[bold red]Some services failed to stop.[/bold red]")
             sys.exit(1)
-
-    if overall_success:
-        console.print("\n[bold green]Services stopped successfully![/bold green]")
-        sys.exit(0)
-    else:
-        console.print("\n[bold red]Some services failed to stop.[/bold red]")
+    except FileNotFoundError:
+        console.print(
+            "[bold red]Error:[/bold red] docker is not installed or not in PATH.\n"
+            "Please install Docker Desktop or Docker Engine."
+        )
         sys.exit(1)
 
 
 # Register command groups and commands from the commands package
-cli.add_command(db)
 cli.add_command(init)
 
 

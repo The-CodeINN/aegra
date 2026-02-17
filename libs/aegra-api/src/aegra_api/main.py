@@ -32,7 +32,7 @@ from aegra_api.core.route_merger import (
     merge_exception_handlers,
     merge_lifespans,
 )
-from aegra_api.middleware import DoubleEncodedJSONMiddleware, StructLogMiddleware
+from aegra_api.middleware import ContentTypeFixMiddleware, StructLogMiddleware
 from aegra_api.models.errors import AgentProtocolError, get_error_type
 from aegra_api.observability.setup import setup_observability
 from aegra_api.services.event_store import event_store
@@ -51,14 +51,38 @@ logger = structlog.getLogger(__name__)
 DEFAULT_EXPOSE_HEADERS = ["Content-Location", "Location"]
 
 
+def _log_connection_help(error: Exception) -> None:
+    """Log a helpful error message when database connection fails."""
+    logger.error(
+        "Could not connect to PostgreSQL",
+        error=str(error),
+        hint="Check your database configuration and ensure PostgreSQL is running.",
+    )
+    logger.error(
+        "Troubleshooting tips:\n"
+        "  - Local development?  Run 'aegra dev' (starts PostgreSQL automatically)\n"
+        "  - Docker deployment?  Run 'aegra up' (starts PostgreSQL + app)\n"
+        "  - External database?  Check DATABASE_URL or POSTGRES_* vars in your .env\n"
+        "  - Missing .env file?  Copy .env.example to .env and configure it"
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan context manager for startup/shutdown"""
     # Auto-apply pending database migrations before anything else
-    await run_migrations_async()
+    try:
+        await run_migrations_async()
+    except (ConnectionRefusedError, OSError) as e:
+        _log_connection_help(e)
+        raise
 
     # Startup: Initialize database and LangGraph components
-    await db_manager.initialize()
+    try:
+        await db_manager.initialize()
+    except (ConnectionRefusedError, OSError) as e:
+        _log_connection_help(e)
+        raise
 
     # Initialize Redis if configured
     await redis_manager.initialize()
@@ -230,7 +254,7 @@ def _add_common_middleware(app: FastAPI, cors_config: dict[str, Any] | None) -> 
     """Add common middleware stack in correct order.
 
     Middleware runs in reverse registration order, so we register:
-    1. DoubleEncodedJSONMiddleware (outermost - runs first)
+    1. ContentTypeFixMiddleware (outermost - fixes text/plain → application/json)
     2. CORSMiddleware (handles preflight early)
     3. CorrelationIdMiddleware (adds request ID)
     4. StructLogMiddleware (innermost - logs with correlation ID)
@@ -242,7 +266,7 @@ def _add_common_middleware(app: FastAPI, cors_config: dict[str, Any] | None) -> 
     app.add_middleware(StructLogMiddleware)
     app.add_middleware(CorrelationIdMiddleware)
     _add_cors_middleware(app, cors_config)
-    app.add_middleware(DoubleEncodedJSONMiddleware)
+    app.add_middleware(ContentTypeFixMiddleware)
 
 
 def _include_core_routers(app: FastAPI) -> None:

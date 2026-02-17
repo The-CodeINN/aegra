@@ -1,6 +1,6 @@
 [project]
 name = "aegra-api"
-version = "0.4.1"
+version = "0.6.0"
 description = "Aegra core API - Self-hosted Agent Protocol server"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,15 +27,12 @@ dependencies = [
     # LangGraph
     "langgraph>=1.0.3",
     "langgraph-checkpoint-postgres>=2.0.23",
-    "langchain>=1.0.8",
-    "langchain-openai>=1.0.3",
 
     # Database
     "sqlalchemy>=2.0.0",
     "asyncpg>=0.30.0",
     "psycopg[binary]>=3.2.9",
     "alembic>=1.16.4",
-    "greenlet>=3.2.3",
 
     # Observability (OpenTelemetry)
     "opentelemetry-api>=1.39.1",
@@ -124,6 +121,10 @@ known-first-party = ["aegra_api", "aegra_cli"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "unit: unit tests",
+    "e2e: end-to-end tests requiring a running server",
+]
 
 [dependency-groups]
 dev = [
@@ -135,4 +136,6 @@ dev = [
     "mypy>=1.14.0",
     "bandit>=1.8.0",
     "pre-commit>=4.0.1",
+    "langchain-openai>=1.0.3",
+    "langchain>=1.0.0",
 ]
