@@ -41,9 +41,10 @@ jobs:
           POSTGRES_DB: 'aegra'
         run: uv run --package aegra-api pytest libs/aegra-api/tests/unit libs/aegra-api/tests/integration
 
-  # Deploy to EC2 after tests pass
+  # Deploy to EC2 after tests (even if tests fail)
   deploy:
     needs: test
+    if: always()
     runs-on: ubuntu-latest
     environment: production
 
