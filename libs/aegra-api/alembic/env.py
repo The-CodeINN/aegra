@@ -89,14 +89,20 @@ def do_run_migrations(connection: Connection) -> None:
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode.
 
-    Uses the sync psycopg (v3) driver with SSL for Neon compatibility.
+    Uses the sync psycopg (v3) driver. SSL mode is controlled via
+    POSTGRES_SSLMODE env var (defaults to 'prefer').
     """
     db = settings.db
-    url = (
-        f"postgresql+psycopg://{db.POSTGRES_USER}:{db.POSTGRES_PASSWORD}@"
-        f"{db.POSTGRES_HOST}:{db.POSTGRES_PORT}/{db.POSTGRES_DB}"
-        f"?sslmode=require"
-    )
+    sslmode = os.environ.get("POSTGRES_SSLMODE", "prefer")
+    if db.DATABASE_URL:
+        # Use DATABASE_URL directly (may already contain query params)
+        url = db.database_url_sync
+    else:
+        url = (
+            f"postgresql+psycopg://{db.POSTGRES_USER}:{db.POSTGRES_PASSWORD}@"
+            f"{db.POSTGRES_HOST}:{db.POSTGRES_PORT}/{db.POSTGRES_DB}"
+            f"?sslmode={sslmode}"
+        )
     connectable = create_engine(url, poolclass=pool.NullPool)
 
     with connectable.connect() as connection:
