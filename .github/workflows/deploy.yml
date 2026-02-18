@@ -1,0 +1,88 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # Manual trigger
+
+# Prevent concurrent deployments
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # Run tests first
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-packages
+
+      - name: Lint
+        run: uvx ruff check .
+
+      - name: Run tests
+        env:
+          AEGRA_CONFIG: ''
+          POSTGRES_USER: 'user'
+          POSTGRES_PASSWORD: 'password'
+          POSTGRES_HOST: 'localhost'
+          POSTGRES_PORT: '5432'
+          POSTGRES_DB: 'aegra'
+        run: uv run --package aegra-api pytest libs/aegra-api/tests/unit libs/aegra-api/tests/integration
+
+  # Deploy to EC2 after tests pass
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script_stop: true
+          command_timeout: 10m
+          script: |
+            set -e
+            cd /opt/ai-service
+            bash deploy/scripts/deploy.sh
+
+      - name: Verify deployment
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script: |
+            curl -sf --max-time 10 http://localhost:8000/health || exit 1
+            echo "Deployment verified successfully!"
+
+      - name: Notify on failure
+        if: failure()
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script: |
+            echo "Deployment failed at $(date)" >> /var/log/aegra-deploy.log
+            # Show recent logs for debugging
+            cd /opt/ai-service
+            docker compose -f docker-compose.prod.yml logs --tail=50 aegra

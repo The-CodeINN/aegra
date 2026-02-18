@@ -47,9 +47,10 @@ RUN uv pip install --system --compile-bytecode --no-deps .
 # -----------------------------
 FROM base AS final
 
-# Install only minimal runtime libs
+# Install only minimal runtime libs (curl needed for health checks)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed Python packages from the builder stage.
@@ -60,12 +61,21 @@ COPY --from=builder /usr/local/bin/ /usr/local/bin/
 COPY libs/aegra-api/alembic.ini ./alembic.ini
 COPY libs/aegra-api/alembic/ ./alembic/
 COPY aegra.json ./aegra.json
+COPY auth.py ./auth.py
 COPY examples/ ./examples/
+COPY graphs/ ./graphs/
+
+# Add entrypoint for migrations
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 8000
 
 # Run as non-root
 USER app
 
-# Default command - can be overridden by docker-compose
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["uvicorn", "aegra_api.main:app", "--host", "0.0.0.0", "--port", "8000"]

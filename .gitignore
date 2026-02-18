@@ -11,6 +11,8 @@ wheels/
 
 # env files
 .env
+.env.production
+!.env.production.template
 
 # Pycharm
 .idea/
@@ -33,3 +35,4 @@ htmlcov/
 
 # Backup files
 *.bak
+*.pem
