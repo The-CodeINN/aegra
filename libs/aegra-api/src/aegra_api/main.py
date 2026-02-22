@@ -16,6 +16,7 @@ from aegra_api.api.activity_logs import router as activity_logs_router
 from aegra_api.api.assistants import router as assistants_router
 from aegra_api.api.career_advisors import router as career_advisors_router
 from aegra_api.api.management import router as management_router
+from aegra_api.api.notifications_ws import router as notifications_ws_router
 from aegra_api.api.opportunities import router as opportunities_router
 from aegra_api.api.runs import router as runs_router
 from aegra_api.api.stateless_runs import router as stateless_runs_router
@@ -296,6 +297,8 @@ def _include_core_routers(app: FastAPI) -> None:
     app.include_router(accountability_router, dependencies=auth_dependency, prefix="", tags=["Accountability"])
     app.include_router(opportunities_router, dependencies=auth_dependency, prefix="", tags=["Opportunities"])
     app.include_router(web_push_router, dependencies=auth_dependency, prefix="", tags=["Web Push"])
+    # WebSocket router (auth handled inside the endpoint, no dependency injection)
+    app.include_router(notifications_ws_router, prefix="", tags=["Notifications WebSocket"])
 
 
 def create_app() -> FastAPI:
