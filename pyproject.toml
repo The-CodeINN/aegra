@@ -4,7 +4,7 @@
 [project]
 name = "aegra-workspace"
 version = "0.0.0"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 
 [tool.uv]
 package = false
@@ -19,7 +19,7 @@ dev = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [
@@ -49,12 +49,11 @@ known-first-party = ["aegra_api", "aegra_cli"]
 # Note: pytest config is in each package's pyproject.toml
 # Run tests from: libs/aegra-api or libs/aegra-cli
 
-[tool.mypy]
-python_version = "3.11"
-warn_return_any = true
-warn_unused_ignores = true
-disallow_untyped_defs = true
-ignore_missing_imports = true
+# ty replaces mypy for type checking. It uses its own rule system rather than
+# mypy-style strictness flags. Severity and per-rule overrides go in
+# [tool.ty.rules]; see https://docs.astral.sh/ty/reference/rules/ for details.
+[tool.ty.environment]
+python-version = "3.12"
 
 [tool.bandit]
 exclude_dirs = ["tests", ".venv"]
