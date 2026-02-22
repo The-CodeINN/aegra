@@ -93,7 +93,7 @@ git commit -m "feat: add feature"
 ┌────────────────────────────┐
 │ 1. Ruff Format             │ ← Formats code
 │ 2. Ruff Lint               │ ← Checks quality
-│ 3. mypy Type Check         │ ← Validates types
+│ 3. ty Type Check (CI only) │ ← Validates types
 │ 4. Bandit Security         │ ← Scans for issues
 │ 5. File Checks             │ ← Validates files
 │ 6. Commit Message Check    │ ← Validates format
@@ -163,7 +163,7 @@ make format
 
 **Error:**
 ```
-❌ mypy found type errors
+❌ ty found type errors
 ```
 
 **Fix:**
@@ -248,7 +248,7 @@ Every push and PR triggers:
 5. **Tests** - All tests must pass
 6. **Coverage** - Coverage report generated
 
-**Matrix:** Tests run on Python 3.11 and 3.12
+**Python version:** Tests run on Python 3.12
 
 ---
 

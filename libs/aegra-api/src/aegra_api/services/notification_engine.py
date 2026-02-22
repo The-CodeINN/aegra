@@ -601,6 +601,30 @@ class NotificationEngine:
         session.add(notification)
         await session.flush()
 
+        # ── Broadcast via WebSocket (best-effort) ───────────────────
+        try:
+            from aegra_api.api.notifications_ws import broadcast_to_user as ws_broadcast
+
+            await ws_broadcast(
+                user_id,
+                {
+                    "type": "new_notification",
+                    "data": {
+                        "id": notification.id,
+                        "title": title,
+                        "content": content,
+                        "category": category,
+                        "priority": priority,
+                        "status": "pending",
+                        "action_buttons": action_buttons or [],
+                        "metadata": metadata or {},
+                        "created_at": notification.created_at.isoformat() if notification.created_at else None,
+                    },
+                },
+            )
+        except Exception as ws_err:
+            logger.debug("ws_broadcast_failed", error=str(ws_err))
+
         # ── Send web push (best-effort) ─────────────────────────────
         try:
             url = None

@@ -7,7 +7,7 @@ help:
 	@echo "  make setup-hooks   - Reinstall git hooks (if needed)"
 	@echo "  make format        - Format code with ruff"
 	@echo "  make lint          - Lint code with ruff"
-	@echo "  make type-check    - Run mypy type checking"
+	@echo "  make type-check    - Run ty type checking"
 	@echo "  make security      - Run security checks with bandit"
 	@echo "  make test          - Run all tests"
 	@echo "  make test-api      - Run aegra-api tests only"
@@ -41,7 +41,7 @@ lint:
 	uv run ruff check .
 
 type-check:
-	uv run mypy libs/aegra-api/src/ libs/aegra-cli/src/
+	uv run ty check libs/aegra-api/src/ libs/aegra-cli/src/
 
 security:
 	uv run bandit -c pyproject.toml -r libs/aegra-api/src/ libs/aegra-cli/src/
@@ -59,16 +59,16 @@ test-cov:
 	uv run --package aegra-cli pytest libs/aegra-cli/tests/ --cov=libs/aegra-cli/src --cov-report=term
 
 ci-check: format lint
-	-uv run mypy libs/aegra-api/src/ libs/aegra-cli/src/
+	-uv run ty check libs/aegra-api/src/ libs/aegra-cli/src/
 	-uv run bandit -c pyproject.toml -r libs/aegra-api/src/ libs/aegra-cli/src/
 	$(MAKE) test
 	@echo ""
-	@echo "All CI checks completed! (mypy and bandit are non-blocking)"
+	@echo "All CI checks completed! (ty and bandit are non-blocking)"
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
-	rm -rf .pytest_cache .mypy_cache .ruff_cache htmlcov 2>/dev/null || true
+	rm -rf .pytest_cache .ty_cache .ruff_cache htmlcov 2>/dev/null || true
 
 run:
 	uv run --package aegra-api uvicorn aegra_api.main:app --reload
