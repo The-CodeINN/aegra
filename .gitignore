@@ -30,6 +30,3 @@ htmlcov/
 
 # Pre-commit
 .pre-commit-cache/
-
-# Backup files
-*.bak

@@ -1,10 +1,11 @@
 """Integration tests for threads CRUD operations"""
 
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from langgraph.types import StateSnapshot
 
 from aegra_api.core.orm import get_session as core_get_session
 from tests.fixtures.clients import create_test_app, make_client
@@ -457,12 +458,12 @@ class TestThreadGetState:
 
         # Mock langgraph service and agent
         mock_agent = AsyncMock()
-        from unittest.mock import Mock
 
-        mock_snapshot = Mock()
+        mock_snapshot = Mock(spec=StateSnapshot)
         mock_snapshot.values = {"messages": ["hello"]}
         mock_snapshot.next = []
         mock_snapshot.tasks = []
+        mock_snapshot.interrupts = []
         mock_snapshot.metadata = {}
         mock_snapshot.config = {"configurable": {"checkpoint_id": "cp-1"}}
         mock_snapshot.created_at = "2024-01-01T00:00:00Z"
@@ -497,12 +498,12 @@ class TestThreadUpdateState:
         client = make_client(app)
 
         mock_agent = AsyncMock()
-        from unittest.mock import Mock
 
-        mock_snapshot = Mock()
+        mock_snapshot = Mock(spec=StateSnapshot)
         mock_snapshot.values = {"key": "val"}
         mock_snapshot.next = []
         mock_snapshot.tasks = []
+        mock_snapshot.interrupts = []
         mock_snapshot.metadata = {}
         mock_snapshot.config = {"configurable": {"checkpoint_id": "cp-1"}}
         mock_snapshot.created_at = "2024-01-01T00:00:00Z"
@@ -535,7 +536,6 @@ class TestThreadUpdateState:
         mock_agent = AsyncMock()
         # aupdate_state returns the new config
         mock_agent.aupdate_state.return_value = {"configurable": {"checkpoint_id": "new-cp", "checkpoint_ns": ""}}
-        from unittest.mock import Mock
 
         mock_agent.with_config = Mock(return_value=mock_agent)
         mock_agent.with_config.return_value = mock_agent
@@ -641,12 +641,12 @@ class TestThreadStateCheckpoint:
         client = make_client(app)
 
         mock_agent = AsyncMock()
-        from unittest.mock import Mock
 
-        mock_snapshot = Mock()
+        mock_snapshot = Mock(spec=StateSnapshot)
         mock_snapshot.values = {"foo": "bar"}
         mock_snapshot.next = []
         mock_snapshot.tasks = []
+        mock_snapshot.interrupts = []
         mock_snapshot.metadata = {}
         mock_snapshot.config = {"configurable": {"checkpoint_id": "cp-target"}}
         mock_snapshot.created_at = "2024-01-01T00:00:00Z"
@@ -717,12 +717,12 @@ class TestThreadStateCheckpointPost:
         client = make_client(app)
 
         mock_agent = AsyncMock()
-        from unittest.mock import Mock
 
-        mock_snapshot = Mock()
+        mock_snapshot = Mock(spec=StateSnapshot)
         mock_snapshot.values = {"foo": "bar"}
         mock_snapshot.next = []
         mock_snapshot.tasks = []
+        mock_snapshot.interrupts = []
         mock_snapshot.metadata = {}
         mock_snapshot.config = {"configurable": {"checkpoint_id": "cp-post"}}
         mock_snapshot.created_at = "2024-01-01T00:00:00Z"

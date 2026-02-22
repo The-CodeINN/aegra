@@ -18,6 +18,7 @@ from aegra_api.api.career_advisors import router as career_advisors_router
 from aegra_api.api.management import router as management_router
 from aegra_api.api.opportunities import router as opportunities_router
 from aegra_api.api.runs import router as runs_router
+from aegra_api.api.stateless_runs import router as stateless_runs_router
 from aegra_api.api.store import router as store_router
 from aegra_api.api.threads import router as threads_router
 from aegra_api.api.web_push import router as web_push_router
@@ -277,7 +278,8 @@ def _include_core_routers(app: FastAPI) -> None:
     2. Assistants (with auth)
     3. Threads (with auth)
     4. Runs (with auth)
-    5. Store (with auth)
+    5. Stateless Runs (with auth)
+    6. Store (with auth)
 
     Args:
         app: FastAPI application instance
@@ -286,6 +288,7 @@ def _include_core_routers(app: FastAPI) -> None:
     app.include_router(assistants_router, dependencies=auth_dependency, prefix="", tags=["Assistants"])
     app.include_router(threads_router, dependencies=auth_dependency, prefix="", tags=["Threads"])
     app.include_router(runs_router, dependencies=auth_dependency, prefix="", tags=["Runs"])
+    app.include_router(stateless_runs_router, dependencies=auth_dependency, prefix="", tags=["Stateless Runs"])
     app.include_router(store_router, dependencies=auth_dependency, prefix="", tags=["Store"])
     app.include_router(activity_logs_router, dependencies=auth_dependency, prefix="", tags=["Activity Logs"])
     app.include_router(management_router, dependencies=auth_dependency, prefix="", tags=["Management"])

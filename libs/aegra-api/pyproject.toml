@@ -1,9 +1,9 @@
 [project]
 name = "aegra-api"
-version = "0.6.0"
+version = "0.7.2"
 description = "Aegra core API - Self-hosted Agent Protocol server"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = "Apache-2.0"
 authors = [{ name = "Muhammad Ibrahim", email = "mibrahim37612@gmail.com" }]
 keywords = ["langgraph", "agents", "llm", "fastapi", "agent-protocol"]
@@ -12,14 +12,13 @@ classifiers = [
     "Framework :: FastAPI",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 dependencies = [
     # Core
-    "fastapi>=0.116.1",
+    "fastapi>=0.110.1",
     "uvicorn>=0.35.0",
     "pydantic>=2.11.7",
     "pydantic-settings>=2.12.0",
@@ -30,6 +29,7 @@ dependencies = [
 
     # Database
     "sqlalchemy>=2.0.0",
+    "greenlet>=3.1.0",
     "asyncpg>=0.30.0",
     "psycopg[binary]>=3.2.9",
     "alembic>=1.16.4",
@@ -91,7 +91,7 @@ packages = ["src/aegra_api"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [
@@ -133,7 +133,7 @@ dev = [
     "pytest-mock>=3.15.1",
     "pytest-cov>=6.0.0",
     "ruff>=0.13.0",
-    "mypy>=1.14.0",
+    "ty>=0.0.17,<0.1.0",
     "bandit>=1.8.0",
     "pre-commit>=4.0.1",
     "langchain-openai>=1.0.3",

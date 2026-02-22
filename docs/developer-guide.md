@@ -23,7 +23,7 @@ Welcome to Aegra! This guide will help you get started with development, whether
 
 ### Prerequisites
 
-- Python 3.11+
+- Python 3.12+
 - Docker
 - Git
 - uv (Python package manager)
@@ -87,7 +87,7 @@ When you commit, these checks run automatically:
 
 - **Code formatting** (Ruff) - Auto-formats your code
 - **Linting** (Ruff) - Checks code quality
-- **Type checking** (mypy) - Validates type hints
+- **Type checking** (ty) - Validates type hints
 - **Security** (Bandit) - Scans for vulnerabilities
 - **Commit message** - Enforces format
 
