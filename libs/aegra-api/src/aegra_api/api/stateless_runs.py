@@ -7,7 +7,6 @@ explicitly sets ``on_completion="keep"``).
 """
 
 import asyncio
-import contextlib
 from collections.abc import AsyncIterator
 from typing import Any
 from uuid import uuid4
@@ -29,6 +28,7 @@ from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import _get_session_maker, get_session
 from aegra_api.models import Run, RunCreate, User
+from aegra_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
 from aegra_api.services.streaming_service import streaming_service
 
 router = APIRouter(tags=["Stateless Runs"], dependencies=auth_dependency)
@@ -106,11 +106,10 @@ async def _cleanup_after_background_run(run_id: str, thread_id: str, user_id: st
 # ---------------------------------------------------------------------------
 
 
-@router.post("/runs/wait")
+@router.post("/runs/wait", responses={**NOT_FOUND, **CONFLICT})
 async def stateless_wait_for_run(
     request: RunCreate,
     user: User = Depends(get_current_user),
-    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     """Create a stateless run and wait for completion.
 
@@ -122,7 +121,7 @@ async def stateless_wait_for_run(
     should_delete = request.on_completion != "keep"
 
     try:
-        result = await wait_for_run(thread_id, request, user, session)
+        result = await wait_for_run(thread_id, request, user)
         return result
     finally:
         if should_delete:
@@ -135,7 +134,7 @@ async def stateless_wait_for_run(
                 )
 
 
-@router.post("/runs/stream")
+@router.post("/runs/stream", responses={**SSE_RESPONSE, **NOT_FOUND, **CONFLICT})
 async def stateless_stream_run(
     request: RunCreate,
     user: User = Depends(get_current_user),
@@ -172,18 +171,21 @@ async def stateless_stream_run(
     original_iterator = response.body_iterator
 
     async def _wrapped_iterator() -> AsyncIterator[str | bytes]:
-        async with contextlib.aclosing(original_iterator) as stream:
+        try:
+            async for chunk in original_iterator:
+                yield chunk
+        finally:
+            # Close the underlying iterator if it supports aclose()
+            aclose = getattr(original_iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
             try:
-                async for chunk in stream:
-                    yield chunk
-            finally:
-                try:
-                    await _delete_thread_by_id(thread_id, user.identity)
-                except Exception:
-                    logger.exception(
-                        "Failed to delete ephemeral thread after stream",
-                        thread_id=thread_id,
-                    )
+                await _delete_thread_by_id(thread_id, user.identity)
+            except Exception:
+                logger.exception(
+                    "Failed to delete ephemeral thread after stream",
+                    thread_id=thread_id,
+                )
 
     return StreamingResponse(
         _wrapped_iterator(),
@@ -193,7 +195,7 @@ async def stateless_stream_run(
     )
 
 
-@router.post("/runs")
+@router.post("/runs", response_model=Run, responses={**NOT_FOUND, **CONFLICT})
 async def stateless_create_run(
     request: RunCreate,
     user: User = Depends(get_current_user),
