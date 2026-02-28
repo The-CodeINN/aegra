@@ -63,6 +63,7 @@ COPY libs/aegra-api/alembic.ini ./alembic.ini
 COPY libs/aegra-api/alembic/ ./alembic/
 COPY aegra.json ./aegra.json
 COPY auth.py ./auth.py
+COPY graphs/ ./graphs/
 COPY examples/ ./examples/
 
 EXPOSE 8000
