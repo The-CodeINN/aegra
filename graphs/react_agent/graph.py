@@ -6,7 +6,8 @@ Works with a chat model with tool calling support.
 from datetime import UTC, datetime
 from typing import Literal, cast
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.config import get_stream_writer
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
@@ -14,7 +15,7 @@ from langgraph.runtime import Runtime
 from react_agent.context import Context
 from react_agent.state import InputState, State
 from react_agent.tools import TOOLS
-from react_agent.utils import load_chat_model
+from react_agent.utils import get_message_text, load_chat_model
 
 # Define the function that calls the model
 
@@ -58,20 +59,50 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, list[
     return {"messages": [response]}
 
 
-# Define a new graph
+async def generate_thread_title(state: State, runtime: Runtime[Context]) -> dict:
+    """Generate a short title for the thread after the first complete exchange.
 
-builder = StateGraph(State, input_schema=InputState, context_schema=Context)
+    Uses the full first exchange (first human message + first AI response) so
+    that greetings like "hi" or "hello" still produce a meaningful title drawn
+    from what the AI actually talked about.
+    """
+    human_messages = [m for m in state.messages if isinstance(m, HumanMessage)]
+    ai_messages = [m for m in state.messages if isinstance(m, AIMessage)]
+    if not human_messages:
+        return {}
 
-# Define the two nodes we will cycle between
-builder.add_node(call_model)
-builder.add_node("tools", ToolNode(TOOLS))
+    first_human = get_message_text(human_messages[0])[:400]
+    first_ai = get_message_text(ai_messages[0])[:400] if ai_messages else ""
 
-# Set the entrypoint as `call_model`
-# This means that this node is the first one called
-builder.add_edge("__start__", "call_model")
+    exchange = f"User: {first_human}"
+    if first_ai:
+        exchange += f"\nAssistant: {first_ai}"
+
+    model = load_chat_model(runtime.context.model)
+    response = await model.ainvoke(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Generate a concise 4-6 word title for this conversation. "
+                    "Base it on the actual topic discussed, not on greetings. "
+                    "Return only the title text — no quotes, no punctuation, no explanation."
+                ),
+            },
+            {"role": "user", "content": exchange},
+        ]
+    )
+
+    title = response.content.strip()[:80]
+
+    # Dispatch custom event so the frontend sidebar updates immediately
+    writer = get_stream_writer()
+    writer({"type": "thread_title", "title": title})
+
+    return {"thread_name": title}
 
 
-def route_model_output(state: State) -> Literal["__end__", "tools"]:
+def route_model_output(state: State) -> Literal["__end__", "tools", "generate_thread_title"]:
     """Determine the next node based on the model's output.
 
     This function checks if the model's last message contains tool calls.
@@ -80,16 +111,35 @@ def route_model_output(state: State) -> Literal["__end__", "tools"]:
         state (State): The current state of the conversation.
 
     Returns:
-        str: The name of the next node to call ("__end__" or "tools").
+        str: The name of the next node to call.
     """
     last_message = state.messages[-1]
     if not isinstance(last_message, AIMessage):
         raise ValueError(f"Expected AIMessage in output edges, but got {type(last_message).__name__}")
-    # If there is no tool call, then we finish
-    if not last_message.tool_calls:
-        return "__end__"
-    # Otherwise we execute the requested actions
-    return "tools"
+    # If there are tool calls, execute them
+    if last_message.tool_calls:
+        return "tools"
+    # Generate a title once — only on the first complete exchange
+    if not state.thread_name:
+        human_count = sum(1 for m in state.messages if isinstance(m, HumanMessage))
+        if human_count == 1:
+            return "generate_thread_title"
+    return "__end__"
+
+
+# Define a new graph
+
+builder = StateGraph(State, input_schema=InputState, context_schema=Context)
+
+# Define the nodes
+builder.add_node(call_model)
+builder.add_node("tools", ToolNode(TOOLS))
+builder.add_node(generate_thread_title)
+
+# Set the entrypoint as `call_model`
+# This means that this node is the first one called
+builder.add_edge("__start__", "call_model")
+builder.add_edge("generate_thread_title", "__end__")
 
 
 # Add a conditional edge to determine the next step after `call_model`
