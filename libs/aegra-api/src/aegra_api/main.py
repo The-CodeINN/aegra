@@ -50,10 +50,17 @@ active_runs: dict[str, asyncio.Task] = {}
 OPENAPI_TAGS: list[dict[str, Any]] = [
     {"name": "Assistants", "description": "A configured instance of a graph."},
     {"name": "Threads", "description": "Accumulated state and outputs from a group of runs."},
-    {"name": "Thread Runs", "description": "Invoke a graph on a thread, updating its persistent state."},
+    {"name": "Runs", "description": "Invoke a graph on a thread, updating its persistent state."},
     {"name": "Stateless Runs", "description": "Invoke a graph without state or memory persistence."},
     {"name": "Store", "description": "Persistent key-value and semantic storage available from any thread."},
     {"name": "Health", "description": "Server health checks and service information."},
+    {"name": "Activity Logs", "description": "Track and retrieve activity logs for auditing and monitoring."},
+    {"name": "Management", "description": "Administrative management endpoints and utilities."},
+    {"name": "Career Advisors", "description": "Career advisor management and queries."},
+    {"name": "Accountability", "description": "Accountability and tracking features."},
+    {"name": "Opportunities", "description": "Opportunity discovery and management."},
+    {"name": "Web Push", "description": "Web push notification management and delivery."},
+    {"name": "Notifications WebSocket", "description": "Real-time notifications via WebSocket connection."},
 ]
 
 setup_logging()
