@@ -3,21 +3,19 @@
 Endpoints:
 - /action-items          GET   list active items
 - /action-items/{id}     POST  update status
-- /notifications         GET   list pending notifications
-- /notifications/all     GET   list all (pending + read)
-- /notifications/{id}/read    POST  mark read
-- /notifications/{id}/dismiss POST  dismiss
-- /notifications/mark-all-read POST mark all read
 - /preferences           GET   get user notification preferences
 - /preferences           PUT   update preferences
 - /activity              POST  record user activity
 - /activity/stats        GET   get user activity stats
+
+Note: Notification listing and mutation endpoints (mark read, dismiss, etc.)
+have been moved to the WebSocket endpoint at /ws/notifications.
 """
 
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,45 +45,6 @@ class ActionItemResponse(BaseModel):
 
     class Config:
         from_attributes = True
-
-
-class NotificationResponse(BaseModel):
-    id: str
-    title: str
-    content: str
-    channel: str = "in_app"
-    priority: str
-    status: str
-    category: str | None = None
-    advisor_persona: str | None = None
-    action_buttons: list[dict] | None = None
-    metadata: dict | None = None
-    expires_at: datetime | None = None
-    dismissed_at: datetime | None = None
-    clicked_at: datetime | None = None
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-    @classmethod
-    def from_orm_model(cls, n) -> "NotificationResponse":
-        return cls(
-            id=n.id,
-            title=n.title,
-            content=n.content,
-            channel=n.channel,
-            priority=n.priority,
-            status=n.status,
-            category=n.category,
-            advisor_persona=getattr(n, "advisor_persona", None),
-            action_buttons=n.action_buttons,
-            metadata=n.metadata_json,
-            expires_at=n.expires_at,
-            dismissed_at=getattr(n, "dismissed_at", None),
-            clicked_at=getattr(n, "clicked_at", None),
-            created_at=n.created_at,
-        )
 
 
 class PreferencesRequest(BaseModel):
@@ -138,66 +97,6 @@ async def update_action_item(
         return await AccountabilityService.update_action_item_status(session, item_id, user.identity, status)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-
-
-# ── Notifications ────────────────────────────────────────────────────
-
-
-@router.get("/notifications", response_model=list[NotificationResponse])
-async def list_notifications(
-    limit: int = Query(50, ge=1, le=100),
-    category: str | None = Query(None),
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
-) -> Any:
-    """List pending notifications (optionally filtered by category)."""
-    items = await AccountabilityService.list_notifications(
-        session, user.identity, limit, status="pending", category=category
-    )
-    return [NotificationResponse.from_orm_model(n) for n in items]
-
-
-@router.get("/notifications/all", response_model=list[NotificationResponse])
-async def list_all_notifications(
-    limit: int = Query(50, ge=1, le=100),
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
-) -> Any:
-    """List all notifications (pending + read) for notification center."""
-    items = await AccountabilityService.list_all_notifications(session, user.identity, limit)
-    return [NotificationResponse.from_orm_model(n) for n in items]
-
-
-@router.post("/notifications/{notification_id}/read")
-async def mark_notification_read(
-    notification_id: str,
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
-) -> dict[str, Any]:
-    try:
-        return await AccountabilityService.mark_notification_read(session, notification_id, user.identity)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
-
-
-@router.post("/notifications/{notification_id}/dismiss")
-async def dismiss_notification(
-    notification_id: str,
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
-) -> dict[str, Any]:
-    try:
-        return await AccountabilityService.dismiss_notification(session, notification_id, user.identity)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
-
-
-@router.post("/notifications/mark-all-read")
-async def mark_all_read(
-    session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
-) -> dict[str, Any]:
-    return await AccountabilityService.mark_all_read(session, user.identity)
 
 
 # ── Preferences ──────────────────────────────────────────────────────

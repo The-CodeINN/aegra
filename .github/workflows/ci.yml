@@ -18,7 +18,7 @@ jobs:
           enable-cache: true
 
       - name: Set up Python
-        run: uv python install 3.11
+        run: uv python install 3.12
 
       - name: Check formatting with ruff
         run: uvx ruff format --check .
@@ -28,6 +28,7 @@ jobs:
 
   test-api:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: write
@@ -43,13 +44,13 @@ jobs:
           enable-cache: true
 
       - name: Set up Python
-        run: uv python install 3.11
+        run: uv python install 3.12
 
       - name: Install workspace dependencies
         run: uv sync --all-packages
 
-      - name: Type check with mypy
-        run: uv run mypy libs/aegra-api/src/
+      - name: Type check with ty
+        run: uv run ty check libs/aegra-api/src/ libs/aegra-cli/src/
         continue-on-error: true
 
       - name: Security check with bandit
@@ -77,6 +78,7 @@ jobs:
 
   test-cli:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: write
@@ -92,7 +94,7 @@ jobs:
           enable-cache: true
 
       - name: Set up Python
-        run: uv python install 3.11
+        run: uv python install 3.12
 
       - name: Install workspace dependencies
         run: uv sync --all-packages
