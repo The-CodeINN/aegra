@@ -14,6 +14,27 @@ from aegra_api.core.orm import Run as RunORM
 from aegra_api.models import User
 
 
+def _make_session_maker(session: AsyncMock) -> MagicMock:
+    """Build a mock async_sessionmaker that always yields the given session."""
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=ctx)
+
+
+def _make_multi_session_maker(*sessions: AsyncMock) -> MagicMock:
+    """Build a mock async_sessionmaker that yields a different session each call."""
+    sessions_iter = iter(sessions)
+
+    def _factory() -> MagicMock:
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(side_effect=lambda: next(sessions_iter))
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        return ctx
+
+    return MagicMock(side_effect=_factory)
+
+
 class TestWaitForRunExceptionPaths:
     """Test exception handling and edge cases in wait_for_run endpoint."""
 
@@ -39,9 +60,12 @@ class TestWaitForRunExceptionPaths:
         request.multitask_strategy = None
         request.stream_subgraphs = False
 
-        # Mock session
-        session = AsyncMock()
-        session.add = MagicMock()  # session.add is synchronous
+        # Mock session for pre-wait block
+        session_1 = AsyncMock()
+        session_1.add = MagicMock()
+
+        # Mock session for post-wait block
+        session_2 = AsyncMock()
 
         # Mock assistant
         assistant = AssistantORM(
@@ -69,12 +93,16 @@ class TestWaitForRunExceptionPaths:
             error_message=None,
         )
 
-        # Configure session.scalar to return assistant then run
-        session.scalar.side_effect = [assistant, run_orm]
-        session.refresh = AsyncMock()
+        # Pre-wait session returns assistant
+        session_1.scalar.return_value = assistant
+        # Post-wait session returns run
+        session_2.scalar.return_value = run_orm
+
+        mock_maker = _make_multi_session_maker(session_1, session_2)
 
         # Mock dependencies
         with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
             patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
             patch(
@@ -85,6 +113,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.api.runs.uuid4", return_value=run_id),
             patch("aegra_api.api.runs.asyncio.create_task") as mock_create_task,
+            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
             patch("aegra_api.api.runs.asyncio.wait_for") as mock_wait_for,
             patch("aegra_api.api.runs.active_runs", {}),
             patch("aegra_api.api.runs.execute_run_async", new_callable=MagicMock),
@@ -99,7 +128,7 @@ class TestWaitForRunExceptionPaths:
             mock_create_task.return_value = mock_task
 
             # Call the endpoint
-            result = await wait_for_run(thread_id, request, user, session)
+            result = await wait_for_run(thread_id, request, user)
 
             # Verify timeout was handled and partial output returned
             assert result == {"partial": "output"}
@@ -125,8 +154,9 @@ class TestWaitForRunExceptionPaths:
         request.multitask_strategy = None
         request.stream_subgraphs = False
 
-        session = AsyncMock()
-        session.add = MagicMock()  # session.add is synchronous
+        session_1 = AsyncMock()
+        session_1.add = MagicMock()
+        session_2 = AsyncMock()
 
         assistant = AssistantORM(
             assistant_id="test-assistant",
@@ -152,10 +182,13 @@ class TestWaitForRunExceptionPaths:
             error_message=None,
         )
 
-        session.scalar.side_effect = [assistant, run_orm]
-        session.refresh = AsyncMock()
+        session_1.scalar.return_value = assistant
+        session_2.scalar.return_value = run_orm
+
+        mock_maker = _make_multi_session_maker(session_1, session_2)
 
         with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
             patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
             patch(
@@ -166,6 +199,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.api.runs.uuid4", return_value=run_id),
             patch("aegra_api.api.runs.asyncio.create_task") as mock_create_task,
+            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
             patch("aegra_api.api.runs.asyncio.wait_for") as mock_wait_for,
             patch("aegra_api.api.runs.active_runs", {}),
             patch("aegra_api.api.runs.execute_run_async", new_callable=MagicMock),
@@ -175,7 +209,7 @@ class TestWaitForRunExceptionPaths:
             mock_task = AsyncMock()
             mock_create_task.return_value = mock_task
 
-            result = await wait_for_run(thread_id, request, user, session)
+            result = await wait_for_run(thread_id, request, user)
 
             assert result == {}
             assert mock_wait_for.called
@@ -200,8 +234,9 @@ class TestWaitForRunExceptionPaths:
         request.multitask_strategy = None
         request.stream_subgraphs = False
 
-        session = AsyncMock()
-        session.add = MagicMock()  # session.add is synchronous
+        session_1 = AsyncMock()
+        session_1.add = MagicMock()
+        session_2 = AsyncMock()
 
         assistant = AssistantORM(
             assistant_id="test-assistant",
@@ -227,10 +262,13 @@ class TestWaitForRunExceptionPaths:
             error_message="Something went wrong",
         )
 
-        session.scalar.side_effect = [assistant, run_orm]
-        session.refresh = AsyncMock()
+        session_1.scalar.return_value = assistant
+        session_2.scalar.return_value = run_orm
+
+        mock_maker = _make_multi_session_maker(session_1, session_2)
 
         with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
             patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
             patch(
@@ -241,6 +279,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.api.runs.uuid4", return_value=run_id),
             patch("aegra_api.api.runs.asyncio.create_task") as mock_create_task,
+            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
             patch("aegra_api.api.runs.asyncio.wait_for") as mock_wait_for,
             patch("aegra_api.api.runs.active_runs", {}),
             patch("aegra_api.api.runs.execute_run_async", new_callable=MagicMock),
@@ -250,7 +289,7 @@ class TestWaitForRunExceptionPaths:
             mock_task = AsyncMock()
             mock_create_task.return_value = mock_task
 
-            result = await wait_for_run(thread_id, request, user, session)
+            result = await wait_for_run(thread_id, request, user)
 
             assert result == {}
             assert mock_wait_for.called
@@ -275,8 +314,9 @@ class TestWaitForRunExceptionPaths:
         request.multitask_strategy = None
         request.stream_subgraphs = False
 
-        session = AsyncMock()
-        session.add = MagicMock()  # session.add is synchronous
+        session_1 = AsyncMock()
+        session_1.add = MagicMock()
+        session_2 = AsyncMock()
 
         assistant = AssistantORM(
             assistant_id="test-assistant",
@@ -287,11 +327,15 @@ class TestWaitForRunExceptionPaths:
             updated_at=datetime.now(UTC),
         )
 
-        # First call returns assistant, second call returns None (run disappeared)
-        session.scalar.side_effect = [assistant, None]
-        session.refresh = AsyncMock()
+        # Pre-wait session returns assistant
+        session_1.scalar.return_value = assistant
+        # Post-wait session returns None (run disappeared)
+        session_2.scalar.return_value = None
+
+        mock_maker = _make_multi_session_maker(session_1, session_2)
 
         with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
             patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
             patch(
@@ -302,6 +346,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.api.runs.uuid4", return_value=run_id),
             patch("aegra_api.api.runs.asyncio.create_task") as mock_create_task,
+            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
             patch("aegra_api.api.runs.asyncio.wait_for") as mock_wait_for,
             patch("aegra_api.api.runs.active_runs", {}),
             patch("aegra_api.api.runs.execute_run_async", new_callable=MagicMock),
@@ -312,7 +357,7 @@ class TestWaitForRunExceptionPaths:
             mock_create_task.return_value = mock_task
 
             with pytest.raises(HTTPException) as exc_info:
-                await wait_for_run(thread_id, request, user, session)
+                await wait_for_run(thread_id, request, user)
 
             assert exc_info.value.status_code == 500
             assert "disappeared during execution" in exc_info.value.detail
@@ -337,8 +382,9 @@ class TestWaitForRunExceptionPaths:
         request.multitask_strategy = None
         request.stream_subgraphs = False
 
-        session = AsyncMock()
-        session.add = MagicMock()  # session.add is synchronous
+        session_1 = AsyncMock()
+        session_1.add = MagicMock()
+        session_2 = AsyncMock()
 
         assistant = AssistantORM(
             assistant_id="test-assistant",
@@ -364,10 +410,13 @@ class TestWaitForRunExceptionPaths:
             error_message="Graph execution error",
         )
 
-        session.scalar.side_effect = [assistant, run_orm]
-        session.refresh = AsyncMock()
+        session_1.scalar.return_value = assistant
+        session_2.scalar.return_value = run_orm
+
+        mock_maker = _make_multi_session_maker(session_1, session_2)
 
         with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
             patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
             patch(
@@ -378,6 +427,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.api.runs.uuid4", return_value=run_id),
             patch("aegra_api.api.runs.asyncio.create_task") as mock_create_task,
+            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
             patch("aegra_api.api.runs.asyncio.wait_for") as mock_wait_for,
             patch("aegra_api.api.runs.active_runs", {}),
             patch("aegra_api.api.runs.logger") as mock_logger,
@@ -388,7 +438,7 @@ class TestWaitForRunExceptionPaths:
             mock_task = AsyncMock()
             mock_create_task.return_value = mock_task
 
-            result = await wait_for_run(thread_id, request, user, session)
+            result = await wait_for_run(thread_id, request, user)
 
             # Verify output returned and error logged
             assert result == {"error": "execution failed"}
@@ -414,8 +464,9 @@ class TestWaitForRunExceptionPaths:
         request.multitask_strategy = None
         request.stream_subgraphs = False
 
-        session = AsyncMock()
-        session.add = MagicMock()  # session.add is synchronous
+        session_1 = AsyncMock()
+        session_1.add = MagicMock()
+        session_2 = AsyncMock()
 
         assistant = AssistantORM(
             assistant_id="test-assistant",
@@ -441,10 +492,13 @@ class TestWaitForRunExceptionPaths:
             error_message=None,
         )
 
-        session.scalar.side_effect = [assistant, run_orm]
-        session.refresh = AsyncMock()
+        session_1.scalar.return_value = assistant
+        session_2.scalar.return_value = run_orm
+
+        mock_maker = _make_multi_session_maker(session_1, session_2)
 
         with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
             patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
             patch(
@@ -455,6 +509,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.api.runs.uuid4", return_value=run_id),
             patch("aegra_api.api.runs.asyncio.create_task") as mock_create_task,
+            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
             patch("aegra_api.api.runs.asyncio.wait_for") as mock_wait_for,
             patch("aegra_api.api.runs.active_runs", {}),
             patch("aegra_api.api.runs.execute_run_async", new_callable=MagicMock),
@@ -464,7 +519,7 @@ class TestWaitForRunExceptionPaths:
             mock_task = AsyncMock()
             mock_create_task.return_value = mock_task
 
-            result = await wait_for_run(thread_id, request, user, session)
+            result = await wait_for_run(thread_id, request, user)
 
             assert result == {"partial": "result", "__interrupt__": [{"value": "test"}]}
 
@@ -488,8 +543,9 @@ class TestWaitForRunExceptionPaths:
         request.multitask_strategy = None
         request.stream_subgraphs = False
 
-        session = AsyncMock()
-        session.add = MagicMock()  # session.add is synchronous
+        session_1 = AsyncMock()
+        session_1.add = MagicMock()
+        session_2 = AsyncMock()
 
         assistant = AssistantORM(
             assistant_id="test-assistant",
@@ -515,10 +571,13 @@ class TestWaitForRunExceptionPaths:
             error_message=None,
         )
 
-        session.scalar.side_effect = [assistant, run_orm]
-        session.refresh = AsyncMock()
+        session_1.scalar.return_value = assistant
+        session_2.scalar.return_value = run_orm
+
+        mock_maker = _make_multi_session_maker(session_1, session_2)
 
         with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
             patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
             patch(
@@ -529,6 +588,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.api.runs.uuid4", return_value=run_id),
             patch("aegra_api.api.runs.asyncio.create_task") as mock_create_task,
+            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
             patch("aegra_api.api.runs.asyncio.wait_for") as mock_wait_for,
             patch("aegra_api.api.runs.active_runs", {}),
             patch("aegra_api.api.runs.execute_run_async", new_callable=MagicMock),
@@ -538,7 +598,7 @@ class TestWaitForRunExceptionPaths:
             mock_task = AsyncMock()
             mock_create_task.return_value = mock_task
 
-            result = await wait_for_run(thread_id, request, user, session)
+            result = await wait_for_run(thread_id, request, user)
 
             assert result == {}
 
@@ -562,7 +622,7 @@ class TestWaitForRunExceptionPaths:
         request.stream_subgraphs = False
 
         session = AsyncMock()
-        session.add = MagicMock()  # session.add is synchronous
+        session.add = MagicMock()
 
         assistant = AssistantORM(
             assistant_id="test-assistant",
@@ -575,7 +635,10 @@ class TestWaitForRunExceptionPaths:
 
         session.scalar.return_value = assistant
 
+        mock_maker = _make_session_maker(session)
+
         with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
             patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
             patch(
@@ -589,7 +652,7 @@ class TestWaitForRunExceptionPaths:
             mock_lg_service.return_value.list_graphs.return_value = ["other-graph"]
 
             with pytest.raises(HTTPException) as exc_info:
-                await wait_for_run(thread_id, request, user, session)
+                await wait_for_run(thread_id, request, user)
 
             assert exc_info.value.status_code == 404
             assert "Graph" in exc_info.value.detail
@@ -615,8 +678,9 @@ class TestWaitForRunExceptionPaths:
         request.multitask_strategy = None
         request.stream_subgraphs = False
 
-        session = AsyncMock()
-        session.add = MagicMock()  # session.add is synchronous
+        session_1 = AsyncMock()
+        session_1.add = MagicMock()
+        session_2 = AsyncMock()
 
         assistant = AssistantORM(
             assistant_id="test-assistant",
@@ -642,10 +706,13 @@ class TestWaitForRunExceptionPaths:
             error_message=None,
         )
 
-        session.scalar.side_effect = [assistant, run_orm]
-        session.refresh = AsyncMock()
+        session_1.scalar.return_value = assistant
+        session_2.scalar.return_value = run_orm
+
+        mock_maker = _make_multi_session_maker(session_1, session_2)
 
         with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
             patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
             patch(
@@ -656,6 +723,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.api.runs.uuid4", return_value=run_id),
             patch("aegra_api.api.runs.asyncio.create_task") as mock_create_task,
+            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
             patch("aegra_api.api.runs.asyncio.wait_for") as mock_wait_for,
             patch("aegra_api.api.runs.active_runs", {}),
             patch("aegra_api.api.runs.execute_run_async", new_callable=MagicMock),
@@ -665,7 +733,7 @@ class TestWaitForRunExceptionPaths:
             mock_task = AsyncMock()
             mock_create_task.return_value = mock_task
 
-            result = await wait_for_run(thread_id, request, user, session)
+            result = await wait_for_run(thread_id, request, user)
 
             assert result == {"result": "success"}
 
@@ -689,8 +757,9 @@ class TestWaitForRunExceptionPaths:
         request.multitask_strategy = None
         request.stream_subgraphs = False
 
-        session = AsyncMock()
-        session.add = MagicMock()  # session.add is synchronous
+        session_1 = AsyncMock()
+        session_1.add = MagicMock()
+        session_2 = AsyncMock()
 
         assistant = AssistantORM(
             assistant_id="test-assistant",
@@ -716,10 +785,13 @@ class TestWaitForRunExceptionPaths:
             error_message=None,
         )
 
-        session.scalar.side_effect = [assistant, run_orm]
-        session.refresh = AsyncMock()
+        session_1.scalar.return_value = assistant
+        session_2.scalar.return_value = run_orm
+
+        mock_maker = _make_multi_session_maker(session_1, session_2)
 
         with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
             patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
             patch(
@@ -730,6 +802,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.api.runs.uuid4", return_value=run_id),
             patch("aegra_api.api.runs.asyncio.create_task") as mock_create_task,
+            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
             patch("aegra_api.api.runs.asyncio.wait_for") as mock_wait_for,
             patch("aegra_api.api.runs.active_runs", {}),
             patch("aegra_api.api.runs.execute_run_async"),
@@ -739,6 +812,6 @@ class TestWaitForRunExceptionPaths:
             mock_task = AsyncMock()
             mock_create_task.return_value = mock_task
 
-            result = await wait_for_run(thread_id, request, user, session)
+            result = await wait_for_run(thread_id, request, user)
 
             assert result == {"result": "success"}
