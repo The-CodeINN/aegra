@@ -46,7 +46,9 @@ serializer = GeneralSerializer()
 active_runs: dict[str, asyncio.Task] = {}
 
 # Default stream modes for background run execution
-DEFAULT_STREAM_MODES = ["values"]
+# "custom" is required so that get_stream_writer() events (e.g. thread_title)
+# are included in the stream and forwarded to the frontend via onCustomEvent.
+DEFAULT_STREAM_MODES = ["values", "custom"]
 
 
 def map_command_to_langgraph(cmd: dict[str, Any]) -> Command:
