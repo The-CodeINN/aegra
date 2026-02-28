@@ -75,3 +75,10 @@ class State(InputState):
     Used to enforce limits on expensive or data-heavy tools like get_student_ai_career_advisor_onboarding.
     The merge_tool_counts reducer ensures counts are preserved across state updates.
     """
+
+    thread_name: str = field(default="")
+    """
+    AI-generated short title for this conversation thread.
+    Set once after the first complete exchange and never changed again.
+    Exposed to the frontend via the thread state values.
+    """
