@@ -1,6 +1,6 @@
 """Integration tests for runs CRUD operations"""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from tests.fixtures.clients import create_test_app, make_client
 from tests.fixtures.database import DummySessionBase
@@ -96,6 +96,18 @@ def _run_row(
 
     run.__table__ = _T()
     return run
+
+
+def _make_session_maker(session_instance: DummySessionBase) -> MagicMock:
+    """Return a callable mimicking ``async_sessionmaker``.
+
+    Calling the returned object produces an async context manager that yields
+    *session_instance*, matching the ``async with maker() as session:`` pattern.
+    """
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session_instance)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=ctx)
 
 
 class TestCreateRun:
@@ -387,7 +399,11 @@ class TestDeleteRun:
 
 
 class TestJoinRun:
-    """Test GET /threads/{thread_id}/runs/{run_id}/join"""
+    """Test GET /threads/{thread_id}/runs/{run_id}/join
+
+    join_run manages sessions manually via _get_session_maker (not Depends),
+    so we patch the maker to return a mock async context manager.
+    """
 
     def test_join_run_not_found(self):
         """Test joining a non-existent run"""
@@ -400,7 +416,8 @@ class TestJoinRun:
         override_session_dependency(app, BasicSession)
         client = make_client(app)
 
-        resp = client.get("/threads/test-thread-123/runs/nonexistent/join")
+        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(Session())):
+            resp = client.get("/threads/test-thread-123/runs/nonexistent/join")
 
         assert resp.status_code == 404
 
@@ -417,7 +434,8 @@ class TestJoinRun:
         override_session_dependency(app, Session)
         client = make_client(app)
 
-        resp = client.get("/threads/test-thread-123/runs/test-run-123/join")
+        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(Session())):
+            resp = client.get("/threads/test-thread-123/runs/test-run-123/join")
 
         assert resp.status_code == 200
         # Response may vary depending on run state
@@ -498,7 +516,11 @@ class TestRunStatuses:
 
 
 class TestWaitForRun:
-    """Test POST /threads/{thread_id}/runs/wait"""
+    """Test POST /threads/{thread_id}/runs/wait
+
+    wait_for_run manages sessions via _get_session_maker (not Depends), so tests
+    that reach the handler must patch it. Pure-validation tests (422) don't need it.
+    """
 
     def test_wait_for_run_validation_no_input(self):
         """Test that wait endpoint requires input or command"""
@@ -527,13 +549,14 @@ class TestWaitForRun:
         override_session_dependency(app, Session)
         client = make_client(app)
 
-        resp = client.post(
-            "/threads/nonexistent/runs/wait",
-            json={
-                "assistant_id": "asst-123",
-                "input": {"message": "test"},
-            },
-        )
+        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(Session())):
+            resp = client.post(
+                "/threads/nonexistent/runs/wait",
+                json={
+                    "assistant_id": "asst-123",
+                    "input": {"message": "test"},
+                },
+            )
 
         # Should get 404 when thread doesn't exist
         assert resp.status_code == 404
@@ -556,13 +579,14 @@ class TestWaitForRun:
         override_session_dependency(app, Session)
         client = make_client(app)
 
-        resp = client.post(
-            "/threads/test-thread-123/runs/wait",
-            json={
-                "assistant_id": "nonexistent-asst",
-                "input": {"message": "test"},
-            },
-        )
+        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(Session())):
+            resp = client.post(
+                "/threads/test-thread-123/runs/wait",
+                json={
+                    "assistant_id": "nonexistent-asst",
+                    "input": {"message": "test"},
+                },
+            )
 
         # Should get 404 when assistant doesn't exist
         assert resp.status_code == 404
@@ -574,14 +598,15 @@ class TestWaitForRun:
         override_session_dependency(app, BasicSession)
         client = make_client(app)
 
-        resp = client.post(
-            "/threads/test-thread-123/runs/wait",
-            json={
-                "assistant_id": "asst-123",
-                "input": {"message": "test"},
-                "interrupt_before": ["node1", "node2"],
-            },
-        )
+        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(BasicSession())):
+            resp = client.post(
+                "/threads/test-thread-123/runs/wait",
+                json={
+                    "assistant_id": "asst-123",
+                    "input": {"message": "test"},
+                    "interrupt_before": ["node1", "node2"],
+                },
+            )
 
         # Should accept the parameter (may fail later in execution, but not validation)
         assert resp.status_code != 422
@@ -593,14 +618,15 @@ class TestWaitForRun:
         override_session_dependency(app, BasicSession)
         client = make_client(app)
 
-        resp = client.post(
-            "/threads/test-thread-123/runs/wait",
-            json={
-                "assistant_id": "asst-123",
-                "input": {"message": "test"},
-                "stream_subgraphs": True,
-            },
-        )
+        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(BasicSession())):
+            resp = client.post(
+                "/threads/test-thread-123/runs/wait",
+                json={
+                    "assistant_id": "asst-123",
+                    "input": {"message": "test"},
+                    "stream_subgraphs": True,
+                },
+            )
 
         # Should accept the parameter
         assert resp.status_code != 422
@@ -612,13 +638,14 @@ class TestWaitForRun:
         override_session_dependency(app, BasicSession)
         client = make_client(app)
 
-        resp = client.post(
-            "/threads/test-thread-123/runs/wait",
-            json={
-                "assistant_id": "asst-123",
-                "command": {"resume": "value"},
-            },
-        )
+        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(BasicSession())):
+            resp = client.post(
+                "/threads/test-thread-123/runs/wait",
+                json={
+                    "assistant_id": "asst-123",
+                    "command": {"resume": "value"},
+                },
+            )
 
         # Should accept command parameter
         assert resp.status_code != 422
@@ -656,13 +683,14 @@ class TestWaitForRun:
         override_session_dependency(app, Session)
         client = make_client(app)
 
-        resp = client.post(
-            "/threads/test-thread-123/runs/wait",
-            json={
-                "assistant_id": "asst-123",
-                "command": {"resume": "value"},
-            },
-        )
+        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(Session())):
+            resp = client.post(
+                "/threads/test-thread-123/runs/wait",
+                json={
+                    "assistant_id": "asst-123",
+                    "command": {"resume": "value"},
+                },
+            )
 
         # Should fail because thread is not interrupted
         assert resp.status_code == 400
@@ -674,15 +702,16 @@ class TestWaitForRun:
         override_session_dependency(app, BasicSession)
         client = make_client(app)
 
-        resp = client.post(
-            "/threads/test-thread-123/runs/wait",
-            json={
-                "assistant_id": "asst-123",
-                "input": {"message": "test"},
-                "config": {"configurable": {"key": "value"}},
-                "context": {"key": "value"},
-            },
-        )
+        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(BasicSession())):
+            resp = client.post(
+                "/threads/test-thread-123/runs/wait",
+                json={
+                    "assistant_id": "asst-123",
+                    "input": {"message": "test"},
+                    "config": {"configurable": {"key": "value"}},
+                    "context": {"key": "value"},
+                },
+            )
 
         # Should reject having both configurable and context
         assert resp.status_code == 400
@@ -766,11 +795,15 @@ class TestWaitForRunTimeouts:
 
                 return Result()
 
+        mock_maker = _make_session_maker(Session())
+
         override_session_dependency(app, Session)
         client = make_client(app)
 
         # Mock asyncio.wait_for to raise TimeoutError
         with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
+            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
             patch("asyncio.wait_for", side_effect=TimeoutError),
             patch("aegra_api.api.runs.get_langgraph_service") as mock_service,
             patch("aegra_api.api.runs.execute_run_async"),

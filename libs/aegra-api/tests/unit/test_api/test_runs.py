@@ -303,7 +303,13 @@ class TestRunsEndpoints:
         )
         mock_session.scalar.return_value = run_orm
 
-        result = await join_run("thread-1", "run-1", mock_user, mock_session)
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        mock_maker = MagicMock(return_value=ctx)
+
+        with patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker):
+            result = await join_run("thread-1", "run-1", mock_user)
 
         assert result == {"result": "done"}
 
@@ -333,15 +339,31 @@ class TestRunsEndpoints:
             updated_at=datetime.now(UTC),
         )
 
-        mock_session.scalar.side_effect = [run_orm_running, run_orm_done]
+        # Two separate sessions: first returns running, second returns done
+        mock_session_1 = AsyncMock()
+        mock_session_1.scalar.return_value = run_orm_running
+        mock_session_2 = AsyncMock()
+        mock_session_2.scalar.return_value = run_orm_done
+
+        sessions_iter = iter([mock_session_1, mock_session_2])
+
+        def _make_ctx() -> MagicMock:
+            ctx = MagicMock()
+            ctx.__aenter__ = AsyncMock(side_effect=lambda: next(sessions_iter))
+            ctx.__aexit__ = AsyncMock(return_value=False)
+            return ctx
+
+        mock_maker = MagicMock(side_effect=lambda: _make_ctx())
 
         # Mock active task
         mock_task = AsyncMock()
         with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.api.runs.active_runs", {"run-1": mock_task}),
+            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
             patch("aegra_api.api.runs.asyncio.wait_for", new_callable=AsyncMock) as mock_wait,
         ):
-            result = await join_run("thread-1", "run-1", mock_user, mock_session)
+            result = await join_run("thread-1", "run-1", mock_user)
 
             mock_wait.assert_called_once()  # Should wait on task
             assert result == {"result": "waited"}
