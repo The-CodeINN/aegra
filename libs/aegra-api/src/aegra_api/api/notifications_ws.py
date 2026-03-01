@@ -34,6 +34,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 
 from aegra_api.core.auth_middleware import get_auth_backend
 from aegra_api.core.orm import _get_session_maker
@@ -231,6 +232,55 @@ async def _heartbeat(ws: WebSocket, user_id: str) -> None:
         # Connection is dead — force close so the receive loop exits
         with contextlib.suppress(Exception):
             await ws.close()
+
+
+@router.get(
+    "/ws/notifications",
+    summary="Notifications WebSocket",
+    description="""
+Connect via WebSocket (not HTTP GET) to receive real-time notifications.
+
+**URL:** `ws://<host>/ws/notifications?token=<jwt>`
+
+---
+
+### Server → Client messages
+| `type` | Description |
+|---|---|
+| `notifications` | Active (unread) notifications, up to 50 |
+| `all_notifications` | All notifications (read + unread), up to 50 |
+| `action_items` | Pending action items |
+| `notification_update` | Single notification state change |
+| `"pong"` | Heartbeat response to client `"ping"` |
+
+### Client → Server messages
+| `action` | Payload | Description |
+|---|---|---|
+| `"ping"` | — | Heartbeat keepalive |
+| `mark_read` | `{"action":"mark_read","id":"<id>"}` | Mark one notification read |
+| `mark_all_read` | `{"action":"mark_all_read"}` | Mark all notifications read |
+| `dismiss` | `{"action":"dismiss","id":"<id>"}` | Dismiss a notification |
+| `refresh` | `{"action":"refresh"}` | Re-fetch full notification state |
+
+### Authentication
+Pass a valid JWT as the `token` query parameter. The connection is closed
+with code `4001` if authentication fails.
+
+### Heartbeat
+The server sends `"ping"` every 30 s. The client should respond with `"pong"`.
+Dead connections are cleaned up automatically.
+""",
+    status_code=426,
+    include_in_schema=True,
+    tags=["Notifications WebSocket"],
+)
+async def notifications_websocket_docs() -> JSONResponse:
+    """Documentation stub — connect via WebSocket, not HTTP."""
+    return JSONResponse(
+        status_code=426,
+        content={"detail": "This endpoint requires a WebSocket connection. Use ws:// or wss://."},
+        headers={"Upgrade": "websocket"},
+    )
 
 
 @router.websocket("/ws/notifications")
