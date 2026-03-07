@@ -88,6 +88,29 @@ def _readable_location(raw: str) -> str:
     return stripped
 
 
+def _dedupe_locations(locations: list[str]) -> list[str]:
+    """Normalize and deduplicate location strings while preserving order."""
+    deduped: list[str] = []
+    seen: set[str] = set()
+
+    for raw in locations:
+        if not isinstance(raw, str):
+            continue
+
+        normalized = raw.strip()
+        if not normalized:
+            continue
+
+        key = normalized.upper()
+        if key in seen:
+            continue
+
+        seen.add(key)
+        deduped.append(normalized)
+
+    return deduped
+
+
 # ---------------------------------------------------------------------------
 # Track → keyword mapping
 # ---------------------------------------------------------------------------
@@ -217,6 +240,25 @@ def _normalise_track(track: str) -> str:
     return track.lower().strip().replace(" ", "-")
 
 
+def _dedupe_tracks(tracks: list[str]) -> list[str]:
+    """Deduplicate tracks while preserving order and normalizing variants."""
+    deduped: list[str] = []
+    seen: set[str] = set()
+
+    for raw in tracks:
+        if not isinstance(raw, str):
+            continue
+
+        normalized = _normalise_track(raw)
+        if not normalized or normalized in seen:
+            continue
+
+        seen.add(normalized)
+        deduped.append(raw.strip())
+
+    return deduped
+
+
 def _domain_of(url: str) -> str:
     """Extract the registerable domain from a URL."""
     try:
@@ -322,6 +364,18 @@ class OpportunityDiscoveryEngine:
         prefs = result.scalar_one_or_none()
         return prefs.location if prefs else None
 
+    def get_profile_locations(self, profile: StudentProfile | None) -> list[str]:
+        """Extract ordered location candidates from the student profile."""
+        if not profile:
+            return []
+
+        return _dedupe_locations(
+            [
+                *(profile.work_countries or []),
+                profile.resident_country,
+            ]
+        )
+
     # ------------------------------------------------------------------
     # Query builders
     # ------------------------------------------------------------------
@@ -377,32 +431,51 @@ class OpportunityDiscoveryEngine:
         """
         loc = _readable_location(location)
 
-        # Determine job title
-        title = self._primary_keyword(track)
+        # Track stays primary; target role is a secondary boost.
+        primary_title = self._primary_keyword(track)
+        secondary_titles: list[str] = []
+
         if profile and profile.target_role:
-            title = profile.target_role
-        elif profile and profile.target_job_titles:
-            title = profile.target_job_titles[0]
+            secondary_titles.append(profile.target_role)
+
+        if profile and profile.target_job_titles:
+            secondary_titles.extend(profile.target_job_titles)
+
+        deduped_titles: list[str] = []
+        seen_titles: set[str] = set()
+        for title in [primary_title, *secondary_titles]:
+            normalized = title.strip().lower()
+            if not normalized or normalized in seen_titles:
+                continue
+            seen_titles.add(normalized)
+            deduped_titles.append(title.strip())
 
         # Experience level hint
         level_hint = ""
         if profile and profile.experience_level in ("entry-level", "junior"):
             level_hint = "junior"
 
-        search_title = f"{level_hint} {title}".strip() if level_hint else title
         queries: list[str] = []
-
-        # Site-specific job board queries
         job_boards = [
             "boards.greenhouse.io",
             "jobs.lever.co",
             "jobs.ashbyhq.com",
         ]
-        for board in job_boards:
-            queries.append(f'site:{board} "{search_title}" "{loc}"')
 
-        # General job query
-        queries.append(f'"{search_title}" "hiring" OR "job" "{loc}"')
+        def format_title(title: str) -> str:
+            return f"{level_hint} {title}".strip() if level_hint else title
+
+        primary_search_title = format_title(deduped_titles[0]) if deduped_titles else primary_title
+        queries.append(f'"{primary_search_title}" "hiring" OR "job" "{loc}"')
+
+        for secondary_title in deduped_titles[1:]:
+            secondary_search_title = format_title(secondary_title)
+            queries.append(f'"{secondary_search_title}" "hiring" OR "job" "{loc}"')
+
+        for title in deduped_titles:
+            search_title = format_title(title)
+            for board in job_boards:
+                queries.append(f'site:{board} "{search_title}" "{loc}"')
 
         return queries
 
@@ -743,7 +816,7 @@ class OpportunityDiscoveryEngine:
     async def _discover_events(
         self,
         tracks: list[str],
-        location: str,
+        locations: list[str],
         profile: StudentProfile | None,
         seen_urls: set[str],
         queries_per_category: int = 2,
@@ -769,9 +842,10 @@ class OpportunityDiscoveryEngine:
 
         tasks = []
         for track_name in tracks:
-            event_queries = self.build_event_queries(track_name, location, profile)
-            for q in event_queries[:queries_per_category]:
-                tasks.append(_search_one(q, track_name))
+            for location in locations:
+                event_queries = self.build_event_queries(track_name, location, profile)
+                for q in event_queries[:queries_per_category]:
+                    tasks.append(_search_one(q, track_name))
 
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
         all_events: list[dict[str, Any]] = []
@@ -783,7 +857,7 @@ class OpportunityDiscoveryEngine:
     async def _discover_jobs(
         self,
         tracks: list[str],
-        location: str,
+        locations: list[str],
         profile: StudentProfile | None,
         seen_urls: set[str],
         queries_per_category: int = 2,
@@ -809,9 +883,10 @@ class OpportunityDiscoveryEngine:
 
         tasks = []
         for track_name in tracks:
-            job_queries = self.build_job_queries(track_name, location, profile)
-            for q in job_queries[:queries_per_category]:
-                tasks.append(_search_one(q, track_name))
+            for location in locations:
+                job_queries = self.build_job_queries(track_name, location, profile)
+                for q in job_queries[:queries_per_category]:
+                    tasks.append(_search_one(q, track_name))
 
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
         all_jobs: list[dict[str, Any]] = []
@@ -841,7 +916,12 @@ class OpportunityDiscoveryEngine:
         # Derive tracks from the profile that was already fetched (avoid
         # a redundant LMS call). Fall back to DB prefs / defaults only
         # if profile has no enrollment data.
-        tracks = profile.enrolled_tracks if profile.enrolled_tracks else []
+        tracks = _dedupe_tracks(
+            [
+                *([profile.learning_track] if profile.learning_track else []),
+                *(profile.enrolled_tracks or []),
+            ]
+        )
         if not tracks:
             tracks = await self._get_tracks_from_prefs_or_fallback(session, user_id)
         if not tracks:
@@ -851,16 +931,20 @@ class OpportunityDiscoveryEngine:
         if max_tracks > 0:
             tracks = tracks[:max_tracks]
 
-        location = profile.location
-        if location == "remote":
-            location = await self.get_user_location(session, user_id) or "remote"
+        locations = self.get_profile_locations(profile)
+        if not locations:
+            fallback_location = await self.get_user_location(session, user_id)
+            if fallback_location:
+                locations = [fallback_location]
+        if not locations:
+            locations = ["remote"]
 
         logger.info(
             "discovery_starting",
             user_id=user_id,
             track_count=len(tracks),
             tracks=tracks,
-            location=_readable_location(location),
+            locations=[_readable_location(location) for location in locations],
             target_role=profile.target_role,
             is_job_searching=profile.is_job_searching,
         )
@@ -877,8 +961,8 @@ class OpportunityDiscoveryEngine:
 
         # Run event and job discovery in parallel
         event_results, job_results = await asyncio.gather(
-            self._discover_events(tracks, location, profile, seen_urls, queries_per_category),
-            self._discover_jobs(tracks, location, profile, seen_urls, queries_per_category),
+            self._discover_events(tracks, locations, profile, seen_urls, queries_per_category),
+            self._discover_jobs(tracks, locations, profile, seen_urls, queries_per_category),
         )
 
         all_parsed = event_results + job_results
@@ -895,6 +979,7 @@ class OpportunityDiscoveryEngine:
             meta: dict[str, Any] = {
                 "source": parsed.get("_source", "unknown"),
                 "query": parsed.get("_query", ""),
+                "search_locations": [_readable_location(location) for location in locations],
             }
             # Attach strategy to metadata so frontend can display it
             if parsed.get("networking_strategy"):

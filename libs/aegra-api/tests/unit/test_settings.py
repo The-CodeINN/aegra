@@ -1,8 +1,10 @@
 """Tests for DatabaseSettings DATABASE_URL support."""
 
+from pathlib import Path
+
 import pytest
 
-from aegra_api.settings import DatabaseSettings
+from aegra_api.settings import DatabaseSettings, _find_env_file
 
 
 class TestDatabaseURLSupport:
@@ -33,6 +35,7 @@ class TestDatabaseURLSupport:
 
         assert db.database_url == "postgresql+asyncpg://rdsuser:rdspass@rds.aws.com:5432/prod"
         assert db.database_url_sync == "postgresql://rdsuser:rdspass@rds.aws.com:5432/prod"
+        assert db.database_url_sqlalchemy_sync == "postgresql+psycopg://rdsuser:rdspass@rds.aws.com:5432/prod"
 
     def test_query_params_preserved(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """SSL and other query params from DATABASE_URL are preserved."""
@@ -46,8 +49,10 @@ class TestDatabaseURLSupport:
         assert "sslmode=require" in db.database_url
         assert "connect_timeout=10" in db.database_url
         assert "sslmode=require" in db.database_url_sync
+        assert "sslmode=require" in db.database_url_sqlalchemy_sync
         assert db.database_url.startswith("postgresql+asyncpg://")
         assert db.database_url_sync.startswith("postgresql://")
+        assert db.database_url_sqlalchemy_sync.startswith("postgresql+psycopg://")
 
     def test_driver_prefix_normalized(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Driver prefix is always normalized regardless of input."""
@@ -57,6 +62,7 @@ class TestDatabaseURLSupport:
 
         assert db.database_url.startswith("postgresql+asyncpg://")
         assert db.database_url_sync.startswith("postgresql://")
+        assert db.database_url_sqlalchemy_sync.startswith("postgresql+psycopg://")
         assert not db.database_url_sync.startswith("postgresql+")
 
     def test_legacy_postgres_scheme_normalized(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -67,6 +73,7 @@ class TestDatabaseURLSupport:
 
         assert db.database_url.startswith("postgresql+asyncpg://")
         assert db.database_url_sync.startswith("postgresql://")
+        assert db.database_url_sqlalchemy_sync.startswith("postgresql+psycopg://")
         assert "user:pass@host:5432/db" in db.database_url
 
     def test_individual_vars_still_work(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -91,3 +98,16 @@ class TestDatabaseURLSupport:
 
         # _normalize_scheme won't match, so URL passes through as-is
         assert db.DATABASE_URL == "not-a-url"
+
+
+class TestEnvFileDiscovery:
+    """Test local .env discovery for the global settings singleton."""
+
+    def test_prefers_explicit_env_override(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """An explicit _AEGRA_ENV_FILE override is honored when it points to a file."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("POSTGRES_HOST=override-host\n", encoding="utf-8")
+
+        monkeypatch.setenv("_AEGRA_ENV_FILE", str(env_file))
+
+        assert _find_env_file() == str(env_file)
