@@ -1,7 +1,11 @@
 {
   "dependencies": ["./graphs"],
   "graphs": {
-    "agent": "./graphs/react_agent/graph.py:graph"
+    "agent": "./graphs/react_agent/graph.py:graph",
+    "agent_hitl": "./examples/react_agent_hitl/graph.py:graph",
+    "subgraph_agent": "./examples/subgraph_agent/graph.py:graph",
+    "subgraph_hitl_agent": "./examples/subgraph_hitl_agent/graph.py:graph",
+    "factory": "./examples/factory/graph.py:graph"
   },
   "auth": {
     "path": "./auth.py:auth"
