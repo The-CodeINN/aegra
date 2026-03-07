@@ -240,6 +240,25 @@ def _normalise_track(track: str) -> str:
     return track.lower().strip().replace(" ", "-")
 
 
+def _dedupe_tracks(tracks: list[str]) -> list[str]:
+    """Deduplicate tracks while preserving order and normalizing variants."""
+    deduped: list[str] = []
+    seen: set[str] = set()
+
+    for raw in tracks:
+        if not isinstance(raw, str):
+            continue
+
+        normalized = _normalise_track(raw)
+        if not normalized or normalized in seen:
+            continue
+
+        seen.add(normalized)
+        deduped.append(raw.strip())
+
+    return deduped
+
+
 def _domain_of(url: str) -> str:
     """Extract the registerable domain from a URL."""
     try:
@@ -412,32 +431,51 @@ class OpportunityDiscoveryEngine:
         """
         loc = _readable_location(location)
 
-        # Determine job title
-        title = self._primary_keyword(track)
+        # Track stays primary; target role is a secondary boost.
+        primary_title = self._primary_keyword(track)
+        secondary_titles: list[str] = []
+
         if profile and profile.target_role:
-            title = profile.target_role
-        elif profile and profile.target_job_titles:
-            title = profile.target_job_titles[0]
+            secondary_titles.append(profile.target_role)
+
+        if profile and profile.target_job_titles:
+            secondary_titles.extend(profile.target_job_titles)
+
+        deduped_titles: list[str] = []
+        seen_titles: set[str] = set()
+        for title in [primary_title, *secondary_titles]:
+            normalized = title.strip().lower()
+            if not normalized or normalized in seen_titles:
+                continue
+            seen_titles.add(normalized)
+            deduped_titles.append(title.strip())
 
         # Experience level hint
         level_hint = ""
         if profile and profile.experience_level in ("entry-level", "junior"):
             level_hint = "junior"
 
-        search_title = f"{level_hint} {title}".strip() if level_hint else title
         queries: list[str] = []
-
-        # Site-specific job board queries
         job_boards = [
             "boards.greenhouse.io",
             "jobs.lever.co",
             "jobs.ashbyhq.com",
         ]
-        for board in job_boards:
-            queries.append(f'site:{board} "{search_title}" "{loc}"')
 
-        # General job query
-        queries.append(f'"{search_title}" "hiring" OR "job" "{loc}"')
+        def format_title(title: str) -> str:
+            return f"{level_hint} {title}".strip() if level_hint else title
+
+        primary_search_title = format_title(deduped_titles[0]) if deduped_titles else primary_title
+        queries.append(f'"{primary_search_title}" "hiring" OR "job" "{loc}"')
+
+        for secondary_title in deduped_titles[1:]:
+            secondary_search_title = format_title(secondary_title)
+            queries.append(f'"{secondary_search_title}" "hiring" OR "job" "{loc}"')
+
+        for title in deduped_titles:
+            search_title = format_title(title)
+            for board in job_boards:
+                queries.append(f'site:{board} "{search_title}" "{loc}"')
 
         return queries
 
@@ -878,7 +916,12 @@ class OpportunityDiscoveryEngine:
         # Derive tracks from the profile that was already fetched (avoid
         # a redundant LMS call). Fall back to DB prefs / defaults only
         # if profile has no enrollment data.
-        tracks = profile.enrolled_tracks if profile.enrolled_tracks else []
+        tracks = _dedupe_tracks(
+            [
+                *( [profile.learning_track] if profile.learning_track else [] ),
+                *(profile.enrolled_tracks or []),
+            ]
+        )
         if not tracks:
             tracks = await self._get_tracks_from_prefs_or_fallback(session, user_id)
         if not tracks:
