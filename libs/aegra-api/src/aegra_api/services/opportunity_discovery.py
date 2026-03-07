@@ -918,7 +918,7 @@ class OpportunityDiscoveryEngine:
         # if profile has no enrollment data.
         tracks = _dedupe_tracks(
             [
-                *( [profile.learning_track] if profile.learning_track else [] ),
+                *([profile.learning_track] if profile.learning_track else []),
                 *(profile.enrolled_tracks or []),
             ]
         )
