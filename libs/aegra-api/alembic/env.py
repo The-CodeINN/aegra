@@ -1,33 +1,15 @@
 """Alembic environment configuration for Aegra database migrations."""
 
-import os
 import threading
 from logging.config import fileConfig
-from pathlib import Path
 
 from sqlalchemy import create_engine, pool
 from sqlalchemy.engine import Connection
 
-from alembic import context
-
-# Ensure .env is loaded from the project root (if running locally)
-# In Docker/production, env vars are injected - no .env needed
-try:
-    _project_root = Path(__file__).resolve().parents[3]  # aegra/
-    _env_path = _project_root / ".env"
-    if _env_path.is_file():
-        os.environ.setdefault("_AEGRA_ENV_FILE", str(_env_path))
-        # Feed dotenv values into the environment so pydantic-settings picks them up
-        from dotenv import load_dotenv
-
-        load_dotenv(_env_path, override=False)
-except (IndexError, OSError):
-    # Running in a flattened Docker environment or .env not found
-    pass
-
 # Import your SQLAlchemy models here
 from aegra_api.core.orm import Base  # noqa: E402
 from aegra_api.settings import settings  # noqa: E402
+from alembic import context
 
 # This is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -89,21 +71,9 @@ def do_run_migrations(connection: Connection) -> None:
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode.
 
-    Uses the sync psycopg (v3) driver. SSL mode is controlled via
-    POSTGRES_SSLMODE env var (defaults to 'prefer').
+    Uses the same computed sync URL as the application runtime.
     """
-    db = settings.db
-    sslmode = os.environ.get("POSTGRES_SSLMODE", "prefer")
-    if db.DATABASE_URL:
-        # Use DATABASE_URL directly (may already contain query params)
-        url = db.database_url_sync
-    else:
-        url = (
-            f"postgresql+psycopg://{db.POSTGRES_USER}:{db.POSTGRES_PASSWORD}@"
-            f"{db.POSTGRES_HOST}:{db.POSTGRES_PORT}/{db.POSTGRES_DB}"
-            f"?sslmode={sslmode}"
-        )
-    connectable = create_engine(url, poolclass=pool.NullPool)
+    connectable = create_engine(settings.db.database_url_sqlalchemy_sync, poolclass=pool.NullPool)
 
     with connectable.connect() as connection:
         do_run_migrations(connection)

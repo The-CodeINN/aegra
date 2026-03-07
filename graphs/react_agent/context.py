@@ -44,7 +44,7 @@ class Context:
     )
 
     enable_thinking: bool = field(
-        default=True,
+        default=False,
         metadata={
             "description": "Enable extended thinking (reasoning) for Claude models. "
             "When enabled, the AI will show its reasoning process."

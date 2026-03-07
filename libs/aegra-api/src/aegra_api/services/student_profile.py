@@ -7,11 +7,7 @@ notification generation, and accountability tracking.
 LMS endpoints used:
 - GET /api/v1/user/profile          → name, email, profileImage
 - GET /api/v1/enrollment/student/blackboard → enrolled tracks, progress
-- GET /api/v1/ai-mentor/onboarding/section-1 → learning track, situation, weekly time
-- GET /api/v1/ai-mentor/onboarding/section-2 → employment, role, industry, location, experience
-- GET /api/v1/ai-mentor/onboarding/section-4 → goals, target role, timeline
-- GET /api/v1/ai-mentor/onboarding/section-5 → skills, profiles
-- GET /api/v1/ai-mentor/onboarding/section-6 → challenges, job search stats
+- GET /api/v1/ai-mentor/onboarding/me       → full onboarding snapshot, including learning, location, goals, skills, and challenges
 """
 
 from __future__ import annotations
@@ -134,19 +130,17 @@ async def fetch_student_profile(user_id: str, auth_token: str) -> StudentProfile
     profile = StudentProfile(user_id=user_id)
 
     async with httpx.AsyncClient() as client:
-        # Fetch all sections in parallel (caching handled per-endpoint)
+        # Fetch the distinct LMS datasets in parallel (caching handled per-endpoint)
         results = await asyncio.gather(
             cached_lms_fetch(client, f"{lms_url}/api/v1/user/profile", auth_token, user_id),
             cached_lms_fetch(client, f"{lms_url}/api/v1/enrollment/student/blackboard", auth_token, user_id),
-            cached_lms_fetch(client, f"{lms_url}/api/v1/ai-mentor/onboarding/section-1", auth_token, user_id),
-            cached_lms_fetch(client, f"{lms_url}/api/v1/ai-mentor/onboarding/section-2", auth_token, user_id),
-            cached_lms_fetch(client, f"{lms_url}/api/v1/ai-mentor/onboarding/section-4", auth_token, user_id),
-            cached_lms_fetch(client, f"{lms_url}/api/v1/ai-mentor/onboarding/section-5", auth_token, user_id),
-            cached_lms_fetch(client, f"{lms_url}/api/v1/ai-mentor/onboarding/section-6", auth_token, user_id),
+            cached_lms_fetch(client, f"{lms_url}/api/v1/ai-mentor/onboarding/me", auth_token, user_id),
             return_exceptions=True,
         )
 
-        user_data, enrollment_data, s1, s2, s4, s5, s6 = [r if isinstance(r, dict) else {} for r in results]
+        user_data, enrollment_data, onboarding_me = [r if isinstance(r, dict) else {} for r in results]
+
+        onboarding_data = onboarding_me.get("onboarding", {}) or {}
 
         # Parse user profile
         user = user_data.get("user", user_data)
@@ -165,14 +159,14 @@ async def fetch_student_profile(user_id: str, auth_token: str) -> StudentProfile
                 profile.overall_progress[track_name] = progress
 
         # Section 1: Quick start
-        sec1 = s1.get("s1", {})
+        sec1 = onboarding_data.get("s1", {}) or {}
         if sec1.get("completed"):
             profile.learning_track = sec1.get("learningTrack", "")
             profile.current_situation = sec1.get("situation", "")
             profile.weekly_time = sec1.get("weeklyTime", "")
 
         # Section 2: Background
-        sec2 = s2.get("s2", {})
+        sec2 = onboarding_data.get("s2", {}) or {}
         if sec2.get("completed"):
             profile.employment_status = sec2.get("employmentStatus", "")
             profile.role_title = sec2.get("roleTitle", "")
@@ -183,7 +177,7 @@ async def fetch_student_profile(user_id: str, auth_token: str) -> StudentProfile
             profile.work_countries = sec2.get("workCountry", []) or []
 
         # Section 4: Goals
-        sec4 = s4.get("s4", {})
+        sec4 = onboarding_data.get("s4", {}) or {}
         if sec4.get("completed"):
             profile.primary_goal = sec4.get("primaryGoal", "")
             profile.target_role = sec4.get("targetRole", "")
@@ -191,7 +185,7 @@ async def fetch_student_profile(user_id: str, auth_token: str) -> StudentProfile
             profile.goal_why = sec4.get("goalWhy", "")
 
         # Section 5: Skills
-        sec5 = s5.get("s5", {})
+        sec5 = onboarding_data.get("s5", {}) or {}
         if sec5.get("completed"):
             profile.confident_skills = sec5.get("confidentSkills", []) or []
             profile.need_help_areas = sec5.get("needHelpAreas", []) or []
@@ -201,7 +195,7 @@ async def fetch_student_profile(user_id: str, auth_token: str) -> StudentProfile
             profile.portfolio_url = profiles.get("portfolio", "")
 
         # Section 6: Challenges
-        sec6 = s6.get("s6", {})
+        sec6 = onboarding_data.get("s6", {}) or {}
         if sec6.get("completed"):
             profile.biggest_challenge = sec6.get("biggestChallenge", "")
             job_search = sec6.get("jobSearch", {}) or {}
