@@ -25,6 +25,8 @@ from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.core.sse import create_end_event, get_sse_headers
 from aegra_api.models import Run, RunCreate, RunStatus, User
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
+from aegra_api.observability.span_enrichment import make_run_trace_context
+from aegra_api.services.advisor_cache import get_cached_advisor
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.graph_streaming import stream_graph_events
 from aegra_api.services.langgraph_service import create_run_config, get_langgraph_service
@@ -49,6 +51,45 @@ active_runs: dict[str, asyncio.Task] = {}
 # "custom" is required so that get_stream_writer() events (e.g. thread_title)
 # are included in the stream and forwarded to the frontend via onCustomEvent.
 DEFAULT_STREAM_MODES = ["values", "custom"]
+
+
+def _get_user_token(user: User | None) -> str | None:
+    """Extract the bearer token stored on the authenticated user, if available."""
+    if not user:
+        return None
+
+    try:
+        user_dict = user.to_dict()
+    except Exception:
+        return None
+
+    token = user_dict.get("token")
+    return token if isinstance(token, str) and token.strip() else None
+
+
+async def _enrich_run_context_with_user_data(context: dict[str, Any] | None, user: User | None) -> dict[str, Any]:
+    """Inject user-scoped runtime data and resolve the assigned advisor when missing."""
+    runtime_context = context.copy() if context else {}
+    if not user:
+        return runtime_context
+
+    runtime_context.setdefault("user_id", user.identity)
+
+    token = _get_user_token(user)
+    if token:
+        runtime_context.setdefault("user_token", token)
+
+    needs_advisor = not runtime_context.get("advisor")
+    needs_track = not runtime_context.get("learning_track")
+
+    if token and (needs_advisor or needs_track):
+        advisor, learning_track = await get_cached_advisor(user.identity, token)
+        if needs_advisor:
+            runtime_context["advisor"] = advisor
+        if needs_track and learning_track:
+            runtime_context["learning_track"] = learning_track
+
+    return runtime_context
 
 
 def map_command_to_langgraph(cmd: dict[str, Any]) -> Command:
@@ -155,6 +196,36 @@ async def _validate_resume_command(session: AsyncSession, thread_id: str, comman
             raise HTTPException(400, "Cannot resume: thread is not in interrupted state")
 
 
+async def persist_thread_title(session: AsyncSession, thread_id: str, output: Any) -> None:
+    """Persist a generated thread title into thread metadata when available."""
+    if not isinstance(output, dict):
+        return
+
+    thread_name = output.get("thread_name")
+    if not isinstance(thread_name, str):
+        return
+
+    normalized_thread_name = thread_name.strip()
+    if not normalized_thread_name:
+        return
+
+    thread = await session.scalar(select(ThreadORM).where(ThreadORM.thread_id == thread_id))
+    if not thread:
+        return
+
+    metadata = dict(getattr(thread, "metadata_json", {}) or {})
+    if metadata.get("thread_name") == normalized_thread_name:
+        return
+
+    metadata["thread_name"] = normalized_thread_name
+    await session.execute(
+        update(ThreadORM)
+        .where(ThreadORM.thread_id == thread_id)
+        .values(metadata_json=metadata, updated_at=datetime.now(UTC))
+    )
+    await session.commit()
+
+
 @router.post("/threads/{thread_id}/runs", response_model=Run, responses={**NOT_FOUND, **CONFLICT})
 async def create_run(
     thread_id: str,
@@ -176,14 +247,18 @@ async def create_run(
 
     # If handler modified config/context, update request
     if filters:
-        if "config" in filters:
+        if "config" in filters and isinstance(filters["config"], dict):
             request.config = {**(request.config or {}), **filters["config"]}
-        if "context" in filters:
+        if "context" in filters and isinstance(filters["context"], dict):
             request.context = {**(request.context or {}), **filters["context"]}
-    elif value.get("config"):
-        request.config = {**(request.config or {}), **value["config"]}
-    elif value.get("context"):
-        request.context = {**(request.context or {}), **value["context"]}
+    else:
+        value_config = value.get("config")
+        if isinstance(value_config, dict):
+            request.config = {**(request.config or {}), **value_config}
+
+        value_context = value.get("context")
+        if isinstance(value_context, dict):
+            request.context = {**(request.context or {}), **value_context}
 
     # Validate resume command requirements early
     await _validate_resume_command(session, thread_id, request.command)
@@ -226,6 +301,7 @@ async def create_run(
 
     config = _merge_jsonb(assistant.config, config)
     context = _merge_jsonb(assistant.context, context)
+    context = await _enrich_run_context_with_user_data(context, user)
 
     # Validate the assistant's graph exists
     available_graphs = langgraph_service.list_graphs()
@@ -259,8 +335,8 @@ async def create_run(
     # Build response from ORM -> Pydantic
     run = Run.model_validate(run_orm)
 
-    # Start execution asynchronously
-    # Don't pass the session to avoid transaction conflicts
+    # Start execution asynchronously.
+    # Don't pass the session to avoid transaction conflicts.
     task = asyncio.create_task(
         execute_run_async(
             run_id,
@@ -278,7 +354,8 @@ async def create_run(
             request.interrupt_after,
             request.multitask_strategy,
             request.stream_subgraphs,
-        )
+        ),
+        context=make_run_trace_context(run_id, thread_id, assistant.graph_id, user.identity),
     )
     logger.info(f"[create_run] background task created task_id={id(task)} for run_id={run_id}")
     active_runs[run_id] = task
@@ -347,6 +424,7 @@ async def create_and_stream_run(
 
     config = _merge_jsonb(assistant.config, config)
     context = _merge_jsonb(assistant.context, context)
+    context = await _enrich_run_context_with_user_data(context, user)
 
     # Validate the assistant's graph exists
     available_graphs = langgraph_service.list_graphs()
@@ -380,8 +458,8 @@ async def create_and_stream_run(
     # Build response model for stream context
     run = Run.model_validate(run_orm)
 
-    # Start background execution that will populate the broker
-    # Don't pass the session to avoid transaction conflicts
+    # Start background execution that will populate the broker.
+    # Don't pass the session to avoid transaction conflicts.
     task = asyncio.create_task(
         execute_run_async(
             run_id,
@@ -399,7 +477,8 @@ async def create_and_stream_run(
             request.interrupt_after,
             request.multitask_strategy,
             request.stream_subgraphs,
-        )
+        ),
+        context=make_run_trace_context(run_id, thread_id, assistant.graph_id, user.identity),
     )
     logger.info(f"[create_and_stream_run] background task created task_id={id(task)} for run_id={run_id}")
     active_runs[run_id] = task
@@ -669,6 +748,7 @@ async def wait_for_run(
 
         config = _merge_jsonb(assistant.config, config)
         context = _merge_jsonb(assistant.context, context)
+        context = await _enrich_run_context_with_user_data(context, user)
 
         # Validate the assistant's graph exists
         available_graphs = langgraph_service.list_graphs()
@@ -704,7 +784,7 @@ async def wait_for_run(
 
     # No pool connection held from here — safe for long waits
 
-    # Start execution asynchronously
+    # Start execution asynchronously.
     task = asyncio.create_task(
         execute_run_async(
             run_id,
@@ -722,7 +802,8 @@ async def wait_for_run(
             request.interrupt_after,
             request.multitask_strategy,
             request.stream_subgraphs,
-        )
+        ),
+        context=make_run_trace_context(run_id, thread_id, graph_id, user.identity),
     )
     logger.info(f"[wait_for_run] background task created task_id={id(task)} for run_id={run_id}")
     active_runs[run_id] = task
@@ -958,22 +1039,16 @@ async def execute_run_async(
         else:
             stream_mode_list = stream_mode.copy()
 
-        # Inject user data into context for graph runtime
-        runtime_context = context.copy() if context else {}
-        if user:
-            runtime_context.setdefault("user_id", user.identity)
-            # Get token from user - handle Pydantic extra fields
-            user_dict = user.to_dict()
-            if "token" in user_dict:
-                runtime_context.setdefault("user_token", user_dict["token"])
-                logger.info(f"[execute_run_async] Injected user_token into context for run_id={run_id}")
-            else:
-                logger.warning(
-                    f"[execute_run_async] No token found in user dict for run_id={run_id} user_dict_keys={list(user_dict.keys())}"
-                )
+        runtime_context = await _enrich_run_context_with_user_data(context, user)
 
         async with (
-            langgraph_service.get_graph(graph_id) as graph,
+            langgraph_service.get_graph(
+                graph_id,
+                config=run_config,
+                access_context="threads.create_run",
+                user=user,
+                context=runtime_context,
+            ) as graph,
             with_auth_ctx(user, []),
         ):
             # Stream events using the graph_streaming service
@@ -1029,6 +1104,7 @@ async def execute_run_async(
             await update_run_status(run_id, "interrupted", output=final_output or {}, session=session)
             if not session:
                 raise RuntimeError(f"No database session available to update thread {thread_id} status")
+            await persist_thread_title(session, thread_id, final_output)
             await set_thread_status(session, thread_id, "interrupted")
 
         else:
@@ -1037,6 +1113,7 @@ async def execute_run_async(
             # Mark thread back to idle
             if not session:
                 raise RuntimeError(f"No database session available to update thread {thread_id} status")
+            await persist_thread_title(session, thread_id, final_output)
             await set_thread_status(session, thread_id, "idle")
 
     except asyncio.CancelledError:

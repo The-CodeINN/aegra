@@ -10,7 +10,7 @@ requires-python = ">=3.12"
 package = false
 
 [tool.uv.workspace]
-members = ["libs/aegra-api"]
+members = ["libs/aegra-api", "libs/aegra-cli"]
 
 [tool.ruff]
 line-length = 120

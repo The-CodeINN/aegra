@@ -39,12 +39,12 @@ LMS_API_URL = settings.app.LMS_URL
 
 def _get_cache_key(user_id: str) -> str:
     """Generate Redis cache key for user's learning track."""
-    return f"dedatahub:learning_track:{user_id}"
+    return f"dedatahub:learning_track:v2:{user_id}"
 
 
 def _get_advisor_cache_key(user_id: str) -> str:
     """Generate Redis cache key for user's advisor."""
-    return f"dedatahub:advisor:{user_id}"
+    return f"dedatahub:advisor:v2:{user_id}"
 
 
 async def _get_from_redis(key: str) -> str | None:
@@ -95,8 +95,44 @@ async def _set_in_memory(user_id: str, track: str | None) -> None:
         _memory_cache[user_id] = (track, expiry)
 
 
+async def _fetch_track_from_subscription(token: str) -> str | None:
+    """Fetch the student's active subscription track from the LMS API."""
+    subscription_endpoint = f"{LMS_API_URL}/api/v1/subscription/me"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                subscription_endpoint,
+                headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            learning_track = cast(str | None, data.get("track"))
+            logger.info("Fetched subscription track from LMS", learning_track=learning_track)
+            return learning_track
+
+    except httpx.HTTPStatusError as e:
+        logger.warning("HTTP error fetching subscription track", status_code=e.response.status_code)
+        return None
+    except httpx.TimeoutException:
+        logger.warning("Timeout while fetching subscription track")
+        return None
+    except Exception as e:
+        logger.warning("Unexpected error fetching subscription track", error=str(e))
+        return None
+
+
 async def _fetch_learning_track_from_lms(token: str) -> str | None:
-    """Fetch the student's learning track from the LMS API."""
+    """Fetch the student's learning track from the LMS API.
+
+    Active subscription is the source of truth. Onboarding is a fallback for
+    accounts without an active track assignment yet.
+    """
+    subscription_track = await _fetch_track_from_subscription(token)
+    if subscription_track:
+        return subscription_track
+
     onboarding_endpoint = f"{LMS_API_URL}/api/v1/onboarding"
 
     try:

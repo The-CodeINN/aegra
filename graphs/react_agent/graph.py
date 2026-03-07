@@ -33,7 +33,11 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, list[
         dict: A dictionary containing the model's response message.
     """
     # Initialize the model with tool binding. Change the model or add more tools here.
-    model = load_chat_model(runtime.context.model).bind_tools(TOOLS)
+    model = load_chat_model(
+        runtime.context.model,
+        enable_thinking=runtime.context.enable_thinking,
+        thinking_budget=runtime.context.thinking_budget,
+    ).bind_tools(TOOLS)
 
     # Format the system prompt. Customize this to change the agent's behavior.
     system_message = runtime.context.system_prompt.format(system_time=datetime.now(tz=UTC).isoformat())
@@ -78,7 +82,11 @@ async def generate_thread_title(state: State, runtime: Runtime[Context]) -> dict
     if first_ai:
         exchange += f"\nAssistant: {first_ai}"
 
-    model = load_chat_model(runtime.context.model)
+    model = load_chat_model(
+        runtime.context.model,
+        enable_thinking=runtime.context.enable_thinking,
+        thinking_budget=runtime.context.thinking_budget,
+    )
     response = await model.ainvoke(
         [
             {
@@ -93,7 +101,9 @@ async def generate_thread_title(state: State, runtime: Runtime[Context]) -> dict
         ]
     )
 
-    title = response.content.strip()[:80]
+    title = get_message_text(response).strip()[:80]
+    if not title:
+        return {}
 
     # Dispatch custom event so the frontend sidebar updates immediately
     writer = get_stream_writer()
