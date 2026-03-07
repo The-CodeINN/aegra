@@ -88,6 +88,29 @@ def _readable_location(raw: str) -> str:
     return stripped
 
 
+def _dedupe_locations(locations: list[str]) -> list[str]:
+    """Normalize and deduplicate location strings while preserving order."""
+    deduped: list[str] = []
+    seen: set[str] = set()
+
+    for raw in locations:
+        if not isinstance(raw, str):
+            continue
+
+        normalized = raw.strip()
+        if not normalized:
+            continue
+
+        key = normalized.upper()
+        if key in seen:
+            continue
+
+        seen.add(key)
+        deduped.append(normalized)
+
+    return deduped
+
+
 # ---------------------------------------------------------------------------
 # Track → keyword mapping
 # ---------------------------------------------------------------------------
@@ -321,6 +344,18 @@ class OpportunityDiscoveryEngine:
         result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
         prefs = result.scalar_one_or_none()
         return prefs.location if prefs else None
+
+    def get_profile_locations(self, profile: StudentProfile | None) -> list[str]:
+        """Extract ordered location candidates from the student profile."""
+        if not profile:
+            return []
+
+        return _dedupe_locations(
+            [
+                *(profile.work_countries or []),
+                profile.resident_country,
+            ]
+        )
 
     # ------------------------------------------------------------------
     # Query builders
@@ -743,7 +778,7 @@ class OpportunityDiscoveryEngine:
     async def _discover_events(
         self,
         tracks: list[str],
-        location: str,
+        locations: list[str],
         profile: StudentProfile | None,
         seen_urls: set[str],
         queries_per_category: int = 2,
@@ -769,9 +804,10 @@ class OpportunityDiscoveryEngine:
 
         tasks = []
         for track_name in tracks:
-            event_queries = self.build_event_queries(track_name, location, profile)
-            for q in event_queries[:queries_per_category]:
-                tasks.append(_search_one(q, track_name))
+            for location in locations:
+                event_queries = self.build_event_queries(track_name, location, profile)
+                for q in event_queries[:queries_per_category]:
+                    tasks.append(_search_one(q, track_name))
 
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
         all_events: list[dict[str, Any]] = []
@@ -783,7 +819,7 @@ class OpportunityDiscoveryEngine:
     async def _discover_jobs(
         self,
         tracks: list[str],
-        location: str,
+        locations: list[str],
         profile: StudentProfile | None,
         seen_urls: set[str],
         queries_per_category: int = 2,
@@ -809,9 +845,10 @@ class OpportunityDiscoveryEngine:
 
         tasks = []
         for track_name in tracks:
-            job_queries = self.build_job_queries(track_name, location, profile)
-            for q in job_queries[:queries_per_category]:
-                tasks.append(_search_one(q, track_name))
+            for location in locations:
+                job_queries = self.build_job_queries(track_name, location, profile)
+                for q in job_queries[:queries_per_category]:
+                    tasks.append(_search_one(q, track_name))
 
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
         all_jobs: list[dict[str, Any]] = []
@@ -851,16 +888,20 @@ class OpportunityDiscoveryEngine:
         if max_tracks > 0:
             tracks = tracks[:max_tracks]
 
-        location = profile.location
-        if location == "remote":
-            location = await self.get_user_location(session, user_id) or "remote"
+        locations = self.get_profile_locations(profile)
+        if not locations:
+            fallback_location = await self.get_user_location(session, user_id)
+            if fallback_location:
+                locations = [fallback_location]
+        if not locations:
+            locations = ["remote"]
 
         logger.info(
             "discovery_starting",
             user_id=user_id,
             track_count=len(tracks),
             tracks=tracks,
-            location=_readable_location(location),
+            locations=[_readable_location(location) for location in locations],
             target_role=profile.target_role,
             is_job_searching=profile.is_job_searching,
         )
@@ -877,8 +918,8 @@ class OpportunityDiscoveryEngine:
 
         # Run event and job discovery in parallel
         event_results, job_results = await asyncio.gather(
-            self._discover_events(tracks, location, profile, seen_urls, queries_per_category),
-            self._discover_jobs(tracks, location, profile, seen_urls, queries_per_category),
+            self._discover_events(tracks, locations, profile, seen_urls, queries_per_category),
+            self._discover_jobs(tracks, locations, profile, seen_urls, queries_per_category),
         )
 
         all_parsed = event_results + job_results
@@ -895,6 +936,7 @@ class OpportunityDiscoveryEngine:
             meta: dict[str, Any] = {
                 "source": parsed.get("_source", "unknown"),
                 "query": parsed.get("_query", ""),
+                "search_locations": [_readable_location(location) for location in locations],
             }
             # Attach strategy to metadata so frontend can display it
             if parsed.get("networking_strategy"):

@@ -1,4 +1,6 @@
+import os
 import re
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import BeforeValidator, computed_field
@@ -22,9 +24,38 @@ LowerStr = Annotated[str, BeforeValidator(parse_lower)]
 UpperStr = Annotated[str, BeforeValidator(parse_upper)]
 
 
+def _find_env_file() -> str | None:
+    """Locate the nearest project .env file for local development."""
+    env_override = os.getenv("_AEGRA_ENV_FILE")
+    if env_override:
+        candidate = Path(env_override).expanduser()
+        if candidate.is_file():
+            return str(candidate)
+
+    search_roots = [Path.cwd(), Path(__file__).resolve()]
+    seen: set[Path] = set()
+
+    for root in search_roots:
+        for candidate_root in [root, *root.parents]:
+            if candidate_root in seen:
+                continue
+            seen.add(candidate_root)
+
+            env_file = candidate_root / ".env"
+            if env_file.is_file():
+                return str(env_file)
+
+    return None
+
+
+_ENV_FILE = _find_env_file()
+
+
 class EnvBase(BaseSettings):
     model_config = SettingsConfigDict(
         extra="ignore",
+        env_file=_ENV_FILE,
+        env_file_encoding="utf-8",
     )
 
 
@@ -99,6 +130,17 @@ class DatabaseSettings(EnvBase):
             return self._normalize_scheme(self.DATABASE_URL, "postgresql")
         return (
             f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@"
+            f"{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        )
+
+    @computed_field
+    @property
+    def database_url_sqlalchemy_sync(self) -> str:
+        """Sync URL for SQLAlchemy migrations using the psycopg v3 driver."""
+        if self.DATABASE_URL:
+            return self._normalize_scheme(self.DATABASE_URL, "postgresql+psycopg")
+        return (
+            f"postgresql+psycopg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@"
             f"{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
 
