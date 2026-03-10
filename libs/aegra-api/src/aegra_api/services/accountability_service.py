@@ -218,9 +218,20 @@ class AccountabilityService:
             "quiet_hours_end",
             "disabled_categories",
             "email_enabled",
+            "job_opportunity_mail_enabled",
+            "job_opportunity_mail_frequency",
+            "last_job_opportunity_digest_sent_at",
+            "user_email",
+            "user_name",
+            "course_updates_enabled",
+            "platform_updates_enabled",
+            "ai_mentor_addon_active",
+            "ai_mentor_addon_expires_at",
         ):
             if key in data:
                 pref_json[key] = data[key]
+        pref_json.setdefault("job_opportunity_mail_enabled", False)
+        pref_json.setdefault("job_opportunity_mail_frequency", "weekly")
         prefs.preferences = pref_json
         prefs.updated_at = datetime.now(UTC)
 

@@ -28,12 +28,23 @@ from aegra_api.core.accountability_orm import (
     DiscoveredOpportunity,
     Notification,
     UserActivityTracking,
+    UserPreferences,
 )
 from aegra_api.core.database import db_manager
+from aegra_api.services.email_service import build_digest_email, resolve_student_contact, send_email
 from aegra_api.services.notification_engine import notification_engine
 from aegra_api.services.opportunity_discovery import opportunity_engine
 
 logger = structlog.getLogger(__name__)
+
+
+def _parse_digest_timestamp(raw_value: str | None) -> datetime | None:
+    if not raw_value:
+        return None
+    try:
+        return datetime.fromisoformat(raw_value)
+    except ValueError:
+        return None
 
 
 class SchedulerService:
@@ -524,32 +535,64 @@ class SchedulerService:
     # Daily digest [§2.6.1]
     # ------------------------------------------------------------------
     async def generate_daily_digest(self) -> None:
-        """Generate daily digest emails bundling the day's notifications."""
-        try:
-            import aegra_api.services.email_service  # noqa: F401
-        except ImportError:
-            logger.warning("email_service not available, skipping daily digest")
-            return
-
+        """Send job and opportunity digests according to student email cadence."""
         try:
             if not db_manager.engine:
                 return
             session_maker = async_sessionmaker(db_manager.engine, expire_on_commit=False)
             async with session_maker() as session:
-                result = await session.execute(select(UserActivityTracking.user_id))
-                user_ids = result.scalars().all()
+                result = await session.execute(select(UserPreferences))
+                preference_rows = result.scalars().all()
+                now = datetime.now(UTC)
 
-                today_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-
-                for user_id in user_ids:
+                for prefs in preference_rows:
                     try:
-                        # Get today's notifications for this user
+                        pref_json = (prefs.preferences or {}).copy()
+                        if not pref_json.get("job_opportunity_mail_enabled", False):
+                            continue
+
+                        # Require active AI Mentor add-on (cached at preference-save time)
+                        if not pref_json.get("ai_mentor_addon_active", False):
+                            continue
+                        addon_expires_raw = pref_json.get("ai_mentor_addon_expires_at")
+                        if addon_expires_raw:
+                            try:
+                                addon_expires = datetime.fromisoformat(addon_expires_raw)
+                                if addon_expires.tzinfo is None:
+                                    addon_expires = addon_expires.replace(tzinfo=UTC)
+                                if now >= addon_expires:
+                                    logger.info(
+                                        "daily_digest_skipped_addon_expired",
+                                        user_id=prefs.user_id,
+                                        expired_at=addon_expires_raw,
+                                    )
+                                    continue
+                            except ValueError:
+                                pass
+
+                        frequency = pref_json.get("job_opportunity_mail_frequency", "weekly")
+                        if frequency not in {"daily", "weekly"}:
+                            frequency = "weekly"
+
+                        last_sent_at = _parse_digest_timestamp(pref_json.get("last_job_opportunity_digest_sent_at"))
+                        if frequency == "daily" and last_sent_at and (now - last_sent_at) < timedelta(hours=20):
+                            continue
+                        if frequency == "weekly" and last_sent_at and (now - last_sent_at) < timedelta(days=7):
+                            continue
+
+                        window_start = last_sent_at or (
+                            now - (timedelta(days=7) if frequency == "weekly" else timedelta(days=1))
+                        )
+
                         notif_result = await session.execute(
                             select(Notification)
                             .where(
                                 and_(
-                                    Notification.user_id == user_id,
-                                    Notification.created_at >= today_start,
+                                    Notification.user_id == prefs.user_id,
+                                    Notification.category == "opportunity",
+                                    Notification.created_at >= window_start,
+                                    Notification.created_at <= now,
+                                    Notification.delivered_at.is_(None),
                                 )
                             )
                             .order_by(Notification.created_at.desc())
@@ -559,28 +602,63 @@ class SchedulerService:
                         if not notifications:
                             continue
 
-                        # Build digest items
                         digest_items = []
                         for n in notifications:
+                            meta = n.metadata_json or {}
+                            url = meta.get("url") or meta.get("action_url") or ""
                             digest_items.append(
                                 {
                                     "title": n.title,
                                     "content": n.content,
                                     "category": n.category or "general",
                                     "priority": n.priority,
+                                    "url": url,
                                 }
                             )
 
-                        # For scheduled jobs, we can't get auth tokens
-                        # Skip digest email if we don't have the email
+                        # Prefer email stored locally in preferences (set on every
+                        # preferences PUT via auth context) before hitting the LMS.
+                        student_email = pref_json.get("user_email")
+                        student_name = pref_json.get("user_name", "")
+                        if not student_email:
+                            student_contact = await resolve_student_contact(prefs.user_id)
+                            student_email = student_contact.get("email")
+                            student_name = student_contact.get("first_name", student_name)
+                        if not student_email:
+                            logger.warning("daily_digest_skipped_missing_email", user_id=prefs.user_id)
+                            continue
+
+                        subject, html_body, text_body = build_digest_email(
+                            student_name=student_name,
+                            items=digest_items,
+                            cadence=frequency,
+                        )
+                        sent = await send_email(
+                            to_email=student_email,
+                            subject=subject,
+                            html_body=html_body,
+                            text_body=text_body,
+                        )
+                        if not sent:
+                            logger.warning("daily_digest_email_failed", user_id=prefs.user_id)
+                            continue
+
+                        for notification in notifications:
+                            notification.delivered_at = now
+                            notification.sent_at = now
+
+                        pref_json["last_job_opportunity_digest_sent_at"] = now.isoformat()
+                        prefs.preferences = pref_json
+                        prefs.updated_at = now
 
                         logger.info(
-                            "daily_digest_generated",
-                            user_id=user_id,
+                            "opportunity_digest_sent",
+                            user_id=prefs.user_id,
+                            frequency=frequency,
                             notification_count=len(digest_items),
                         )
                     except Exception as e:
-                        logger.warning("daily_digest_user_failed", user_id=user_id, error=str(e))
+                        logger.warning("daily_digest_user_failed", user_id=prefs.user_id, error=str(e))
 
                 await session.commit()
         except Exception as e:

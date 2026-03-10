@@ -123,6 +123,34 @@ async def _fetch_track_from_subscription(token: str) -> str | None:
         return None
 
 
+async def check_ai_mentor_addon(token: str) -> dict:
+    """Check whether the student's subscription includes an active AI Mentor add-on.
+
+    Returns a dict with:
+      - active (bool): True if aiMentorAddOn.active is True on a non-expired subscription
+      - expires_at (str | None): ISO timestamp from aiMentorAddOn.expiresAt, if present
+    """
+    subscription_endpoint = f"{LMS_API_URL}/api/v1/subscription/me"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                subscription_endpoint,
+                headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
+            )
+            response.raise_for_status()
+            data = response.json()
+            addon = data.get("aiMentorAddOn") or {}
+            active = bool(addon.get("active", False))
+            expires_at = addon.get("expiresAt")
+            return {"active": active, "expires_at": expires_at}
+    except httpx.HTTPStatusError as e:
+        logger.warning("HTTP error checking ai_mentor_addon", status_code=e.response.status_code)
+        return {"active": False, "expires_at": None}
+    except Exception as e:
+        logger.warning("Unexpected error checking ai_mentor_addon", error=str(e))
+        return {"active": False, "expires_at": None}
+
+
 async def _fetch_learning_track_from_lms(token: str) -> str | None:
     """Fetch the student's learning track from the LMS API.
 
