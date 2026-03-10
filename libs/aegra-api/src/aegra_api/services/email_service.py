@@ -7,11 +7,46 @@ version with subject line, as required by the spec (§2.2, §3.1).
 
 from __future__ import annotations
 
+import httpx
 import structlog
 
+from aegra_api.services.lms_cache import cached_lms_fetch
 from aegra_api.settings import settings
 
 logger = structlog.get_logger()
+
+
+def _extract_contact(payload: dict) -> dict[str, str]:
+    user = payload.get("student") or payload.get("user") or payload
+    name = (user.get("name") or user.get("firstName") or "").strip()
+    email = (user.get("email") or "").strip()
+    if not email:
+        return {}
+
+    return {
+        "first_name": name.split()[0] if name else "",
+        "email": email,
+    }
+
+
+async def resolve_student_contact(user_id: str, auth_token: str | None = None) -> dict[str, str]:
+    """Resolve a student's first name and email from the LMS."""
+    token = auth_token or settings.app.ADMIN_TOKEN
+    lms_url = settings.app.LMS_URL
+
+    if not token or not lms_url:
+        return {}
+
+    client = httpx.AsyncClient()
+    try:
+        user_data = await cached_lms_fetch(client, f"{lms_url}/api/v1/user/students/{user_id}", token, user_id)
+        return _extract_contact(user_data)
+    except Exception as exc:
+        logger.debug("resolve_student_contact_failed", user_id=user_id, error=str(exc))
+    finally:
+        await client.aclose()
+
+    return {}
 
 
 async def send_email(
@@ -152,13 +187,15 @@ def build_digest_email(
     student_name: str,
     items: list[dict],
     advisor_persona: str = "Alexandra",
+    cadence: str = "daily",
 ) -> tuple[str, str, str]:
     """Build a daily digest email bundling multiple notifications.
 
     Returns: (subject, html_body, text_body)
     """
     count = len(items)
-    subject = f"Your Daily Career Update ({count} item{'s' if count != 1 else ''})"
+    cadence_label = "Weekly" if cadence == "weekly" else "Daily"
+    subject = f"Your {cadence_label} Career Update ({count} item{'s' if count != 1 else ''})"
 
     # Build items HTML
     items_html = ""
@@ -166,11 +203,20 @@ def build_digest_email(
         icon = {"deadline": "📅", "opportunity": "🎯", "celebration": "🎉", "inactivity": "👋", "motivation": "💪"}.get(
             item.get("category", ""), "📌"
         )
+        url = item.get("url", "")
+        view_btn = (
+            f'<a href="{url}" style="display:inline-block;margin-top:6px;padding:4px 14px;'
+            f"background-color:#876EFF;color:#ffffff;text-decoration:none;border-radius:4px;"
+            f'font-size:12px;font-weight:600;">View &rarr;</a>'
+            if url
+            else ""
+        )
         items_html += f"""
         <tr><td style="padding:12px 0;border-bottom:1px solid #f3f4f6;">
           <span style="font-size:18px;">{icon}</span>
           <strong style="color:#1f2937;font-size:14px;">{item.get("title", "")}</strong>
           <p style="color:#6b7280;font-size:13px;margin:4px 0 0;">{item.get("content", "")[:120]}</p>
+          {view_btn}
         </td></tr>"""
 
     html_body = f"""<!DOCTYPE html>
@@ -181,10 +227,10 @@ def build_digest_email(
     <tr><td align="center">
       <table width="600" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;">
         <tr><td style="background:linear-gradient(135deg,#876EFF,#513FB5);padding:24px 32px;">
-          <h1 style="color:#ffffff;margin:0;font-size:20px;">DeDataHub Daily Digest</h1>
+          <h1 style="color:#ffffff;margin:0;font-size:20px;">DeDataHub {cadence_label} Digest</h1>
         </td></tr>
         <tr><td style="padding:32px;">
-          <p style="color:#374151;font-size:16px;">Hi {student_name or "there"}, here's your career update:</p>
+          <p style="color:#374151;font-size:16px;">Hi {student_name or "there"}, here's your latest jobs and opportunities update:</p>
           <table width="100%" cellpadding="0" cellspacing="0">{items_html}</table>
           <div style="margin:24px 0;text-align:center;">
             <a href="https://app.dedatahub.com/dashboard" style="display:inline-block;padding:12px 32px;background-color:#876EFF;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;">Go to Dashboard</a>
@@ -204,9 +250,12 @@ def build_digest_email(
 </body>
 </html>"""
 
-    text_lines = [f"Hi {student_name or 'there'}, here's your career update:\n"]
+    text_lines = [f"Hi {student_name or 'there'}, here's your latest jobs and opportunities update:\n"]
     for item in items[:10]:
-        text_lines.append(f"• {item.get('title', '')}: {item.get('content', '')[:120]}")
+        line = f"• {item.get('title', '')}: {item.get('content', '')[:120]}"
+        if item.get("url"):
+            line += f"\n  {item['url']}"
+        text_lines.append(line)
     text_lines.append(f"\n— {advisor_persona}")
     text_body = "\n".join(text_lines)
 

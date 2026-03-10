@@ -15,7 +15,7 @@ have been moved to the WebSocket endpoint at /ws/notifications.
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +23,7 @@ from aegra_api.core.auth_deps import get_current_user
 from aegra_api.core.orm import get_session
 from aegra_api.models import User
 from aegra_api.services.accountability_service import AccountabilityService
+from aegra_api.services.advisor_cache import check_ai_mentor_addon
 
 router = APIRouter(tags=["Accountability"])
 
@@ -50,6 +51,8 @@ class ActionItemResponse(BaseModel):
 class PreferencesRequest(BaseModel):
     notifications_enabled: bool | None = None
     email_enabled: bool | None = None
+    job_opportunity_mail_enabled: bool | None = None
+    job_opportunity_mail_frequency: str | None = None
     location: str | None = None
     push_subscription: dict | None = None
     max_daily: int | None = None
@@ -113,28 +116,61 @@ async def get_preferences(
             "user_id": user.identity,
             "notifications_enabled": True,
             "location": None,
-            "preferences": {},
+            "preferences": {
+                "job_opportunity_mail_enabled": False,
+                "job_opportunity_mail_frequency": "weekly",
+            },
         }
+    pref_data = prefs.preferences or {}
+    pref_data.setdefault("job_opportunity_mail_enabled", False)
+    pref_data.setdefault("job_opportunity_mail_frequency", "weekly")
     return {
         "user_id": prefs.user_id,
         "notifications_enabled": prefs.notifications_enabled,
         "location": prefs.location,
-        "preferences": prefs.preferences or {},
+        "preferences": pref_data,
     }
 
 
 @router.put("/preferences")
 async def update_preferences(
     body: PreferencesRequest,
+    request: Request,
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    prefs = await AccountabilityService.upsert_preferences(session, user.identity, body.model_dump(exclude_none=True))
+    data = body.model_dump(exclude_none=True)
+
+    # Gate: enabling job opportunity mail requires an active AI Mentor add-on
+    if data.get("job_opportunity_mail_enabled") is True:
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.removeprefix("Bearer ").strip()
+        addon = await check_ai_mentor_addon(token)
+        if not addon["active"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Jobs & Opportunity email requires an active AI Mentor add-on subscription.",
+            )
+        # Cache the add-on state so the scheduler can verify without a token
+        data["ai_mentor_addon_active"] = True
+        if addon.get("expires_at"):
+            data["ai_mentor_addon_expires_at"] = addon["expires_at"]
+
+    # Always persist the caller's email/name so the scheduler can use them
+    # without calling the LMS.
+    if user.email:
+        data["user_email"] = user.email
+    if user.display_name:
+        data["user_name"] = user.display_name
+    prefs = await AccountabilityService.upsert_preferences(session, user.identity, data)
+    pref_data = prefs.preferences or {}
+    pref_data.setdefault("job_opportunity_mail_enabled", False)
+    pref_data.setdefault("job_opportunity_mail_frequency", "weekly")
     return {
         "user_id": prefs.user_id,
         "notifications_enabled": prefs.notifications_enabled,
         "location": prefs.location,
-        "preferences": prefs.preferences or {},
+        "preferences": pref_data,
     }
 
 
