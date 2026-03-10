@@ -682,6 +682,9 @@ class NotificationEngine:
         prefs = prefs_row.scalar_one_or_none()
         user_prefs = (prefs.preferences if prefs else {}) or {}
 
+        if category == "opportunity":
+            return
+
         if not user_prefs.get("email_enabled", True):
             return
 
