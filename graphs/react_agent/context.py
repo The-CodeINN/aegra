@@ -95,4 +95,7 @@ class Context:
 
         # Generate dynamic system prompt based on advisor
         if not self.system_prompt:
-            self.system_prompt = prompts.get_dynamic_system_prompt(self.advisor)
+            self.system_prompt = prompts.get_dynamic_system_prompt(
+                advisor=self.advisor,
+                learning_track=self.learning_track,
+            )
