@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import Integer, String, bindparam, create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from aegra_api.settings import settings  # type: ignore[import-untyped]
@@ -49,7 +49,12 @@ class CourseContentService:
             ORDER BY course_id, level_title, module_index, lesson_index
             LIMIT 1
             """
-            row = session.execute(text(sql), params).mappings().first()
+            stmt = text(sql).bindparams(
+                bindparam("course_id", type_=String()),
+                bindparam("module_index", type_=Integer()),
+                bindparam("lesson_index", type_=Integer()),
+            )
+            row = session.execute(stmt, params).mappings().first()
             return dict(row) if row else None
         finally:
             session.close()
@@ -179,7 +184,12 @@ class CourseContentService:
             LIMIT :limit
             """
             params: dict[str, Any] = {"query": query, "limit": k, "course_id": course_id}
-            rows = session.execute(text(sql), params).mappings().all()
+            stmt = text(sql).bindparams(
+                bindparam("query", type_=String()),
+                bindparam("course_id", type_=String()),
+                bindparam("limit", type_=Integer()),
+            )
+            rows = session.execute(stmt, params).mappings().all()
             return [
                 {
                     "content": (row.get("content") or "")[:4000],
