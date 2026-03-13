@@ -138,7 +138,10 @@ elif AUTH_TYPE == "custom":
             owner_filter = {"owner": user_id}
 
             # Add owner information to metadata for create/update operations
-            metadata = value.setdefault("metadata", {})
+            metadata = value.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                value["metadata"] = metadata
             metadata.update(owner_filter)
 
             # Return filter for database operations

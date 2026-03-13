@@ -6,7 +6,11 @@
     "version": "1.0.0"
   },
   "servers": [
-    { "url": "https://dedatahub-api.vercel.app/", "description": "Production" },
+    {
+      "url": "https://dedatahub-api.vercel.app/",
+      "description": "Development"
+    },
+    { "url": "https://server.dedatahub.io/", "description": "Production" },
     { "url": "http://localhost:5000", "description": "Local" }
   ],
   "components": {
@@ -18,6 +22,61 @@
       }
     },
     "schemas": {
+      "Feedback": {
+        "type": "object",
+        "required": ["type", "rating"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["course", "module", "lesson", "ai-mentor", "ai-general"]
+          },
+          "course": {
+            "type": "string",
+            "description": "Course ID (required for course/module/lesson feedback)"
+          },
+          "levelIndex": { "type": "number" },
+          "moduleIndex": { "type": "number" },
+          "lessonIndex": { "type": "number" },
+          "aiSessionId": {
+            "type": "string",
+            "description": "AI session ID (for ai-mentor type)"
+          },
+          "rating": { "type": "number", "minimum": 1, "maximum": 5 },
+          "comment": { "type": "string" },
+          "metadata": { "type": "object" }
+        }
+      },
+      "FeedbackSummary": {
+        "type": "object",
+        "properties": {
+          "totalFeedback": { "type": "number" },
+          "averageRating": { "type": "number" },
+          "feedback": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Feedback" }
+          }
+        }
+      },
+      "AiFeedbackSummary": {
+        "type": "object",
+        "properties": {
+          "aiPerformance": {
+            "type": "object",
+            "properties": {
+              "total": { "type": "number" },
+              "averageRating": { "type": "number" }
+            }
+          },
+          "sessionFeedback": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Feedback" }
+          },
+          "generalFeedback": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Feedback" }
+          }
+        }
+      },
       "TrackStat": {
         "type": "object",
         "properties": {
@@ -667,7 +726,10 @@
                           "type": "array",
                           "items": { "type": "string" }
                         },
-                        "correctAnswer": { "type": "string" }
+                        "correctAnswer": {
+                          "type": "array",
+                          "items": { "type": "string" }
+                        }
                       }
                     }
                   },
@@ -725,7 +787,10 @@
                           "type": "array",
                           "items": { "type": "string" }
                         },
-                        "correctAnswer": { "type": "string" }
+                        "correctAnswer": {
+                          "type": "array",
+                          "items": { "type": "string" }
+                        }
                       }
                     }
                   },
@@ -1076,7 +1141,27 @@
         }
       }
     },
-    "/api/v1courses/projects/{courseId}/{levelTitle}/{moduleIndex}/submissions": {
+    "/api/v1/courses/projects/course/{courseId}": {
+      "get": {
+        "summary": "Get all project submissions for a specific course (Admin only)",
+        "tags": ["Projects"],
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "courseId",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "The course ID"
+          }
+        ],
+        "responses": {
+          "200": { "description": "Course project submissions" },
+          "500": { "description": "Internal server error" }
+        }
+      }
+    },
+    "/api/v1/courses/projects/{courseId}/{levelTitle}/{moduleIndex}/submissions": {
       "get": {
         "summary": "Get all project submissions for a specific module",
         "tags": ["Projects"],
@@ -1162,7 +1247,10 @@
                           "type": "array",
                           "items": { "type": "string" }
                         },
-                        "correctAnswer": { "type": "string" }
+                        "correctAnswer": {
+                          "type": "array",
+                          "items": { "type": "string" }
+                        }
                       }
                     }
                   },
@@ -1231,7 +1319,10 @@
                           "type": "array",
                           "items": { "type": "string" }
                         },
-                        "correctAnswer": { "type": "string" }
+                        "correctAnswer": {
+                          "type": "array",
+                          "items": { "type": "string" }
+                        }
                       }
                     }
                   },
@@ -1786,7 +1877,6 @@
                             }
                           },
                           "overallProgress": { "type": "number" },
-                          "finalAssessmentPassed": { "type": "boolean" },
                           "aiMentor": {
                             "type": "object",
                             "nullable": true,
@@ -1915,7 +2005,7 @@
         },
         "responses": {
           "200": {
-            "description": "Test-out result",
+            "description": "Test-out result (does not affect progress bars)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1923,6 +2013,26 @@
                   "properties": {
                     "passed": { "type": "boolean" },
                     "score": { "type": "number" },
+                    "certificateUrl": {
+                      "type": "string",
+                      "nullable": true,
+                      "description": "Level certificate URL (issued on passing)"
+                    },
+                    "certificateShareUrl": {
+                      "type": "string",
+                      "nullable": true,
+                      "description": "Public shareable verification link for the level certificate"
+                    },
+                    "finalCertificateUrl": {
+                      "type": "string",
+                      "nullable": true,
+                      "description": "Course completion certificate (if all 3 levels passed)"
+                    },
+                    "finalCertificateShareUrl": {
+                      "type": "string",
+                      "nullable": true,
+                      "description": "Public shareable verification link for the course completion certificate"
+                    },
                     "message": { "type": "string" }
                   }
                 }
@@ -1977,7 +2087,7 @@
         },
         "responses": {
           "200": {
-            "description": "Module assessment result",
+            "description": "Module assessment result with updated progress",
             "content": {
               "application/json": {
                 "schema": {
@@ -1985,6 +2095,19 @@
                   "properties": {
                     "passed": { "type": "boolean" },
                     "score": { "type": "number" },
+                    "duration": { "type": "number", "nullable": true },
+                    "moduleProgress": {
+                      "type": "number",
+                      "description": "Updated module progress percentage"
+                    },
+                    "levelProgress": {
+                      "type": "number",
+                      "description": "Updated level progress percentage"
+                    },
+                    "overallProgress": {
+                      "type": "number",
+                      "description": "Updated overall course progress percentage"
+                    },
                     "message": { "type": "string" }
                   }
                 }
@@ -2040,7 +2163,7 @@
         },
         "responses": {
           "200": {
-            "description": "Level assessment result and certificate issuance",
+            "description": "Level assessment result, progress update, and certificate issuance",
             "content": {
               "application/json": {
                 "schema": {
@@ -2048,14 +2171,50 @@
                   "properties": {
                     "passed": { "type": "boolean" },
                     "score": { "type": "number" },
-                    "certificateUrl": { "type": "string", "nullable": true },
+                    "levelCompleted": {
+                      "type": "boolean",
+                      "description": "True if assessment passed"
+                    },
+                    "nextLevelUnlocked": {
+                      "type": "boolean",
+                      "description": "True if assessment passed (next level accessible)"
+                    },
+                    "levelProgress": {
+                      "type": "number",
+                      "description": "Updated level progress percentage"
+                    },
+                    "overallProgress": {
+                      "type": "number",
+                      "description": "Updated overall course progress percentage"
+                    },
+                    "certificateUrl": {
+                      "type": "string",
+                      "nullable": true,
+                      "description": "Level certificate URL (issued on passing)"
+                    },
+                    "certificateShareUrl": {
+                      "type": "string",
+                      "nullable": true,
+                      "description": "Public shareable verification link for the level certificate"
+                    },
+                    "finalCertificateUrl": {
+                      "type": "string",
+                      "nullable": true,
+                      "description": "Course completion certificate (if all 3 level assessments passed)"
+                    },
+                    "finalCertificateShareUrl": {
+                      "type": "string",
+                      "nullable": true,
+                      "description": "Public shareable verification link for the course completion certificate"
+                    },
                     "message": { "type": "string" }
                   }
                 }
               }
             }
           },
-          "404": { "description": "Course, enrollment, or level not found" }
+          "404": { "description": "Course, enrollment, or level not found" },
+          "500": { "description": "Failed to submit assessment" }
         }
       }
     },
@@ -2130,6 +2289,113 @@
         }
       }
     },
+    "/api/v1/enrollment/{courseId}/progress": {
+      "get": {
+        "summary": "Get full progress breakdown for a course enrollment",
+        "tags": ["Blackboard"],
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "courseId",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Course ID to get progress for"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Progress data for all levels and modules",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "courseId": { "type": "string" },
+                    "courseTitle": { "type": "string" },
+                    "courseTrack": { "type": "string" },
+                    "overallProgress": {
+                      "type": "number",
+                      "description": "Average of level progress percentages (0-100)"
+                    },
+                    "totalCompletedLessons": { "type": "integer" },
+                    "totalWatchedHours": { "type": "number" },
+                    "courseCompleted": { "type": "boolean" },
+                    "courseCompletionCertificateUrl": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "levels": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "levelTitle": {
+                            "type": "string",
+                            "enum": ["Beginner", "Intermediate", "Advanced"]
+                          },
+                          "progressPercentage": {
+                            "type": "number",
+                            "description": "80% from modules + 20% from level assessment"
+                          },
+                          "assessmentPassed": { "type": "boolean" },
+                          "testedOut": { "type": "boolean" },
+                          "completed": { "type": "boolean" },
+                          "certificateUrl": {
+                            "type": "string",
+                            "nullable": true
+                          },
+                          "certificateShareUrl": {
+                            "type": "string",
+                            "nullable": true,
+                            "description": "Public shareable verification link"
+                          },
+                          "modules": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "moduleTitle": { "type": "string" },
+                                "progressPercentage": {
+                                  "type": "number",
+                                  "description": "(completed lessons + module assessment) / (total lessons + 1) x 100"
+                                },
+                                "assessmentPassed": { "type": "boolean" },
+                                "assessmentScore": {
+                                  "type": "number",
+                                  "nullable": true
+                                },
+                                "completed": { "type": "boolean" },
+                                "totalLessons": { "type": "integer" },
+                                "completedLessons": { "type": "integer" },
+                                "lessons": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "lessonId": { "type": "string" },
+                                      "watchedPercentage": { "type": "number" },
+                                      "completed": { "type": "boolean" },
+                                      "locked": { "type": "boolean" }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": { "description": "Enrollment not found" },
+          "500": { "description": "Failed to fetch progress" }
+        }
+      }
+    },
     "/api/v1/enrollment/{courseId}/certificates": {
       "get": {
         "summary": "Get list of issued certificates for a course",
@@ -2162,7 +2428,14 @@
                             "type": "string",
                             "format": "date-time"
                           },
-                          "certificateUrl": { "type": "string" }
+                          "certificateUrl": { "type": "string" },
+                          "shareUrl": {
+                            "type": "string",
+                            "nullable": true,
+                            "description": "Public shareable verification link"
+                          },
+                          "courseTitle": { "type": "string" },
+                          "courseTrack": { "type": "string" }
                         }
                       }
                     }
@@ -2197,6 +2470,43 @@
           },
           "403": { "description": "Unauthorized access" },
           "404": { "description": "Enrollment not found" }
+        }
+      }
+    },
+    "/api/v1/certificates/verify/{code}": {
+      "get": {
+        "summary": "Verify a certificate by its unique code (public, no auth required)",
+        "tags": ["Certificates"],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "code",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Unique certificate code (e.g. CERT-abc12xyz)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Certificate details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "valid": { "type": "boolean" },
+                    "studentName": { "type": "string" },
+                    "courseTitle": { "type": "string" },
+                    "trackName": { "type": "string" },
+                    "levelTitle": { "type": "string" },
+                    "issuedAt": { "type": "string", "format": "date-time" },
+                    "certificateCode": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "404": { "description": "Certificate not found" }
         }
       }
     },
@@ -2355,7 +2665,10 @@
                                             "type": "array",
                                             "items": { "type": "string" }
                                           },
-                                          "correctAnswer": { "type": "string" }
+                                          "correctAnswer": {
+                                            "type": "array",
+                                            "items": { "type": "string" }
+                                          }
                                         }
                                       }
                                     }
@@ -2378,7 +2691,10 @@
                                     "type": "array",
                                     "items": { "type": "string" }
                                   },
-                                  "correctAnswer": { "type": "string" }
+                                  "correctAnswer": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                  }
                                 }
                               }
                             },
@@ -2742,6 +3058,88 @@
         }
       }
     },
+    "/api/v1/feedback": {
+      "post": {
+        "summary": "Submit feedback (course, module, lesson, AI mentor session, or general AI)",
+        "tags": ["Feedback"],
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/Feedback" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Feedback submitted successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "Feedback submitted successfully"
+                    },
+                    "feedback": { "$ref": "#/components/schemas/Feedback" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Invalid input" },
+          "500": { "description": "Server error" }
+        }
+      }
+    },
+    "/api/v1/feedback/course/{courseId}": {
+      "get": {
+        "summary": "Get all feedback for a course (course-level, module-level, and lesson-level)",
+        "tags": ["Feedback"],
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "courseId",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "The ID of the course"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Course feedback summary",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FeedbackSummary" }
+              }
+            }
+          },
+          "404": { "description": "Course not found" },
+          "500": { "description": "Server error" }
+        }
+      }
+    },
+    "/api/v1/feedback/ai": {
+      "get": {
+        "summary": "Get all AI mentor feedback (session feedback + general AI experience feedback)",
+        "tags": ["Feedback"],
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "AI mentor feedback summary",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AiFeedbackSummary" }
+              }
+            }
+          },
+          "500": { "description": "Server error" }
+        }
+      }
+    },
     "/api/v1/courses/{courseId}/modules/{levelTitle}/{moduleIndex}/lessons": {
       "post": {
         "summary": "Add a new lesson to a module",
@@ -2786,7 +3184,10 @@
                           "type": "array",
                           "items": { "type": "string" }
                         },
-                        "correctAnswer": { "type": "string" }
+                        "correctAnswer": {
+                          "type": "array",
+                          "items": { "type": "string" }
+                        }
                       }
                     }
                   },
@@ -2872,7 +3273,10 @@
                                   "type": "array",
                                   "items": { "type": "string" }
                                 },
-                                "correctAnswer": { "type": "string" }
+                                "correctAnswer": {
+                                  "type": "array",
+                                  "items": { "type": "string" }
+                                }
                               }
                             }
                           },
@@ -2963,7 +3367,10 @@
                                 "type": "array",
                                 "items": { "type": "string" }
                               },
-                              "correctAnswer": { "type": "string" }
+                              "correctAnswer": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                              }
                             }
                           }
                         }
@@ -3029,7 +3436,10 @@
                           "type": "array",
                           "items": { "type": "string" }
                         },
-                        "correctAnswer": { "type": "string" }
+                        "correctAnswer": {
+                          "type": "array",
+                          "items": { "type": "string" }
+                        }
                       }
                     }
                   },
@@ -3117,7 +3527,10 @@
                               "type": "array",
                               "items": { "type": "string" }
                             },
-                            "correctAnswer": { "type": "string" }
+                            "correctAnswer": {
+                              "type": "array",
+                              "items": { "type": "string" }
+                            }
                           }
                         }
                       },
@@ -3194,7 +3607,10 @@
                               "type": "array",
                               "items": { "type": "string" }
                             },
-                            "correctAnswer": { "type": "string" }
+                            "correctAnswer": {
+                              "type": "array",
+                              "items": { "type": "string" }
+                            }
                           }
                         }
                       },
@@ -3237,14 +3653,14 @@
         }
       }
     },
-    "/api/v1/users/certificates": {
+    "/api/v1/courses/user/certificates": {
       "get": {
         "summary": "Get all certificates earned by the logged-in student",
-        "tags": ["Users"],
+        "tags": ["Certificates"],
         "security": [{ "bearerAuth": [] }],
         "responses": {
           "200": {
-            "description": "List of earned certificates",
+            "description": "List of earned certificates across all courses",
             "content": {
               "application/json": {
                 "schema": {
@@ -3256,8 +3672,21 @@
                         "type": "object",
                         "properties": {
                           "courseTitle": { "type": "string" },
-                          "level": { "type": "string" },
-                          "certificateUrl": { "type": "string" }
+                          "courseTrack": { "type": "string" },
+                          "levelTitle": {
+                            "type": "string",
+                            "description": "Level name or \"Course Completion\" for final certificate"
+                          },
+                          "issuedAt": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "certificateUrl": { "type": "string" },
+                          "shareUrl": {
+                            "type": "string",
+                            "nullable": true,
+                            "description": "Public shareable verification link"
+                          }
                         }
                       }
                     }
@@ -3316,7 +3745,10 @@
                               "type": "array",
                               "items": { "type": "string" }
                             },
-                            "correctAnswer": { "type": "string" }
+                            "correctAnswer": {
+                              "type": "array",
+                              "items": { "type": "string" }
+                            }
                           }
                         }
                       },
@@ -3391,7 +3823,10 @@
                               "type": "array",
                               "items": { "type": "string" }
                             },
-                            "correctAnswer": { "type": "string" }
+                            "correctAnswer": {
+                              "type": "array",
+                              "items": { "type": "string" }
+                            }
                           }
                         }
                       },
@@ -4170,6 +4605,256 @@
         }
       }
     },
+    "/api/v1/courses/{courseId}/levels/{levelTitle}/modules/{moduleIndex}/lessons/reorder": {
+      "put": {
+        "summary": "Reorder lessons within a module",
+        "tags": ["Reorder"],
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "courseId",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "in": "path",
+            "name": "levelTitle",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "in": "path",
+            "name": "moduleIndex",
+            "required": true,
+            "schema": { "type": "integer" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["orderedIds"],
+                "properties": {
+                  "orderedIds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Lesson IDs in desired order"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Lessons reordered successfully" },
+          "400": { "description": "Invalid input" },
+          "404": { "description": "Course, level, or module not found" }
+        }
+      }
+    },
+    "/api/v1/courses/{courseId}/levels/{levelTitle}/modules/{moduleIndex}/lessons/{lessonIndex}/quiz/reorder": {
+      "put": {
+        "summary": "Reorder quiz questions within a lesson",
+        "tags": ["Reorder"],
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "courseId",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "in": "path",
+            "name": "levelTitle",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "in": "path",
+            "name": "moduleIndex",
+            "required": true,
+            "schema": { "type": "integer" }
+          },
+          {
+            "in": "path",
+            "name": "lessonIndex",
+            "required": true,
+            "schema": { "type": "integer" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["orderedIds"],
+                "properties": {
+                  "orderedIds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Quiz question IDs in desired order"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Lesson quiz reordered successfully" },
+          "400": { "description": "Invalid input" },
+          "404": { "description": "Not found" }
+        }
+      }
+    },
+    "/api/v1/courses/{courseId}/levels/{levelTitle}/modules/{moduleIndex}/quiz/reorder": {
+      "put": {
+        "summary": "Reorder quiz questions within a module",
+        "tags": ["Reorder"],
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "courseId",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "in": "path",
+            "name": "levelTitle",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "in": "path",
+            "name": "moduleIndex",
+            "required": true,
+            "schema": { "type": "integer" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["orderedIds"],
+                "properties": {
+                  "orderedIds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Quiz question IDs in desired order"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Module quiz reordered successfully" },
+          "400": { "description": "Invalid input" },
+          "404": { "description": "Not found" }
+        }
+      }
+    },
+    "/api/v1/courses/{courseId}/levels/{levelTitle}/modules/{moduleIndex}/assessment/reorder": {
+      "put": {
+        "summary": "Reorder assessment questions within a module",
+        "tags": ["Reorder"],
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "courseId",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "in": "path",
+            "name": "levelTitle",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "in": "path",
+            "name": "moduleIndex",
+            "required": true,
+            "schema": { "type": "integer" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["orderedIds"],
+                "properties": {
+                  "orderedIds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Assessment question IDs in desired order"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Module assessment reordered successfully" },
+          "400": { "description": "Invalid input" },
+          "404": { "description": "Not found" }
+        }
+      }
+    },
+    "/api/v1/courses/{courseId}/levels/{levelTitle}/assessment/reorder": {
+      "put": {
+        "summary": "Reorder assessment questions within a level",
+        "tags": ["Reorder"],
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "courseId",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "in": "path",
+            "name": "levelTitle",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["orderedIds"],
+                "properties": {
+                  "orderedIds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Assessment question IDs in desired order"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Level assessment reordered successfully" },
+          "400": { "description": "Invalid input" },
+          "404": { "description": "Not found" }
+        }
+      }
+    },
     "/api/v1/subscription/create-payment-intent": {
       "post": {
         "summary": "Create a Stripe Payment Intent for a subscription",
@@ -4533,6 +5218,30 @@
         }
       }
     },
+    "/api/v1/subscription/test-email": {
+      "get": {
+        "summary": "Send a test subscription email to yourself",
+        "description": "Sends a test subscription email to the authenticated user to verify email delivery works. For admin/testing purposes only.",
+        "tags": ["Subscriptions"],
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "type",
+            "schema": {
+              "type": "string",
+              "enum": ["subscription", "renewal", "ai-mentor", "canceled"],
+              "default": "subscription"
+            },
+            "description": "Type of email to test"
+          }
+        ],
+        "responses": {
+          "200": { "description": "Test email sent successfully" },
+          "500": { "description": "Failed to send test email" }
+        }
+      }
+    },
     "/api/hello": {
       "get": {
         "summary": "Returns a hello message",
@@ -4835,6 +5544,36 @@
         }
       }
     },
+    "/api/v1/user/ai-consent": {
+      "put": {
+        "summary": "Grant AI Mentor consent",
+        "description": "One-time consent for AI Mentor access. Once granted, cannot be revoked.",
+        "tags": ["Users"],
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Consent granted successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "AI consent granted successfully"
+                    },
+                    "aiConsent": { "type": "boolean", "example": true },
+                    "aiConsentDate": { "type": "string", "format": "date-time" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Already consented" },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
     "/api/v1/user/{id}": {
       "get": {
         "summary": "Get user by ID",
@@ -4949,6 +5688,10 @@
   },
   "tags": [
     { "name": "Blackboard", "description": "Student blackboard management" },
+    {
+      "name": "Certificates",
+      "description": "Public certificate verification"
+    },
     {
       "name": "Contact",
       "description": "Manage contact messages and inquiries"

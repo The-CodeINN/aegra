@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 from collections.abc import Callable
 from typing import Any
@@ -28,14 +29,14 @@ from react_agent.memory import get_user_memory, save_user_memory, search_user_me
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# LMS response caching (Redis + in-memory fallback)
+# LMS response caching (Redis + in-memory cache)
 # ---------------------------------------------------------------------------
 # TTLs (seconds)
 _TTL_ONBOARDING = 86400  # 24 h — onboarding data rarely changes
 _TTL_PROFILE = 3600  # 1 h
 _TTL_ENROLLMENT = 900  # 15 min
 
-# In-memory fallback: key → (json_str, expiry_ts)
+# In-memory cache: key → (json_str, expiry_ts)
 _mem_cache: dict[str, tuple[str, float]] = {}
 
 # Lazy Redis client reference (set once on first use)
@@ -80,7 +81,8 @@ async def _cached_lms_get(
     user_id: str | None,
 ) -> dict[str, Any]:
     """GET with Redis + in-memory caching. Falls back to live fetch."""
-    path = urlparse(url).path
+    parsed = urlparse(url)
+    path = f"{parsed.netloc}{parsed.path}"
     uid = user_id or "anon"
     key = _cache_key(uid, path)
     ttl = _ttl_for_path(path)
@@ -121,7 +123,7 @@ async def _cached_lms_get(
     return data
 
 
-# Import RAG course retriever
+# Import local-first course content service
 try:
     import sys
     from pathlib import Path
@@ -132,13 +134,13 @@ try:
     if src_path.exists() and str(src_path) not in sys.path:
         sys.path.insert(0, str(src_path))
 
-    from aegra_api.tools.rag import CourseRetriever
+    from aegra_api.tools.course_content import CourseContentService
 
-    RAG_AVAILABLE = True
-    logger.info("RAG course search module loaded successfully")
+    COURSE_CONTENT_AVAILABLE = True
+    logger.info("Course content service loaded successfully")
 except ImportError as e:
-    RAG_AVAILABLE = False
-    logger.warning(f"RAG CourseRetriever not available: {e}. Course search will be disabled.")
+    COURSE_CONTENT_AVAILABLE = False
+    logger.warning(f"Course content service not available: {e}. Course search will be disabled.")
 
 
 async def brave_search(query: str) -> str:
@@ -303,21 +305,22 @@ async def get_student_profile() -> dict[str, Any]:
     logger.info(f"Attempting to fetch profile with token (length: {len(token)})")
 
     # Get LMS API URL from context
-    lms_url = runtime.context.lms_api_url
+    lms_url = runtime.context.lms_api_url.rstrip("/")
     profile_endpoint = f"{lms_url}/api/v1/user/profile"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            logger.info(f"Fetching student profile from {profile_endpoint}")
-
             data = await _cached_lms_get(client, profile_endpoint, token, runtime.context.user_id)
+
+            user_data = data.get("user", data)
 
             # Extract only the required fields
             profile = {
-                "name": data.get("name"),
-                "role": data.get("role"),
-                "onboardingComplete": data.get("onboardingComplete"),
-                "onboardingSkipped": data.get("onboardingSkipped"),
+                "name": user_data.get("name") or user_data.get("firstName"),
+                "role": user_data.get("role"),
+                "onboardingComplete": data.get("onboardingComplete") or user_data.get("onboardingComplete"),
+                "onboardingSkipped": data.get("onboardingSkipped") or user_data.get("onboardingSkipped"),
+                "sourceEndpoint": "/api/v1/user/profile",
             }
 
             logger.info(f"Successfully fetched profile for student: {profile.get('name')}")
@@ -366,13 +369,11 @@ async def get_student_onboarding() -> dict[str, Any]:
         }
 
     # Get LMS API URL from context
-    lms_url = runtime.context.lms_api_url
+    lms_url = runtime.context.lms_api_url.rstrip("/")
     onboarding_endpoint = f"{lms_url}/api/v1/onboarding"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            logger.info(f"Fetching student onboarding from {onboarding_endpoint}")
-
             data = await _cached_lms_get(client, onboarding_endpoint, token, runtime.context.user_id)
 
             # Extract the onboarding data
@@ -386,6 +387,7 @@ async def get_student_onboarding() -> dict[str, Any]:
                 "technicalBackground": onboarding_data.get("technicalBackground", {}),
                 "completed": onboarding_data.get("completed"),
                 "completedSteps": onboarding_data.get("completedSteps", []),
+                "sourceEndpoint": "/api/v1/onboarding",
             }
 
             logger.info(f"Successfully fetched onboarding for learning track: {onboarding.get('learningTrack')}")
@@ -436,13 +438,11 @@ async def get_student_ai_career_advisor_onboarding() -> dict[str, Any]:
         }
 
     # Get LMS API URL from context
-    lms_url = runtime.context.lms_api_url
+    lms_url = runtime.context.lms_api_url.rstrip("/")
     career_advisor_endpoint = f"{lms_url}/api/v1/ai-mentor/onboarding/me"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            logger.info(f"Fetching AI career advisor onboarding from {career_advisor_endpoint}")
-
             data = await _cached_lms_get(client, career_advisor_endpoint, token, runtime.context.user_id)
 
             # Extract the onboarding data
@@ -462,6 +462,7 @@ async def get_student_ai_career_advisor_onboarding() -> dict[str, Any]:
                 "learningTrack": onboarding_data.get("learningTrack"),
                 "completedSteps": onboarding_data.get("completedSteps", []),
                 "completed": onboarding_data.get("completed"),
+                "sourceEndpoint": "/api/v1/ai-mentor/onboarding/me",
             }
 
             logger.info(
@@ -495,10 +496,11 @@ async def search_course_content(
     course_id: str | None = None,
     max_results: int = 5,
 ) -> dict[str, Any]:
-    """Search for relevant course content using semantic similarity.
+    """Search for relevant course content using hybrid BM25 full-text ranking.
 
-    This tool searches through indexed course materials, lessons, and descriptions
-    to find the most relevant information based on your query. Use this when:
+    This tool searches through indexed course materials, lessons, and transcript
+    segments using full-text retrieval and BM25-style ranking fused with lexical
+    exact-match signals. Use this when:
     - Students ask about specific course topics or concepts
     - Looking for explanations from course materials
     - Finding relevant lessons or modules
@@ -520,12 +522,12 @@ async def search_course_content(
             - metadata: Additional context (level, module, etc.)
         - error: Error message if search fails
     """
-    if not RAG_AVAILABLE:
-        logger.error("RAG system not available")
+    if not COURSE_CONTENT_AVAILABLE:
+        logger.error("Course content service not available")
         return {
             "query": query,
             "results": [],
-            "error": "Course search is not available. RAG system not initialized.",
+            "error": "Course search is not available. Local course content service not initialized.",
         }
 
     try:
@@ -533,22 +535,15 @@ async def search_course_content(
         if course_id:
             logger.info(f"Filtering by course_id: {course_id}")
 
-        # Initialize retriever
-        retriever = CourseRetriever()
-
-        # Perform semantic search
-        results = await retriever.search(
-            query=query,
-            course_id=course_id,
-            k=max_results,
-        )
+        service = CourseContentService()
+        results = await asyncio.to_thread(service.search, query, course_id, max_results)
 
         if not results:
             logger.info(f"No course content found for query: {query}")
             return {
                 "query": query,
                 "results": [],
-                "message": "No relevant course content found. The course may not be indexed yet.",
+                "message": "No relevant local course content found. The course may not be synced yet.",
             }
 
         logger.info(f"Found {len(results)} relevant course content chunks")
@@ -567,11 +562,80 @@ async def search_course_content(
         }
 
 
+async def read_webpage(url: str) -> dict[str, Any]:
+    """Fetch and summarize a webpage so advice can be based on page content, not just snippet text."""
+    if not isinstance(url, str) or not url.strip():
+        return {"error": "invalid_url", "message": "A valid URL is required."}
+
+    cleaned_url = url.strip()
+    if not cleaned_url.startswith(("http://", "https://")):
+        cleaned_url = f"https://{cleaned_url}"
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
+            response = await client.get(
+                cleaned_url,
+                headers={
+                    "User-Agent": "DeDataHubBot/1.0 (+https://dedatahub.io)",
+                    "Accept": "text/html,application/xhtml+xml,text/plain",
+                },
+            )
+            response.raise_for_status()
+
+            content_type = (response.headers.get("content-type") or "").lower()
+            raw = response.text[:180000]
+
+            title_match = re.search(r"(?is)<title[^>]*>(.*?)</title>", raw)
+            title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else ""
+
+            meta_desc_match = re.search(
+                r'(?is)<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+                raw,
+            )
+            meta_description = re.sub(r"\s+", " ", meta_desc_match.group(1)).strip() if meta_desc_match else ""
+
+            # Convert HTML to plain text quickly for model use.
+            text = re.sub(r"(?is)<script.*?>.*?</script>", " ", raw)
+            text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
+            text = re.sub(r"(?s)<[^>]+>", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
+
+            return {
+                "url": str(response.url),
+                "status_code": response.status_code,
+                "content_type": content_type,
+                "title": title,
+                "meta_description": meta_description,
+                "content_preview": text[:5000],
+            }
+
+    except httpx.HTTPStatusError as e:
+        return {
+            "error": "http_error",
+            "status_code": e.response.status_code,
+            "message": f"Unable to access the page ({e.response.status_code}).",
+            "url": cleaned_url,
+        }
+    except httpx.TimeoutException:
+        return {
+            "error": "timeout",
+            "message": "The page timed out before it could be read.",
+            "url": cleaned_url,
+        }
+    except Exception as e:
+        return {
+            "error": "unexpected_error",
+            "message": str(e),
+            "url": cleaned_url,
+        }
+
+
 # Build tools list dynamically based on availability
 TOOLS: list[Callable[..., Any]] = [
     # search,
     # extract_webpage_content,
     brave_search,
+    read_webpage,
     get_student_profile,
     get_student_onboarding,
     get_student_ai_career_advisor_onboarding,
@@ -580,7 +644,7 @@ TOOLS: list[Callable[..., Any]] = [
     search_user_memories,
 ]
 
-# Add RAG tool if available
-if RAG_AVAILABLE:
+# Add course search tool if available
+if COURSE_CONTENT_AVAILABLE:
     TOOLS.append(search_course_content)
-    logger.info("RAG course search tool enabled")
+    logger.info("Course search tool enabled")

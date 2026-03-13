@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -202,6 +203,21 @@ JOB_DOMAINS = frozenset(
     ]
 )
 
+RESOURCE_DOMAINS = frozenset(
+    [
+        "coursera.org",
+        "udemy.com",
+        "edx.org",
+        "futurelearn.com",
+        "datacamp.com",
+        "udacity.com",
+        "simplilearn.com",
+        "coursecompare.ca",
+        "classcentral.com",
+        "springboard.com",
+    ]
+)
+
 # Content keywords as fallback when domain is not in either set
 EVENT_SIGNALS = frozenset(
     [
@@ -212,7 +228,6 @@ EVENT_SIGNALS = frozenset(
         "webinar",
         "summit",
         "hackathon",
-        "bootcamp",
         "seminar",
         "networking",
         "talk",
@@ -232,6 +247,22 @@ JOB_SIGNALS = frozenset(
         "opening",
         "recruit",
         "employment",
+    ]
+)
+
+RESOURCE_SIGNALS = frozenset(
+    [
+        "bootcamp",
+        "course",
+        "courses",
+        "program",
+        "programs",
+        "curriculum",
+        "syllabus",
+        "tuition",
+        "certificate",
+        "certification",
+        "self-paced",
     ]
 )
 
@@ -287,11 +318,19 @@ def _classify_result(url: str, title: str, description: str) -> str | None:
     for jd in JOB_DOMAINS:
         if domain == jd or domain.endswith("." + jd):
             return "job"
+    for rd in RESOURCE_DOMAINS:
+        if domain == rd or domain.endswith("." + rd):
+            return None
 
     # Fallback to content analysis
     content = f"{title} {description}".lower()
     event_hits = sum(1 for kw in EVENT_SIGNALS if kw in content)
     job_hits = sum(1 for kw in JOB_SIGNALS if kw in content)
+    resource_hits = sum(1 for kw in RESOURCE_SIGNALS if kw in content)
+
+    # Prefer skipping training/program aggregator pages over misclassifying as events.
+    if resource_hits >= 2 and event_hits <= 1 and job_hits <= 1:
+        return None
 
     if event_hits > job_hits and event_hits >= 2:
         return "event"
@@ -511,6 +550,61 @@ class OpportunityDiscoveryEngine:
         except httpx.HTTPError as e:
             logger.error("serper_search_failed", error=str(e), query=query[:80])
             return []
+
+    async def fetch_page_preview(self, url: str) -> str:
+        """Fetch a lightweight text preview from a page for better classification.
+
+        This is only used for ambiguous domains that are not known event/job hosts.
+        """
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
+                resp = await client.get(
+                    url,
+                    headers={
+                        "User-Agent": "DeDataHubBot/1.0 (+https://dedatahub.io)",
+                        "Accept": "text/html,application/xhtml+xml",
+                    },
+                )
+                if resp.status_code >= 400:
+                    return ""
+
+                content_type = (resp.headers.get("content-type") or "").lower()
+                if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+                    return ""
+
+                html = resp.text[:120000]
+                html = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
+                html = re.sub(r"(?is)<style.*?>.*?</style>", " ", html)
+                text = re.sub(r"(?s)<[^>]+>", " ", html)
+                text = re.sub(r"\s+", " ", text).strip().lower()
+                return text[:8000]
+        except Exception:
+            return ""
+
+    def _is_known_event_or_job_domain(self, url: str) -> bool:
+        domain = _domain_of(url)
+        if not domain:
+            return False
+
+        if any(domain == known or domain.endswith("." + known) for known in EVENT_DOMAINS):
+            return True
+        return any(domain == known or domain.endswith("." + known) for known in JOB_DOMAINS)
+
+    async def should_keep_result(self, expected_type: str, title: str, desc: str, url: str) -> bool:
+        """Return True when a result is consistent with expected event/job type."""
+        base_type = _classify_result(url, title, desc)
+        if base_type != expected_type:
+            return False
+
+        if self._is_known_event_or_job_domain(url):
+            return True
+
+        page_preview = await self.fetch_page_preview(url)
+        if not page_preview:
+            return True
+
+        refined_type = _classify_result(url, title, f"{desc} {page_preview}")
+        return refined_type == expected_type
 
     # ------------------------------------------------------------------
     # Result parsing (URL-domain based classification)
@@ -833,6 +927,11 @@ class OpportunityDiscoveryEngine:
                     if not url or url in seen_urls:
                         continue
                     seen_urls.add(url)
+                    title = r.get("title", "")
+                    desc = r.get("snippet", "") or r.get("description", "")
+                    if not await self.should_keep_result("event", title, desc, url):
+                        continue
+
                     parsed = self.parse_result(r, track, location)
                     if parsed and parsed["opportunity_type"] == "event" and parsed["match_score"] >= Decimal("0.50"):
                         parsed["_query"] = query
@@ -874,6 +973,11 @@ class OpportunityDiscoveryEngine:
                     if not url or url in seen_urls:
                         continue
                     seen_urls.add(url)
+                    title = r.get("title", "")
+                    desc = r.get("snippet", "") or r.get("description", "")
+                    if not await self.should_keep_result("job", title, desc, url):
+                        continue
+
                     parsed = self.parse_result(r, track, location)
                     if parsed and parsed["opportunity_type"] == "job" and parsed["match_score"] >= Decimal("0.50"):
                         parsed["_query"] = query
