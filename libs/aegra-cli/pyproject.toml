@@ -3,7 +3,7 @@ name = "aegra-cli"
 version = "0.7.4"
 description = "Aegra CLI - Manage your self-hosted agent deployments"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
 authors = [{ name = "Muhammad Ibrahim", email = "mibrahim37612@gmail.com" }]
 keywords = ["langgraph", "agents", "cli", "docker", "deployment"]

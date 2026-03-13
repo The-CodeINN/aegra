@@ -31,6 +31,7 @@ from aegra_api.services.broker import broker_manager
 from aegra_api.services.graph_streaming import stream_graph_events
 from aegra_api.services.langgraph_service import create_run_config, get_langgraph_service
 from aegra_api.services.streaming_service import streaming_service
+from aegra_api.tools.course_content.mongo_client import get_course_content_mongo_client
 from aegra_api.utils.assistants import resolve_assistant_id
 from aegra_api.utils.run_utils import (
     _merge_jsonb,
@@ -88,6 +89,22 @@ async def _enrich_run_context_with_user_data(context: dict[str, Any] | None, use
             runtime_context["advisor"] = advisor
         if needs_track and learning_track:
             runtime_context["learning_track"] = learning_track
+
+    if "enrolled_course_ids" not in runtime_context:
+        try:
+            mongo_service = get_course_content_mongo_client()
+            enrolled_course_ids = await asyncio.to_thread(
+                mongo_service.get_active_enrolled_course_ids,
+                user.identity,
+            )
+            runtime_context["enrolled_course_ids"] = enrolled_course_ids
+        except Exception as exc:
+            logger.warning(
+                "Failed to resolve enrolled course scope from Mongo",
+                user_id=user.identity,
+                error=str(exc),
+            )
+            runtime_context["enrolled_course_ids"] = []
 
     return runtime_context
 

@@ -1,17 +1,14 @@
-Local-first course content access
+Mongo-backed course content access
 
-This package replaces the old vector-first RAG setup.
+This package provides direct Mongo reads for course and enrollment context.
 
 Principles
-- Mirror LMS course structure into local PostgreSQL tables.
-- Resolve exact lesson references deterministically.
-- Use PostgreSQL full-text search for transcript and material lookup.
-- Keep LMS API usage in the sync pipeline, not in the user-answer path.
 
-CLI
-- Sync one course:
-  python -m aegra_api.tools.course_content.cli sync-course --course-id <course_id>
-- Sync all courses:
-  python -m aegra_api.tools.course_content.cli sync-all
-- Search local content:
-  python -m aegra_api.tools.course_content.cli search --query "module 2 lesson 3.1"
+- No LMS backend API dependency for course retrieval/search path.
+- Scope all course answers by active student enrollments.
+- Keep Mongo data-access and ranking logic separated.
+
+Integration
+
+- Use `get_course_content_mongo_client()` for enrollment/course/progress/material reads.
+- Use `get_course_content_search_service()` for enrollment-scoped hybrid search.

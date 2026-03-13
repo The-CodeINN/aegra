@@ -84,6 +84,8 @@ class AppSettings(EnvBase):
     LMS_JWT_SECRET: str | None = None
     LMS_URL: str = "http://localhost:3000"
     ADMIN_TOKEN: str | None = None
+    MONGODB_URI: str | None = None
+    MONGODB_DB_NAME: str | None = None
 
     # Title Generator
     TITLE_GENERATOR_MODEL: str = "openai/gpt-4o-mini"

@@ -112,6 +112,53 @@ def _dedupe_locations(locations: list[str]) -> list[str]:
     return deduped
 
 
+def _is_remote_friendly(content: str) -> bool:
+    remote_signals = (
+        "remote",
+        "work from home",
+        "wfh",
+        "anywhere",
+        "worldwide",
+        "global role",
+        "distributed",
+    )
+    return any(signal in content for signal in remote_signals)
+
+
+def _is_location_compatible(target_location: str, title: str, description: str) -> bool:
+    """Hard filter opportunities by location unless explicitly remote-friendly."""
+    normalized_target = _readable_location(target_location).strip().lower()
+    content = f"{title} {description}".lower()
+
+    if normalized_target == "remote":
+        return True
+
+    if _is_remote_friendly(content):
+        return True
+
+    if normalized_target and normalized_target in content:
+        return True
+
+    # Prefer country-level matches for broad location strings.
+    target_country = normalized_target.upper()
+    target_country_name = COUNTRY_NAMES.get(target_country, "")
+    if target_country_name and target_country_name.lower() in content:
+        return True
+
+    # Detect explicit contradictory country mentions.
+    known_countries = {name.lower() for name in COUNTRY_NAMES.values()}
+    mentioned_countries = {country for country in known_countries if country in content}
+    if mentioned_countries:
+        if target_country_name:
+            return target_country_name.lower() in mentioned_countries
+        # If target isn't in known-country format, require at least one target token in content.
+        target_tokens = [token for token in re.split(r"[,/|-]", normalized_target) if token.strip()]
+        return any(token.strip() in content for token in target_tokens)
+
+    # If no clear contradictory signal appears, keep the result.
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Track → keyword mapping
 # ---------------------------------------------------------------------------
@@ -641,6 +688,7 @@ class OpportunityDiscoveryEngine:
         result: dict[str, Any],
         track: str,
         location: str,
+        profile: StudentProfile | None = None,
     ) -> dict[str, Any] | None:
         """Parse and classify a Serper.dev organic result.
 
@@ -668,6 +716,24 @@ class OpportunityDiscoveryEngine:
             "matched_track": track,
             "match_score": self._score(result, track),
         }
+
+        reason_tags: list[str] = ["matched_track"]
+        if _is_remote_friendly(f"{title} {desc}".lower()) or _readable_location(location).strip().lower() in (
+            f"{title} {desc}".lower()
+        ):
+            reason_tags.append("matched_location")
+
+        content = f"{title} {desc}".lower()
+        if any(keyword.lower() in content for keyword in self._keywords_for_track(track)):
+            reason_tags.append("matched_skill_signals")
+
+        if profile and profile.experience_level in ("entry-level", "junior"):
+            if any(tag in content for tag in ["entry", "junior", "intern", "graduate"]):
+                reason_tags.append("matched_experience_level")
+        elif profile:
+            reason_tags.append("matched_experience_level")
+
+        parsed["reason_tags"] = list(dict.fromkeys(reason_tags))
 
         if opp_type == "job":
             parsed["company"] = self._extract_company(title, url)
@@ -931,8 +997,10 @@ class OpportunityDiscoveryEngine:
                     desc = r.get("snippet", "") or r.get("description", "")
                     if not await self.should_keep_result("event", title, desc, url):
                         continue
+                    if not _is_location_compatible(location, title, desc):
+                        continue
 
-                    parsed = self.parse_result(r, track, location)
+                    parsed = self.parse_result(r, track, location, profile=profile)
                     if parsed and parsed["opportunity_type"] == "event" and parsed["match_score"] >= Decimal("0.50"):
                         parsed["_query"] = query
                         parsed["_source"] = "serper"
@@ -977,8 +1045,10 @@ class OpportunityDiscoveryEngine:
                     desc = r.get("snippet", "") or r.get("description", "")
                     if not await self.should_keep_result("job", title, desc, url):
                         continue
+                    if not _is_location_compatible(location, title, desc):
+                        continue
 
-                    parsed = self.parse_result(r, track, location)
+                    parsed = self.parse_result(r, track, location, profile=profile)
                     if parsed and parsed["opportunity_type"] == "job" and parsed["match_score"] >= Decimal("0.50"):
                         parsed["_query"] = query
                         parsed["_source"] = "serper"
@@ -1084,6 +1154,7 @@ class OpportunityDiscoveryEngine:
                 "source": parsed.get("_source", "unknown"),
                 "query": parsed.get("_query", ""),
                 "search_locations": [_readable_location(location) for location in locations],
+                "reason_tags": parsed.get("reason_tags", ["matched_track"]),
             }
             # Attach strategy to metadata so frontend can display it
             if parsed.get("networking_strategy"):

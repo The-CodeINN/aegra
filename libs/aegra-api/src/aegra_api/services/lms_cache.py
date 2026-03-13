@@ -4,10 +4,10 @@ Caches LMS endpoint responses to reduce redundant API calls.
 Uses the existing redis_manager for distributed caching and falls
 back to an in-memory TTL cache when Redis is unavailable.
 
-TTL Strategy (endpoints that rarely change get longer TTLs):
-- Onboarding sections (section-1..8, /onboarding)  → 24 hours
-- User profile (/user/profile)                      → 1 hour
-- Enrollment/blackboard (/enrollment/*)              → 15 minutes
+TTL Strategy:
+- Onboarding and profile endpoints                   → 120 seconds
+- Enrollment overview                                → 45 seconds
+- Critical progress/structure/subscription/attempts  → live only (no cache)
 """
 
 from __future__ import annotations
@@ -25,9 +25,9 @@ from aegra_api.core.redis import redis_manager
 logger = structlog.get_logger()
 
 # TTL constants (seconds)
-TTL_ONBOARDING = 86400  # 24 hours — onboarding data rarely changes
-TTL_PROFILE = 3600  # 1 hour — name/email rarely change
-TTL_ENROLLMENT = 900  # 15 minutes — progress changes more often
+TTL_ONBOARDING = 120
+TTL_PROFILE = 120
+TTL_ENROLLMENT = 45
 
 # In-memory fallback: key → (json_str, expiry_ts)
 _mem_cache: dict[str, tuple[str, float]] = {}
@@ -36,6 +36,11 @@ _cache_lock = asyncio.Lock()
 
 def _ttl_for_path(path: str) -> int:
     """Return the appropriate TTL based on the endpoint path."""
+    # Critical user-state endpoints should always be fetched live.
+    if path.endswith("/subscription/me"):
+        return 0
+    if path.endswith("/structure") or path.endswith("/progress") or "/attempts" in path:
+        return 0
     if "/onboarding" in path or "/ai-mentor/" in path:
         return TTL_ONBOARDING
     if "/user/profile" in path:
@@ -111,6 +116,20 @@ async def cached_lms_fetch(
     key = _cache_key(user_id, path)
     ttl = _ttl_for_path(path)
 
+    if ttl <= 0:
+        try:
+            resp = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            data: dict[str, Any] = resp.json()
+            return data
+        except Exception as exc:
+            logger.debug("lms_fetch_failed", url=url, error=str(exc))
+            return {}
+
     # 1. Redis
     cached = await _redis_get(key)
     if cached is not None:
@@ -159,7 +178,12 @@ async def invalidate_lms_cache(user_id: str, paths: list[str] | None = None) -> 
         paths = [
             "/api/v1/user/profile",
             "/api/v1/enrollment/student/blackboard",
+            "/api/v1/enrollment/active",
+            "/api/v1/enrollment/{courseId}/structure",
+            "/api/v1/enrollment/{courseId}/progress",
+            "/api/v1/enrollment/{studentId}/attempts",
             "/api/v1/onboarding",
+            "/api/v1/subscription/me",
             "/api/v1/ai-mentor/onboarding/section-1",
             "/api/v1/ai-mentor/onboarding/section-2",
             "/api/v1/ai-mentor/onboarding/section-4",
