@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, fields
+from dataclasses import MISSING, dataclass, field, fields
 from typing import Annotated, Any
 
 from react_agent import prompts
@@ -82,7 +82,7 @@ class Context:
     )
 
     lms_api_url: str = field(
-        default="https://dedatahub-api.vercel.app",
+        default_factory=lambda: os.environ["LMS_URL"],
         metadata={"description": "Base URL for the LMS API to fetch student information."},
     )
 
@@ -118,6 +118,33 @@ class Context:
         },
     )
 
+    def __post_init__(self) -> None:
+        """Apply env overrides for default values and build the dynamic prompt."""
+        for f in fields(self):
+            if not f.init:
+                continue
+
+            env_value = os.environ.get(f.name.upper())
+            if env_value is None:
+                continue
+
+            current_value = getattr(self, f.name)
+            has_default = f.default is not MISSING
+            is_default_value = has_default and current_value == f.default
+            is_missing_like = current_value is None or current_value == "" or current_value == []
+
+            if not (is_default_value or is_missing_like):
+                continue
+
+            base_value = f.default if has_default else current_value
+            setattr(self, f.name, _coerce_env_value(env_value, base_value))
+
+        if not self.system_prompt:
+            self.system_prompt = prompts.get_dynamic_system_prompt(
+                advisor=self.advisor,
+                learning_track=self.learning_track,
+            )
+
 
 def _coerce_env_value(raw: str, default: Any) -> Any:
     if isinstance(default, bool):
@@ -128,21 +155,3 @@ def _coerce_env_value(raw: str, default: Any) -> Any:
         except ValueError:
             return default
     return raw
-
-    def __post_init__(self) -> None:
-        """Fetch env vars for attributes that were not passed as args and generate dynamic prompt."""
-        for f in fields(self):
-            if not f.init:
-                continue
-
-            if getattr(self, f.name) == f.default:
-                env_value = os.environ.get(f.name.upper())
-                if env_value is not None:
-                    setattr(self, f.name, _coerce_env_value(env_value, f.default))
-
-        # Generate dynamic system prompt based on advisor
-        if not self.system_prompt:
-            self.system_prompt = prompts.get_dynamic_system_prompt(
-                advisor=self.advisor,
-                learning_track=self.learning_track,
-            )
