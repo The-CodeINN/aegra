@@ -1,9 +1,9 @@
 [project]
 name = "aegra-cli"
-version = "0.7.4"
+version = "0.8.2"
 description = "Aegra CLI - Manage your self-hosted agent deployments"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
 authors = [{ name = "Muhammad Ibrahim", email = "mibrahim37612@gmail.com" }]
 keywords = ["langgraph", "agents", "cli", "docker", "deployment"]
@@ -24,7 +24,7 @@ dependencies = [
     "python-dotenv>=1.1.1",
 
     # Server (always included)
-    "aegra-api~=0.7.0",
+    "aegra-api~=0.8.0",
 ]
 
 [project.scripts]

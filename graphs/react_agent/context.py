@@ -74,6 +74,13 @@ class Context:
         metadata={"description": "User ID extracted from JWT token for memory namespacing."},
     )
 
+    enrolled_course_ids: list[str] = field(
+        default_factory=list,
+        metadata={
+            "description": "Authoritative enrolled course IDs for this user. Search tools must restrict retrieval to this scope."
+        },
+    )
+
     lms_api_url: str = field(
         default="https://dedatahub-api.vercel.app",
         metadata={"description": "Base URL for the LMS API to fetch student information."},
@@ -84,6 +91,44 @@ class Context:
         metadata={"description": "The API key for Brave Search."},
     )
 
+    anthropic_prompt_caching_enabled: bool = field(
+        default=True,
+        metadata={"description": "Enable Anthropic prompt-caching middleware when using Claude models."},
+    )
+
+    anthropic_prompt_caching_ttl: str = field(
+        default="5m",
+        metadata={"description": "Anthropic prompt cache TTL. Supported values: '5m' or '1h'."},
+    )
+
+    anthropic_tool_search_enabled: bool = field(
+        default=True,
+        metadata={"description": "Enable Anthropic server-side tool search for deferred tools."},
+    )
+
+    anthropic_tool_search_variant: str = field(
+        default="bm25",
+        metadata={"description": "Anthropic tool search variant: 'bm25' or 'regex'."},
+    )
+
+    anthropic_programmatic_tool_calling_enabled: bool = field(
+        default=False,
+        metadata={
+            "description": "Enable Anthropic code-execution based programmatic tool calling for supported read-only tools."
+        },
+    )
+
+
+def _coerce_env_value(raw: str, default: Any) -> Any:
+    if isinstance(default, bool):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(default, int):
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+    return raw
+
     def __post_init__(self) -> None:
         """Fetch env vars for attributes that were not passed as args and generate dynamic prompt."""
         for f in fields(self):
@@ -91,7 +136,9 @@ class Context:
                 continue
 
             if getattr(self, f.name) == f.default:
-                setattr(self, f.name, os.environ.get(f.name.upper(), f.default))
+                env_value = os.environ.get(f.name.upper())
+                if env_value is not None:
+                    setattr(self, f.name, _coerce_env_value(env_value, f.default))
 
         # Generate dynamic system prompt based on advisor
         if not self.system_prompt:

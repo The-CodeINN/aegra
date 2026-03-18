@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import BeforeValidator, computed_field
+from pydantic import BeforeValidator, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from aegra_api import __version__
@@ -67,8 +67,16 @@ class AppSettings(EnvBase):
 
     # Server config
     HOST: str = "0.0.0.0"  # nosec B104
-    PORT: int = 8000
-    SERVER_URL: str = "http://localhost:8000"
+    PORT: int = 2026
+    SERVER_URL: str | None = None
+
+    @model_validator(mode="after")
+    def _derive_server_url(self) -> "AppSettings":
+        """Derive SERVER_URL from HOST/PORT when not explicitly set."""
+        if self.SERVER_URL is None:
+            host = "localhost" if self.HOST in ("0.0.0.0", "127.0.0.1") else self.HOST  # nosec B104
+            object.__setattr__(self, "SERVER_URL", f"http://{host}:{self.PORT}")
+        return self
 
     # App logic
     AEGRA_CONFIG: str = "aegra.json"  # Default config file path
@@ -84,6 +92,8 @@ class AppSettings(EnvBase):
     LMS_JWT_SECRET: str | None = None
     LMS_URL: str = "http://localhost:3000"
     ADMIN_TOKEN: str | None = None
+    MONGODB_URI: str | None = None
+    MONGODB_DB_NAME: str | None = None
 
     # Title Generator
     TITLE_GENERATOR_MODEL: str = "openai/gpt-4o-mini"

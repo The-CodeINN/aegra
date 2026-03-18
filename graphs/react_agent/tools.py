@@ -16,6 +16,7 @@ import logging
 import re
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -32,9 +33,9 @@ logger = logging.getLogger(__name__)
 # LMS response caching (Redis + in-memory cache)
 # ---------------------------------------------------------------------------
 # TTLs (seconds)
-_TTL_ONBOARDING = 86400  # 24 h — onboarding data rarely changes
-_TTL_PROFILE = 3600  # 1 h
-_TTL_ENROLLMENT = 900  # 15 min
+_TTL_ONBOARDING = 120
+_TTL_PROFILE = 120
+_TTL_ENROLLMENT = 45
 
 # In-memory cache: key → (json_str, expiry_ts)
 _mem_cache: dict[str, tuple[str, float]] = {}
@@ -45,6 +46,11 @@ _redis_checked = False
 
 
 def _ttl_for_path(path: str) -> int:
+    # Critical live state: do not cache, always fetch from LMS.
+    if path.endswith("/structure") or path.endswith("/progress") or "/attempts" in path:
+        return 0
+    if path.endswith("/subscription/me"):
+        return 0
     if "/onboarding" in path or "/ai-mentor/" in path:
         return _TTL_ONBOARDING
     if "/user/profile" in path:
@@ -74,56 +80,86 @@ def _get_redis_client() -> Any:
     return _redis_client
 
 
-async def _cached_lms_get(
+async def _cached_lms_get_with_evidence(
     client: httpx.AsyncClient,
     url: str,
     token: str,
     user_id: str | None,
-) -> dict[str, Any]:
-    """GET with Redis + in-memory caching. Falls back to live fetch."""
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """GET LMS endpoint with evidence metadata for observability and confidence."""
     parsed = urlparse(url)
-    path = f"{parsed.netloc}{parsed.path}"
+    path = parsed.path
+    full_path = f"{parsed.netloc}{parsed.path}"
     uid = user_id or "anon"
-    key = _cache_key(uid, path)
-    ttl = _ttl_for_path(path)
+    key = _cache_key(uid, full_path)
+    ttl = _ttl_for_path(full_path)
+    fetched_at = datetime.now(tz=UTC).isoformat()
 
-    # 1. Redis
+    # Critical paths enforce live fetch.
+    if ttl <= 0:
+        resp = await client.get(
+            url,
+            headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
+        )
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        return data, {
+            "endpoint": path,
+            "fetched_at": fetched_at,
+            "cache_source": "none",
+            "cache_ttl_seconds": 0,
+            "live_verified": True,
+        }
+
     rc = _get_redis_client()
     if rc is not None:
         with contextlib.suppress(Exception):
             val = await rc.get(key)
             if val is not None:
-                return json.loads(val)
+                return json.loads(val), {
+                    "endpoint": path,
+                    "fetched_at": fetched_at,
+                    "cache_source": "redis",
+                    "cache_ttl_seconds": ttl,
+                    "live_verified": False,
+                }
 
-    # 2. Memory
     entry = _mem_cache.get(key)
     if entry is not None:
         value, expiry = entry
         if time.time() < expiry:
-            return json.loads(value)
-        else:
-            del _mem_cache[key]
+            return json.loads(value), {
+                "endpoint": path,
+                "fetched_at": fetched_at,
+                "cache_source": "memory",
+                "cache_ttl_seconds": ttl,
+                "live_verified": False,
+            }
+        del _mem_cache[key]
 
-    # 3. Live fetch
     resp = await client.get(
         url,
         headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
     )
     resp.raise_for_status()
-    data: dict[str, Any] = resp.json()
+    data = resp.json()
 
     serialized = json.dumps(data)
-    # Store in Redis
     if rc is not None:
         with contextlib.suppress(Exception):
             await rc.setex(key, ttl, serialized)
-    # Store in memory
     _mem_cache[key] = (serialized, time.time() + ttl)
 
-    return data
+    return data, {
+        "endpoint": path,
+        "fetched_at": fetched_at,
+        "cache_source": "live",
+        "cache_ttl_seconds": ttl,
+        "live_verified": True,
+    }
 
 
-# Import local-first course content service
+# Import course content services
 try:
     import sys
     from pathlib import Path
@@ -134,13 +170,14 @@ try:
     if src_path.exists() and str(src_path) not in sys.path:
         sys.path.insert(0, str(src_path))
 
-    from aegra_api.tools.course_content import CourseContentService
+    from aegra_api.tools.course_content.mongo_client import get_course_content_mongo_client
+    from aegra_api.tools.course_content.search_service import get_course_content_search_service
 
     COURSE_CONTENT_AVAILABLE = True
-    logger.info("Course content service loaded successfully")
+    logger.info("Course content services loaded successfully")
 except ImportError as e:
     COURSE_CONTENT_AVAILABLE = False
-    logger.warning(f"Course content service not available: {e}. Course search will be disabled.")
+    logger.warning(f"Course content services not available: {e}. Course search will be disabled.")
 
 
 async def brave_search(query: str) -> str:
@@ -310,7 +347,12 @@ async def get_student_profile() -> dict[str, Any]:
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            data = await _cached_lms_get(client, profile_endpoint, token, runtime.context.user_id)
+            data, evidence = await _cached_lms_get_with_evidence(
+                client,
+                profile_endpoint,
+                token,
+                runtime.context.user_id,
+            )
 
             user_data = data.get("user", data)
 
@@ -321,6 +363,8 @@ async def get_student_profile() -> dict[str, Any]:
                 "onboardingComplete": data.get("onboardingComplete") or user_data.get("onboardingComplete"),
                 "onboardingSkipped": data.get("onboardingSkipped") or user_data.get("onboardingSkipped"),
                 "sourceEndpoint": "/api/v1/user/profile",
+                "evidence": evidence,
+                "confidence": "high" if evidence.get("live_verified") else "medium",
             }
 
             logger.info(f"Successfully fetched profile for student: {profile.get('name')}")
@@ -374,7 +418,12 @@ async def get_student_onboarding() -> dict[str, Any]:
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            data = await _cached_lms_get(client, onboarding_endpoint, token, runtime.context.user_id)
+            data, evidence = await _cached_lms_get_with_evidence(
+                client,
+                onboarding_endpoint,
+                token,
+                runtime.context.user_id,
+            )
 
             # Extract the onboarding data
             onboarding_data = data.get("onboarding", {})
@@ -388,6 +437,8 @@ async def get_student_onboarding() -> dict[str, Any]:
                 "completed": onboarding_data.get("completed"),
                 "completedSteps": onboarding_data.get("completedSteps", []),
                 "sourceEndpoint": "/api/v1/onboarding",
+                "evidence": evidence,
+                "confidence": "high" if evidence.get("live_verified") else "medium",
             }
 
             logger.info(f"Successfully fetched onboarding for learning track: {onboarding.get('learningTrack')}")
@@ -443,7 +494,12 @@ async def get_student_ai_career_advisor_onboarding() -> dict[str, Any]:
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            data = await _cached_lms_get(client, career_advisor_endpoint, token, runtime.context.user_id)
+            data, evidence = await _cached_lms_get_with_evidence(
+                client,
+                career_advisor_endpoint,
+                token,
+                runtime.context.user_id,
+            )
 
             # Extract the onboarding data
             onboarding_data = data.get("onboarding", {})
@@ -463,6 +519,8 @@ async def get_student_ai_career_advisor_onboarding() -> dict[str, Any]:
                 "completedSteps": onboarding_data.get("completedSteps", []),
                 "completed": onboarding_data.get("completed"),
                 "sourceEndpoint": "/api/v1/ai-mentor/onboarding/me",
+                "evidence": evidence,
+                "confidence": "high" if evidence.get("live_verified") else "medium",
             }
 
             logger.info(
@@ -491,12 +549,286 @@ async def get_student_ai_career_advisor_onboarding() -> dict[str, Any]:
         return {"error": "Unexpected error", "message": str(e)}
 
 
+async def get_student_enrollment_overview() -> dict[str, Any]:
+    """Get dashboard-grade enrollment and progress overview for the current student."""
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+    if not user_id:
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": "Authentication required",
+            "message": "Unable to fetch enrollment overview without authenticated user context",
+        }
+
+    try:
+        mongo_client = get_course_content_mongo_client()
+        data = await asyncio.to_thread(mongo_client.get_enrollment_overview, user_id)
+        return {
+            "ok": True,
+            "source": "mongo",
+            "confidence": "high",
+            "data": data,
+        }
+    except Exception as e:
+        logger.error(f"Error fetching enrollment overview from Mongo: {e}", exc_info=True)
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": str(e),
+        }
+
+
+async def get_course_structure(course_id: str) -> dict[str, Any]:
+    """Get ordered module/lesson structure with lock and completion state for a course."""
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+    if not course_id:
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": "course_id is required",
+        }
+    if not user_id:
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": "Authentication required",
+        }
+
+    enrolled_course_ids = list(runtime.context.enrolled_course_ids or [])
+    try:
+        mongo_client = get_course_content_mongo_client()
+        if not enrolled_course_ids:
+            enrolled_course_ids = await asyncio.to_thread(mongo_client.get_active_enrolled_course_ids, user_id)
+        if course_id not in enrolled_course_ids:
+            return {
+                "ok": False,
+                "source": "mongo",
+                "confidence": "low",
+                "error": "Requested course is outside the user's enrolled scope.",
+                "enrolled_course_ids": enrolled_course_ids,
+            }
+
+        data = await asyncio.to_thread(mongo_client.get_course_structure, user_id, course_id)
+        return {
+            "ok": data is not None,
+            "source": "mongo",
+            "confidence": "high" if data is not None else "low",
+            "data": data,
+        }
+    except Exception as e:
+        logger.error(f"Error fetching course structure from Mongo: {e}", exc_info=True)
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": str(e),
+        }
+
+
+async def get_course_progress(course_id: str) -> dict[str, Any]:
+    """Get detailed per-level/module/lesson progress for a course."""
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+    if not course_id:
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": "course_id is required",
+        }
+    if not user_id:
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": "Authentication required",
+        }
+
+    enrolled_course_ids = list(runtime.context.enrolled_course_ids or [])
+    try:
+        mongo_client = get_course_content_mongo_client()
+        if not enrolled_course_ids:
+            enrolled_course_ids = await asyncio.to_thread(mongo_client.get_active_enrolled_course_ids, user_id)
+        if course_id not in enrolled_course_ids:
+            return {
+                "ok": False,
+                "source": "mongo",
+                "confidence": "low",
+                "error": "Requested course is outside the user's enrolled scope.",
+                "enrolled_course_ids": enrolled_course_ids,
+            }
+
+        data = await asyncio.to_thread(mongo_client.get_course_progress, user_id, course_id)
+        return {
+            "ok": data is not None,
+            "source": "mongo",
+            "confidence": "high" if data is not None else "low",
+            "data": data,
+        }
+    except Exception as e:
+        logger.error(f"Error fetching course progress from Mongo: {e}", exc_info=True)
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": str(e),
+        }
+
+
+async def get_course_materials(course_id: str, include_content: bool = True, limit: int = 10) -> dict[str, Any]:
+    """Get enrolled course materials and extract readable text from PDFs when possible."""
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+    if not course_id:
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": "course_id is required",
+        }
+    if not user_id:
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": "Authentication required",
+        }
+
+    enrolled_course_ids = list(runtime.context.enrolled_course_ids or [])
+    try:
+        mongo_client = get_course_content_mongo_client()
+        if not enrolled_course_ids:
+            enrolled_course_ids = await asyncio.to_thread(mongo_client.get_active_enrolled_course_ids, user_id)
+        if course_id not in enrolled_course_ids:
+            return {
+                "ok": False,
+                "source": "mongo",
+                "confidence": "low",
+                "error": "Requested course is outside the user's enrolled scope.",
+                "enrolled_course_ids": enrolled_course_ids,
+            }
+
+        materials = await asyncio.to_thread(
+            mongo_client.get_course_materials,
+            course_id,
+            include_content=include_content,
+            limit=max(1, min(limit, 20)),
+        )
+        data = {
+            "courseId": course_id,
+            "materials": [
+                {
+                    "materialId": item.material_id,
+                    "lessonId": item.lesson_id,
+                    "lessonTitle": item.lesson_title,
+                    "levelTitle": item.level_title,
+                    "moduleTitle": item.module_title,
+                    "title": item.raw.get("title") if isinstance(item.raw, dict) else None,
+                    "fileType": item.file_type,
+                    "fileUrl": item.file_url,
+                    "downloadUrl": item.download_url,
+                    "contentPreview": (item.content_text or "")[:8000] if include_content else None,
+                }
+                for item in materials
+            ],
+        }
+        return {
+            "ok": True,
+            "source": "mongo",
+            "confidence": "high",
+            "data": data,
+        }
+    except Exception as e:
+        logger.error(f"Error fetching course materials from Mongo: {e}", exc_info=True)
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": str(e),
+        }
+
+
+async def get_student_attempts(student_id: str) -> dict[str, Any]:
+    """Get assessment attempts history and result context for a student."""
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+    if not student_id:
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": "student_id is required",
+        }
+    if not user_id or student_id != user_id:
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": "Requested student is outside the authenticated scope.",
+        }
+
+    try:
+        mongo_client = get_course_content_mongo_client()
+        data = await asyncio.to_thread(mongo_client.get_student_attempts, user_id)
+        return {
+            "ok": True,
+            "source": "mongo",
+            "confidence": "high",
+            "data": data,
+        }
+    except Exception as e:
+        logger.error(f"Error fetching student attempts from Mongo: {e}", exc_info=True)
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": str(e),
+        }
+
+
+async def get_subscription_state() -> dict[str, Any]:
+    """Get current subscription entitlement and active track state."""
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+    if not user_id:
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": "Authentication required",
+        }
+
+    try:
+        mongo_client = get_course_content_mongo_client()
+        data = await asyncio.to_thread(mongo_client.get_subscription_state, user_id)
+        return {
+            "ok": data is not None,
+            "source": "mongo",
+            "confidence": "high" if data is not None else "low",
+            "data": data,
+        }
+    except Exception as e:
+        logger.error(f"Error fetching subscription state from Mongo: {e}", exc_info=True)
+        return {
+            "ok": False,
+            "source": "mongo",
+            "confidence": "low",
+            "error": str(e),
+        }
+
+
 async def search_course_content(
     query: str,
     course_id: str | None = None,
     max_results: int = 5,
 ) -> dict[str, Any]:
-    """Search for relevant course content using hybrid BM25 full-text ranking.
+    """Search enrolled course content directly from Mongo Atlas Search.
 
     This tool searches through indexed course materials, lessons, and transcript
     segments using full-text retrieval and BM25-style ranking fused with lexical
@@ -522,28 +854,62 @@ async def search_course_content(
             - metadata: Additional context (level, module, etc.)
         - error: Error message if search fails
     """
+    runtime = get_runtime(Context)
+
     if not COURSE_CONTENT_AVAILABLE:
-        logger.error("Course content service not available")
+        logger.error("Course content services are not available")
         return {
             "query": query,
             "results": [],
-            "error": "Course search is not available. Local course content service not initialized.",
+            "error": "Course search is not available. Course content services are not initialized.",
         }
 
     try:
-        logger.info(f"Searching course content for: {query}")
-        if course_id:
-            logger.info(f"Filtering by course_id: {course_id}")
+        user_id = runtime.context.user_id
+        if not user_id:
+            return {
+                "query": query,
+                "results": [],
+                "error": "User context is missing. Cannot resolve enrollment scope.",
+            }
 
-        service = CourseContentService()
-        results = await asyncio.to_thread(service.search, query, course_id, max_results)
+        enrolled_course_ids = list(runtime.context.enrolled_course_ids or [])
+        mongo_client = get_course_content_mongo_client()
+        search_service = get_course_content_search_service()
+
+        if not enrolled_course_ids:
+            enrolled_course_ids = await asyncio.to_thread(mongo_client.get_active_enrolled_course_ids, user_id)
+
+        if course_id and course_id not in enrolled_course_ids:
+            return {
+                "query": query,
+                "results": [],
+                "error": "Requested course is outside the user's enrolled scope.",
+                "enrolled_course_ids": enrolled_course_ids,
+            }
+
+        if not enrolled_course_ids:
+            return {
+                "query": query,
+                "results": [],
+                "message": "No active enrollments found for this user.",
+            }
+
+        results = await asyncio.to_thread(
+            search_service.search_enrolled_course_content,
+            query=query,
+            enrolled_course_ids=enrolled_course_ids,
+            limit=max_results,
+            requested_course_id=course_id,
+        )
 
         if not results:
             logger.info(f"No course content found for query: {query}")
             return {
                 "query": query,
                 "results": [],
-                "message": "No relevant local course content found. The course may not be synced yet.",
+                "message": "No relevant enrolled course content found in Mongo search.",
+                "enrolled_course_ids": enrolled_course_ids,
             }
 
         logger.info(f"Found {len(results)} relevant course content chunks")
@@ -551,6 +917,8 @@ async def search_course_content(
             "query": query,
             "results": results,
             "total_results": len(results),
+            "enrolled_course_ids": enrolled_course_ids,
+            "source": results[0].get("metadata", {}).get("source", "mongo_atlas_search"),
         }
 
     except Exception as e:
@@ -639,12 +1007,18 @@ TOOLS: list[Callable[..., Any]] = [
     get_student_profile,
     get_student_onboarding,
     get_student_ai_career_advisor_onboarding,
+    get_student_enrollment_overview,
+    get_course_structure,
+    get_course_materials,
+    get_course_progress,
+    get_student_attempts,
+    get_subscription_state,
     get_user_memory,
     save_user_memory,
     search_user_memories,
 ]
 
-# Add course search tool if available
+# Add course search tool if a backend is available
 if COURSE_CONTENT_AVAILABLE:
     TOOLS.append(search_course_content)
     logger.info("Course search tool enabled")
