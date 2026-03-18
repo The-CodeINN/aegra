@@ -45,6 +45,24 @@ _redis_client: Any = None
 _redis_checked = False
 
 
+def _normalize_auth_token(token: str | None) -> str | None:
+    """Normalize user token value before forwarding to LMS.
+
+    Accepts raw JWT or a mistakenly prefixed value like "Bearer <jwt>".
+    """
+    if not token:
+        return None
+
+    cleaned = token.strip()
+    if not cleaned:
+        return None
+
+    if cleaned.lower().startswith("bearer "):
+        cleaned = cleaned[7:].strip()
+
+    return cleaned or None
+
+
 def _ttl_for_path(path: str) -> int:
     # Critical live state: do not cache, always fetch from LMS.
     if path.endswith("/structure") or path.endswith("/progress") or "/attempts" in path:
@@ -331,7 +349,7 @@ async def get_student_profile() -> dict[str, Any]:
     runtime = get_runtime(Context)
 
     # Get the user token from context
-    token = runtime.context.user_token
+    token = _normalize_auth_token(runtime.context.user_token)
     if not token:
         logger.error("No user token available in context")
         return {
@@ -404,7 +422,7 @@ async def get_student_onboarding() -> dict[str, Any]:
     runtime = get_runtime(Context)
 
     # Get the user token from context
-    token = runtime.context.user_token
+    token = _normalize_auth_token(runtime.context.user_token)
     if not token:
         logger.error("No user token available in context")
         return {
@@ -519,7 +537,7 @@ async def get_student_ai_career_advisor_onboarding() -> dict[str, Any]:
     runtime = get_runtime(Context)
 
     # Get the user token from context
-    token = runtime.context.user_token
+    token = _normalize_auth_token(runtime.context.user_token)
     if not token:
         logger.error("No user token available in context")
         return {
