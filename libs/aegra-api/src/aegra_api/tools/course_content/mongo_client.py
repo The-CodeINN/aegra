@@ -60,6 +60,21 @@ class CourseContentMongoClient:
             self.db = default_db
 
     @staticmethod
+    def _pick_text(data: dict[str, Any], *keys: str) -> str | None:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    @staticmethod
+    def _normalize_label(value: Any) -> str | None:
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            return normalized if normalized else None
+        return None
+
+    @staticmethod
     def _to_object_id_or_str(value: str) -> ObjectId | str:
         try:
             return ObjectId(value)
@@ -321,32 +336,57 @@ class CourseContentMongoClient:
         enrollment_progress = self.get_course_progress(user_id, course_id)
         progress_levels = self._safe_list((enrollment_progress or {}).get("progress"))
 
-        progress_by_level: dict[str, dict[str, Any]] = {}
-        for level in progress_levels:
+        progress_by_level_title: dict[str, dict[str, Any]] = {}
+        progress_by_level_index: dict[int, dict[str, Any]] = {}
+        for idx, level in enumerate(progress_levels):
             if not isinstance(level, dict):
                 continue
-            level_title = level.get("levelTitle")
-            if isinstance(level_title, str) and level_title:
-                progress_by_level[level_title] = level
+            level_title = self._pick_text(level, "levelTitle", "title", "name")
+            normalized_level_title = self._normalize_label(level_title)
+            if normalized_level_title:
+                progress_by_level_title[normalized_level_title] = level
+            level_idx = level.get("levelIndex")
+            if isinstance(level_idx, int):
+                progress_by_level_index[level_idx] = level
+            elif idx not in progress_by_level_index:
+                progress_by_level_index[idx] = level
 
         levels_out: list[dict[str, Any]] = []
         for level_index, level in enumerate(course.levels):
             if not isinstance(level, dict):
                 continue
-            level_title = level.get("levelTitle") or level.get("title") or f"Level {level_index + 1}"
-            level_progress = progress_by_level.get(level_title, {})
-            progress_modules = {
-                item.get("moduleTitle"): item
-                for item in self._safe_list(level_progress.get("modules"))
-                if isinstance(item, dict) and item.get("moduleTitle")
-            }
+            level_title = self._pick_text(level, "levelTitle", "title", "name") or f"Level {level_index + 1}"
+            level_progress = (
+                progress_by_level_title.get(self._normalize_label(level_title) or "")
+                or progress_by_level_index.get(level_index)
+                or {}
+            )
+
+            progress_modules_by_title: dict[str, dict[str, Any]] = {}
+            progress_modules_by_index: dict[int, dict[str, Any]] = {}
+            for idx, item in enumerate(self._safe_list(level_progress.get("modules"))):
+                if not isinstance(item, dict):
+                    continue
+                module_progress_title = self._pick_text(item, "moduleTitle", "title", "name")
+                normalized_module_progress_title = self._normalize_label(module_progress_title)
+                if normalized_module_progress_title:
+                    progress_modules_by_title[normalized_module_progress_title] = item
+                module_idx = item.get("moduleIndex")
+                if isinstance(module_idx, int):
+                    progress_modules_by_index[module_idx] = item
+                elif idx not in progress_modules_by_index:
+                    progress_modules_by_index[idx] = item
 
             modules_out: list[dict[str, Any]] = []
             for module_index, module in enumerate(self._safe_list(level.get("modules"))):
                 if not isinstance(module, dict):
                     continue
-                module_title = module.get("moduleTitle") or module.get("title") or f"Module {module_index + 1}"
-                module_progress = progress_modules.get(module_title, {})
+                module_title = self._pick_text(module, "moduleTitle", "title", "name") or f"Module {module_index + 1}"
+                module_progress = (
+                    progress_modules_by_title.get(self._normalize_label(module_title) or "")
+                    or progress_modules_by_index.get(module_index)
+                    or {}
+                )
                 completed_lessons = self._safe_list(module_progress.get("completedLessons"))
                 lesson_progress_by_id = {
                     self._to_str_id(item.get("lessonId")): item
