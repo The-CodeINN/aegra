@@ -414,7 +414,9 @@ async def get_student_onboarding() -> dict[str, Any]:
 
     # Get LMS API URL from context
     lms_url = runtime.context.lms_api_url.rstrip("/")
-    onboarding_endpoint = f"{lms_url}/api/v1/onboarding"
+    # Use the AI mentor onboarding snapshot endpoint because it contains
+    # the complete onboarding journey, including work experience details.
+    onboarding_endpoint = f"{lms_url}/api/v1/ai-mentor/onboarding/me"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -425,18 +427,55 @@ async def get_student_onboarding() -> dict[str, Any]:
                 runtime.context.user_id,
             )
 
-            # Extract the onboarding data
-            onboarding_data = data.get("onboarding", {})
+            # Extract and normalize onboarding data.
+            onboarding_data = data.get("onboarding", {}) if isinstance(data, dict) else {}
+            s1 = onboarding_data.get("s1", {}) if isinstance(onboarding_data, dict) else {}
+            s7 = onboarding_data.get("s7", {}) if isinstance(onboarding_data, dict) else {}
+
+            weekly_time = s1.get("weeklyTime") if isinstance(s1, dict) else None
+            time_commitment = onboarding_data.get("timeCommitment", {})
+            if not time_commitment and weekly_time:
+                time_commitment = {"hoursPerWeek": weekly_time}
+
+            learning_preferences = onboarding_data.get("learningPreferences", {})
+            if not learning_preferences and (s1 or s7):
+                learning_preferences = {
+                    "learningStyle": s1.get("learningStyle"),
+                    "feedbackStyle": s7.get("feedbackStyle"),
+                    "availability": s7.get("availability"),
+                    "motivators": s7.get("motivators"),
+                    "riskTolerance": s7.get("riskTolerance"),
+                }
+
+            technical_background = onboarding_data.get("technicalBackground", {})
+            if not technical_background:
+                technical_background = {
+                    "employment": onboarding_data.get("s2", {}),
+                    "education": onboarding_data.get("s3", {}),
+                    "skills": onboarding_data.get("s5", {}),
+                    "challenges": onboarding_data.get("s6", {}),
+                }
 
             # Structure the response with relevant fields
             onboarding = {
-                "learningTrack": onboarding_data.get("learningTrack"),
-                "timeCommitment": onboarding_data.get("timeCommitment", {}),
-                "learningPreferences": onboarding_data.get("learningPreferences", {}),
-                "technicalBackground": onboarding_data.get("technicalBackground", {}),
+                "learningTrack": onboarding_data.get("learningTrack") or s1.get("learningTrack"),
+                "timeCommitment": time_commitment,
+                "learningPreferences": learning_preferences,
+                "technicalBackground": technical_background,
                 "completed": onboarding_data.get("completed"),
                 "completedSteps": onboarding_data.get("completedSteps", []),
-                "sourceEndpoint": "/api/v1/onboarding",
+                "sourceEndpoint": "/api/v1/ai-mentor/onboarding/me",
+                "sections": {
+                    "s1": onboarding_data.get("s1", {}),
+                    "s2": onboarding_data.get("s2", {}),
+                    "s3": onboarding_data.get("s3", {}),
+                    "s4": onboarding_data.get("s4", {}),
+                    "s5": onboarding_data.get("s5", {}),
+                    "s6": onboarding_data.get("s6", {}),
+                    "s_track": onboarding_data.get("s_track", {}),
+                    "s7": onboarding_data.get("s7", {}),
+                    "s8": onboarding_data.get("s8", {}),
+                },
                 "evidence": evidence,
                 "confidence": "high" if evidence.get("live_verified") else "medium",
             }
