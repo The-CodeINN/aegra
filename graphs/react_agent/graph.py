@@ -13,7 +13,6 @@ from anthropic.types.beta import (
 )
 from langchain.agents import create_agent
 from langchain.tools import tool as lc_tool
-from langchain_anthropic import ChatAnthropic
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.config import get_stream_writer
@@ -21,6 +20,8 @@ from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
 
 from react_agent.context import Context
+from react_agent.message_utils import sanitize_messages_for_anthropic
+from react_agent.sanitized_anthropic import SanitizedChatAnthropic
 from react_agent.state import InputState, State
 from react_agent.tools import TOOLS
 from react_agent.utils import get_message_text, load_chat_model
@@ -119,7 +120,7 @@ def _build_runtime_model(runtime: Runtime[Context]) -> Any:
         if betas:
             model_kwargs["betas"] = betas
 
-        return ChatAnthropic(**model_kwargs)
+        return SanitizedChatAnthropic(**model_kwargs)
 
     return load_chat_model(
         runtime.context.model,
@@ -149,7 +150,10 @@ async def _invoke_integrated_agent(state: State, runtime: Runtime[Context], syst
         system_prompt=system_message,
     )
 
-    result = await agent.ainvoke({"messages": list(state.messages)})
+    # Sanitize messages for Anthropic compatibility (removes problematic fields like index from tool_search_tool_result)
+    sanitized_messages = sanitize_messages_for_anthropic(list(state.messages))
+
+    result = await agent.ainvoke({"messages": sanitized_messages})
     messages = result.get("messages", [])
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
