@@ -137,7 +137,7 @@ async def _lms_profile(lms_url: str, token: str) -> dict[str, Any]:
 async def _lms_onboarding(lms_url: str, token: str) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {token}", "accept": "*/*"}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(f"{lms_url.rstrip('/')}/api/v1/onboarding", headers=headers)
+        response = await client.get(f"{lms_url.rstrip('/')}/api/v1/ai-mentor/onboarding/me", headers=headers)
         response.raise_for_status()
         payload = response.json()
     return payload if isinstance(payload, dict) else {}
@@ -262,6 +262,10 @@ async def main() -> int:
         learning_track = _pick(subscription, "track")
         if not isinstance(learning_track, str) or not learning_track.strip():
             learning_track = _pick(onboard, "learningTrack")
+        if (not isinstance(learning_track, str) or not learning_track.strip()) and isinstance(onboard, dict):
+            s1 = onboard.get("s1", {})
+            if isinstance(s1, dict):
+                learning_track = _pick(s1, "learningTrack")
         learning_track = learning_track.strip() if isinstance(learning_track, str) else None
 
         enrolled_titles: list[str] = []

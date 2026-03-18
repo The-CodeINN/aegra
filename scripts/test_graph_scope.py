@@ -169,7 +169,7 @@ async def fetch_profile(token: str) -> dict[str, Any]:
 
 async def fetch_onboarding(token: str) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{LMS_URL}/api/v1/onboarding", headers={"Authorization": f"Bearer {token}"})
+        r = await client.get(f"{LMS_URL}/api/v1/ai-mentor/onboarding/me", headers={"Authorization": f"Bearer {token}"})
         r.raise_for_status()
         return r.json()
 
@@ -246,6 +246,9 @@ async def gather_student_data(email: str, password: str) -> StudentData:
     onboarding_data = await fetch_onboarding(token)
     onboarding = onboarding_data.get("onboarding", {}) if isinstance(onboarding_data, dict) else {}
     onboarding_track = onboarding.get("learningTrack") if isinstance(onboarding, dict) else None
+    if (not isinstance(onboarding_track, str) or not onboarding_track.strip()) and isinstance(onboarding, dict):
+        s1 = onboarding.get("s1", {})
+        onboarding_track = s1.get("learningTrack") if isinstance(s1, dict) else None
     print(f"  [OK] Onboarding track: {onboarding_track or 'N/A'}")
 
     # Subscription

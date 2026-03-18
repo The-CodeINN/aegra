@@ -364,7 +364,7 @@ async def get_student_onboarding() -> dict[str, Any]:
 
     # Get LMS API URL from context
     lms_url = runtime.context.lms_api_url
-    onboarding_endpoint = f"{lms_url}/api/v1/onboarding"
+    onboarding_endpoint = f"{lms_url}/api/v1/ai-mentor/onboarding/me"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:

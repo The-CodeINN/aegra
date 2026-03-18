@@ -28,6 +28,7 @@ logger = structlog.getLogger(__name__)
 
 # Cache TTL in seconds (1 hour)
 LEARNING_TRACK_CACHE_TTL = 3600
+NEGATIVE_TRACK_CACHE_TTL = 60
 
 # In-memory cache fallback (user_id -> (learning_track, expiry_timestamp))
 _memory_cache: dict[str, tuple[str | None, float]] = {}
@@ -95,7 +96,7 @@ async def _set_in_memory(user_id: str, track: str | None) -> None:
         _memory_cache[user_id] = (track, expiry)
 
 
-async def _fetch_track_from_subscription(token: str) -> str | None:
+async def _fetch_track_from_subscription(token: str) -> tuple[str | None, bool]:
     """Fetch the student's active subscription track from the LMS API."""
     subscription_endpoint = f"{LMS_API_URL}/api/v1/subscription/me"
 
@@ -110,17 +111,17 @@ async def _fetch_track_from_subscription(token: str) -> str | None:
 
             learning_track = cast(str | None, data.get("track"))
             logger.info("Fetched subscription track from LMS", learning_track=learning_track)
-            return learning_track
+            return learning_track, True
 
     except httpx.HTTPStatusError as e:
         logger.warning("HTTP error fetching subscription track", status_code=e.response.status_code)
-        return None
+        return None, False
     except httpx.TimeoutException:
         logger.warning("Timeout while fetching subscription track")
-        return None
+        return None, False
     except Exception as e:
         logger.warning("Unexpected error fetching subscription track", error=str(e))
-        return None
+        return None, False
 
 
 async def check_ai_mentor_addon(token: str) -> dict:
@@ -151,17 +152,17 @@ async def check_ai_mentor_addon(token: str) -> dict:
         return {"active": False, "expires_at": None}
 
 
-async def _fetch_learning_track_from_lms(token: str) -> str | None:
+async def _fetch_learning_track_from_lms(token: str) -> tuple[str | None, bool]:
     """Fetch the student's learning track from the LMS API.
 
     Active subscription is the source of truth. Onboarding is a fallback for
     accounts without an active track assignment yet.
     """
-    subscription_track = await _fetch_track_from_subscription(token)
+    subscription_track, subscription_ok = await _fetch_track_from_subscription(token)
     if subscription_track:
-        return subscription_track
+        return subscription_track, True
 
-    onboarding_endpoint = f"{LMS_API_URL}/api/v1/onboarding"
+    onboarding_endpoint = f"{LMS_API_URL}/api/v1/ai-mentor/onboarding/me"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -172,22 +173,29 @@ async def _fetch_learning_track_from_lms(token: str) -> str | None:
             response.raise_for_status()
             data = response.json()
 
-            # Extract learning track from onboarding data
+            # Extract learning track from onboarding data.
             onboarding_data = data.get("onboarding", {})
-            learning_track = cast(str | None, onboarding_data.get("learningTrack"))
+            sec1 = onboarding_data.get("s1", {}) if isinstance(onboarding_data, dict) else {}
+            learning_track = cast(
+                str | None,
+                onboarding_data.get("learningTrack") if isinstance(onboarding_data, dict) else None,
+            ) or cast(str | None, sec1.get("learningTrack") if isinstance(sec1, dict) else None)
 
             logger.info("Fetched learning track from LMS", learning_track=learning_track)
-            return learning_track
+            return learning_track, True
 
     except httpx.HTTPStatusError as e:
         logger.error("HTTP error fetching learning track", status_code=e.response.status_code)
-        return None
+        return None, False
     except httpx.TimeoutException:
         logger.error("Timeout while fetching learning track")
-        return None
+        return None, False
     except Exception as e:
         logger.error("Unexpected error fetching learning track", error=str(e))
-        return None
+        return None, False
+
+    # If subscription lookup itself failed, treat this as non-cacheable failure.
+    return None, subscription_ok
 
 
 async def get_cached_learning_track(user_id: str, token: str) -> str | None:
@@ -221,12 +229,18 @@ async def get_cached_learning_track(user_id: str, token: str) -> str | None:
 
     # Cache miss - fetch from LMS
     logger.info("Learning track cache miss, fetching from LMS", user_id=user_id)
-    learning_track = await _fetch_learning_track_from_lms(token)
+    learning_track, cacheable = await _fetch_learning_track_from_lms(token)
 
-    # Cache the result (even if None, to avoid repeated failed lookups)
-    cache_value = learning_track if learning_track else "__none__"
-    await _set_in_redis(cache_key, cache_value)
-    await _set_in_memory(user_id, learning_track)
+    if learning_track:
+        await _set_in_redis(cache_key, learning_track)
+        await _set_in_memory(user_id, learning_track)
+    elif cacheable:
+        # Keep negative cache short to reduce staleness after user updates.
+        await _set_in_redis(cache_key, "__none__", ttl=NEGATIVE_TRACK_CACHE_TTL)
+        await _set_in_memory(user_id, None)
+    else:
+        # Skip caching transient failures (timeouts, auth errors, upstream outage).
+        return None
 
     return learning_track
 
