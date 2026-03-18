@@ -50,7 +50,7 @@ def _normalize_auth_token(token: str | None) -> str | None:
 
     Accepts raw JWT or a mistakenly prefixed value like "Bearer <jwt>".
     """
-    if not token or not isinstance(token, str):
+    if not token:
         return None
 
     cleaned = token.strip()
