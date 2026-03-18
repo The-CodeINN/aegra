@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from typing import Any
 
@@ -182,25 +183,52 @@ async def invalidate_lms_cache(user_id: str, paths: list[str] | None = None) -> 
             "/api/v1/enrollment/{courseId}/structure",
             "/api/v1/enrollment/{courseId}/progress",
             "/api/v1/enrollment/{studentId}/attempts",
-            "/api/v1/onboarding",
+            "/api/v1/ai-mentor/onboarding/me",
+            "/api/v1/ai-mentor/onboarding/status",
+            "/api/v1/ai-mentor/onboarding/mentor-payload",
             "/api/v1/subscription/me",
             "/api/v1/ai-mentor/onboarding/section-1",
             "/api/v1/ai-mentor/onboarding/section-2",
+            "/api/v1/ai-mentor/onboarding/section-3",
             "/api/v1/ai-mentor/onboarding/section-4",
             "/api/v1/ai-mentor/onboarding/section-5",
             "/api/v1/ai-mentor/onboarding/section-6",
+            "/api/v1/ai-mentor/onboarding/section-track",
             "/api/v1/ai-mentor/onboarding/section-7",
             "/api/v1/ai-mentor/onboarding/section-8",
-            "/api/v1/ai-mentor/onboarding/me",
+            "/api/v1/ai-mentor/onboarding/track",
         ]
 
     keys = [_cache_key(user_id, p) for p in paths]
+    template_patterns = []
+    for p in paths:
+        escaped = re.escape(p)
+        # Convert template placeholders like {courseId} into segment wildcards.
+        escaped = re.sub(r"\\\{[^\\}]+\\\}", r"[^/]+", escaped)
+        template_patterns.append(re.compile(rf"^{escaped}$"))
+
+    user_prefix = f"lms:{user_id}:"
+
+    def _key_matches_templates(cache_key: str) -> bool:
+        if not cache_key.startswith(user_prefix):
+            return False
+        endpoint_path = cache_key[len(user_prefix) :]
+        return any(pattern.match(endpoint_path) for pattern in template_patterns)
 
     # Redis
     if redis_manager.is_available():
         try:
             client = redis_manager.get_client()
             await client.delete(*keys)
+
+            # Also clear concrete keys that match templated paths (e.g. {courseId}).
+            dynamic_keys: list[str] = []
+            async for raw_key in client.scan_iter(match=f"{user_prefix}*"):
+                key_str = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else str(raw_key)
+                if _key_matches_templates(key_str):
+                    dynamic_keys.append(key_str)
+            if dynamic_keys:
+                await client.delete(*dynamic_keys)
         except Exception as exc:
             logger.debug("lms_cache_invalidate_redis_error", error=str(exc))
 
@@ -208,5 +236,8 @@ async def invalidate_lms_cache(user_id: str, paths: list[str] | None = None) -> 
     async with _cache_lock:
         for k in keys:
             _mem_cache.pop(k, None)
+        for mem_key in list(_mem_cache.keys()):
+            if _key_matches_templates(mem_key):
+                _mem_cache.pop(mem_key, None)
 
     logger.info("lms_cache_invalidated", user_id=user_id, paths=paths)
