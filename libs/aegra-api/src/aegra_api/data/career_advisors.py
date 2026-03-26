@@ -12,7 +12,7 @@ CAREER_ADVISORS: list[dict[str, Any]] = [
     {
         "id": "1",
         "track": "data-analytics",
-        "name": "Alex Chen",
+        "name": "Alexandra Chen",
         "title": "Data Analytics Career Advisor",
         "experience": "20+ years",
         "personality": "Approachable, practical, and results-oriented with a passion for translating technical concepts into business value",
@@ -76,8 +76,8 @@ CAREER_ADVISORS: list[dict[str, Any]] = [
     {
         "id": "4",
         "track": "ai-engineering",
-        "name": "Sofia Rodriguez",
-        "title": "AI Engineering Career Advisor",
+        "name": "David Rodriguez",
+        "title": "AI/LLM Engineering Career Advisor",
         "experience": "9+ years",
         "personality": "Forward-thinking and innovative, balances enthusiasm for AI with practical implementation, systematic approach to complexity",
         "expertise_areas": [
@@ -135,7 +135,7 @@ def get_advisor_by_track(track: str) -> dict[str, Any] | None:
 
 
 def get_default_advisor() -> dict[str, Any]:
-    """Get the default advisor (Data Analytics - Alex Chen).
+    """Get the default advisor (Data Analytics - Alexandra Chen).
 
     Used when no specific track is assigned or track is unknown.
     """
