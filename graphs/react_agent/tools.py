@@ -1055,6 +1055,151 @@ async def read_webpage(url: str) -> dict[str, Any]:
         }
 
 
+async def get_portfolio_projects() -> dict[str, Any]:
+    """Get the student's submitted project history from the LMS.
+
+    Uses the canonical student submissions endpoint exposed by the LMS.
+    This gives the advisor real project evidence to reference when checking
+    portfolio coherence across modules.
+    """
+    runtime = get_runtime(Context)
+
+    token = _normalize_auth_token(runtime.context.user_token)
+    if not token:
+        logger.error("No user token available in context")
+        return {
+            "error": "Authentication required",
+            "message": "Unable to fetch project submissions without authentication token",
+        }
+
+    lms_url = runtime.context.lms_api_url.rstrip("/")
+    endpoint = f"{lms_url}/api/v1/courses/projects/my-submissions"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                endpoint,
+                headers={"accept": "application/json", "Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+            data: dict[str, Any] | list[dict[str, Any]] = resp.json()
+            submissions: list[dict[str, Any]]
+            if isinstance(data, dict):
+                if isinstance(data.get("submissions"), list):
+                    submissions = data["submissions"]
+                elif isinstance(data.get("data"), list):
+                    submissions = data["data"]
+                elif isinstance(data.get("projects"), list):
+                    submissions = data["projects"]
+                else:
+                    submissions = []
+            else:
+                submissions = data
+            logger.info(f"Fetched {len(submissions)} project submissions")
+            return {
+                "ok": True,
+                "submissions": submissions,
+                "count": len(submissions),
+                "sourceEndpoint": "/api/v1/courses/projects/my-submissions",
+            }
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error fetching project submissions: {e.response.status_code}")
+        return {
+            "error": "API request failed",
+            "status_code": e.response.status_code,
+            "message": str(e),
+        }
+    except httpx.TimeoutException:
+        logger.error("Timeout while fetching project submissions")
+        return {
+            "error": "Request timeout",
+            "message": "The LMS API took too long to respond",
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error fetching project submissions: {e}", exc_info=True)
+        return {"error": "Unexpected error", "message": str(e)}
+
+
+async def review_project_submission(
+    submission_id: str,
+    feedback: str,
+    reviewed: bool = True,
+) -> dict[str, Any]:
+    """Review a student's submitted project via the LMS admin route.
+
+    This tool must use the admin token because the backing LMS endpoint is
+    restricted to admin users. Use it after preparing the structured review so
+    the review is persisted against the student's submission record.
+    """
+    runtime = get_runtime(Context)
+
+    try:
+        from aegra_api.services.admin_auth import admin_token_manager
+
+        token = await admin_token_manager.get_token()
+    except Exception as exc:
+        logger.error(f"Failed to obtain admin token: {exc}")
+        return {
+            "error": "Authentication required",
+            "message": "Unable to review project submission without admin authentication token",
+        }
+
+    if not submission_id.strip():
+        return {
+            "error": "Invalid submission ID",
+            "message": "submission_id is required",
+        }
+
+    if not feedback.strip():
+        return {
+            "error": "Invalid feedback",
+            "message": "feedback is required",
+        }
+
+    lms_url = runtime.context.lms_api_url.rstrip("/")
+    endpoint = f"{lms_url}/api/v1/courses/projects/review/{submission_id}"
+    payload = {"feedback": feedback.strip(), "reviewed": reviewed}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.patch(
+                endpoint,
+                json=payload,
+                headers={
+                    "accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+            )
+            resp.raise_for_status()
+            data: dict[str, Any] = resp.json()
+            logger.info(f"Reviewed project submission: {submission_id}")
+            return {
+                "ok": True,
+                "submissionId": submission_id,
+                "review": data,
+                "sourceEndpoint": "/api/v1/courses/projects/review/{submissionId}",
+            }
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error reviewing project submission: {e.response.status_code}")
+        return {
+            "error": "API request failed",
+            "status_code": e.response.status_code,
+            "message": str(e),
+        }
+    except httpx.TimeoutException:
+        logger.error("Timeout while reviewing project submission")
+        return {
+            "error": "Request timeout",
+            "message": "The LMS API took too long to respond",
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error reviewing project submission: {e}", exc_info=True)
+        return {"error": "Unexpected error", "message": str(e)}
+
+
 # Build tools list dynamically based on availability
 TOOLS: list[Callable[..., Any]] = [
     # search,
@@ -1070,6 +1215,8 @@ TOOLS: list[Callable[..., Any]] = [
     get_course_progress,
     get_student_attempts,
     get_subscription_state,
+    get_portfolio_projects,
+    review_project_submission,
     get_user_memory,
     save_user_memory,
     search_user_memories,

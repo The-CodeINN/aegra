@@ -4,6 +4,8 @@ This module provides tools for reading and writing user-specific long-term memor
 using LangGraph's persistence layer.
 """
 
+import hashlib
+import json
 import logging
 from typing import Any
 
@@ -12,6 +14,32 @@ from langgraph.runtime import get_runtime
 from react_agent.context import Context
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MEMORY_NAMESPACE = "memories"
+
+
+def get_user_memory_namespace(user_id: str) -> tuple[str, str]:
+    """Return the standard LangGraph store namespace for a user's memories."""
+    return (user_id, DEFAULT_MEMORY_NAMESPACE)
+
+
+def make_memory_key(category: str, text: str) -> str:
+    """Build a deterministic key so repeated memories overwrite instead of ballooning."""
+    normalized = f"{category}:{text.strip().lower()}"
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+    return f"{category}:{digest}"
+
+
+def format_memory_value(value: dict[str, Any]) -> str | None:
+    """Convert a stored memory value into a compact string for prompt injection."""
+    for field in ("text", "fact", "summary", "goal", "value"):
+        field_value = value.get(field)
+        if isinstance(field_value, str) and field_value.strip():
+            return field_value.strip()
+
+    if value:
+        return json.dumps(value, ensure_ascii=True, sort_keys=True)
+    return None
 
 
 async def get_user_memory(memory_key: str) -> dict[str, Any]:
@@ -50,7 +78,7 @@ async def get_user_memory(memory_key: str) -> dict[str, Any]:
             "message": "Cannot retrieve memory without authentication",
         }
 
-    namespace = (user_id, "memories")
+    namespace = get_user_memory_namespace(user_id)
 
     try:
         logger.info(f"Retrieving memory for user {user_id}, key: {memory_key}")
@@ -97,7 +125,7 @@ async def save_user_memory(memory_key: str, memory_data: dict[str, Any]) -> str:
         logger.warning("No user_id in context, user not authenticated")
         return "Error: User not authenticated. Cannot save memory without authentication."
 
-    namespace = (user_id, "memories")
+    namespace = get_user_memory_namespace(user_id)
 
     try:
         logger.info(f"Saving memory for user {user_id}, key: {memory_key}")
@@ -147,13 +175,16 @@ async def search_user_memories(query: str) -> list[dict[str, Any]]:
             }
         ]
 
-    namespace = (user_id, "memories")
+    namespace = get_user_memory_namespace(user_id)
 
     try:
         logger.info(f"Searching memories for user {user_id}, query: {query}")
 
-        # Search memories using semantic search
-        results = await store.asearch(namespace, query=query, limit=5)
+        try:
+            results = await store.asearch(namespace, query=query, limit=5)
+        except Exception as exc:
+            logger.warning(f"Semantic memory search failed, falling back to recent memories: {exc}")
+            results = await store.asearch(namespace, limit=5)
 
         memories = []
         for item in results:

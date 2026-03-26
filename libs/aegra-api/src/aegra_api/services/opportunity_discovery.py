@@ -746,10 +746,10 @@ class OpportunityDiscoveryEngine:
     async def generate_networking_strategy(self, opportunity: dict[str, Any], user_track: str) -> dict[str, Any] | None:
         """Generate a personalised networking strategy for an event."""
         try:
+            from langchain_anthropic import ChatAnthropic
             from langchain_core.messages import HumanMessage, SystemMessage
-            from langchain_openai import ChatOpenAI
 
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, max_tokens=500, request_timeout=12)
+            llm = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0.7, max_tokens=500, timeout=12)
             messages = [
                 SystemMessage(
                     content=(
@@ -785,10 +785,10 @@ class OpportunityDiscoveryEngine:
     ) -> dict[str, Any] | None:
         """Generate AI application strategy for a job opportunity."""
         try:
+            from langchain_anthropic import ChatAnthropic
             from langchain_core.messages import HumanMessage, SystemMessage
-            from langchain_openai import ChatOpenAI
 
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, max_tokens=500, request_timeout=12)
+            llm = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0.7, max_tokens=500, timeout=12)
             messages = [
                 SystemMessage(
                     content=(
