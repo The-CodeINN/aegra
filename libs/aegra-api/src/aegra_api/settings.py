@@ -91,12 +91,13 @@ class AppSettings(EnvBase):
     # Custom LMS Integration
     LMS_JWT_SECRET: str | None = None
     LMS_URL: str = "http://localhost:3000"
-    ADMIN_TOKEN: str | None = None
+    ADMIN_EMAIL_ADDRESS: str | None = None
+    ADMIN_PASSWORD: str | None = None
     MONGODB_URI: str | None = None
     MONGODB_DB_NAME: str | None = None
 
     # Title Generator
-    TITLE_GENERATOR_MODEL: str = "openai/gpt-4o-mini"
+    TITLE_GENERATOR_MODEL: str = "anthropic/claude-haiku-4-5-20251001"
 
 
 class DatabaseSettings(EnvBase):

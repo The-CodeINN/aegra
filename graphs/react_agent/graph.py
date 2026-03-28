@@ -3,6 +3,8 @@
 Works with a chat model with tool calling support.
 """
 
+import json
+import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -14,12 +16,14 @@ from anthropic.types.beta import (
 from langchain.agents import create_agent
 from langchain.tools import tool as lc_tool
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 from langgraph.config import get_stream_writer
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
 
 from react_agent.context import Context
+from react_agent.memory import format_memory_value, get_user_memory_namespace, make_memory_key
 from react_agent.message_utils import sanitize_messages_for_anthropic
 from react_agent.sanitized_anthropic import SanitizedChatAnthropic
 from react_agent.state import InputState, State
@@ -44,10 +48,19 @@ _PROGRAMMATIC_SAFE_TOOLS = {
     "get_course_progress",
     "get_student_attempts",
     "get_subscription_state",
+    "get_portfolio_projects",
+    "review_project_submission",
     "search_course_content",
     "get_user_memory",
     "search_user_memories",
 }
+
+_TRIM_MAX_TOKENS = 8000
+_SUMMARY_TRIGGER_MESSAGES = 14
+_SUMMARY_KEEP_RECENT = 8
+_SUMMARY_MIN_NEW_MESSAGES = 4
+_LONG_TERM_RECALL_LIMIT = 4
+_LONG_TERM_STORE_LIMIT = 3
 
 
 def _is_anthropic_model(model_name: str) -> bool:
@@ -141,7 +154,230 @@ def _build_runtime_tools(runtime: Runtime[Context]) -> list[Any]:
     return list(TOOLS)
 
 
-async def _invoke_integrated_agent(state: State, runtime: Runtime[Context], system_message: str) -> AIMessage:
+def _latest_human_text(messages: list[AnyMessage]) -> str:
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            return get_message_text(message).strip()
+    return ""
+
+
+def _message_role(message: AnyMessage) -> str:
+    message_type = getattr(message, "type", message.__class__.__name__).lower()
+    if message_type == "human":
+        return "User"
+    if message_type == "ai":
+        return "Advisor"
+    if message_type == "tool":
+        return "Tool"
+    return message_type.title()
+
+
+def _clean_json_block(raw_text: str) -> str:
+    stripped = raw_text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    match = re.search(r"(\[.*\])", stripped, re.DOTALL)
+    return match.group(1) if match else stripped
+
+
+def _should_extract_memories(user_text: str) -> bool:
+    normalized = user_text.lower()
+    if len(normalized.strip()) < 24:
+        return False
+    triggers = (
+        "i am ",
+        "i'm ",
+        "my goal",
+        "i want",
+        "i need",
+        "i prefer",
+        "i like",
+        "i work",
+        "i worked",
+        "my background",
+        "my experience",
+        "remember",
+        "i have",
+    )
+    return any(trigger in normalized for trigger in triggers)
+
+
+async def _recall_long_term_memories(state: State, runtime: Runtime[Context]) -> list[str]:
+    store = runtime.store
+    user_id = runtime.context.user_id
+    query = _latest_human_text(list(state.messages))
+
+    if not store or not user_id or not query:
+        return []
+
+    namespace = get_user_memory_namespace(user_id)
+
+    try:
+        try:
+            results = await store.asearch(namespace, query=query, limit=_LONG_TERM_RECALL_LIMIT)
+        except Exception:
+            results = await store.asearch(namespace, limit=_LONG_TERM_RECALL_LIMIT)
+    except Exception:
+        return []
+
+    recalled: list[str] = []
+    for item in results:
+        if isinstance(item.value, dict):
+            rendered = format_memory_value(item.value)
+            if rendered:
+                recalled.append(rendered)
+    return recalled[:_LONG_TERM_RECALL_LIMIT]
+
+
+async def _maybe_refresh_summary(state: State, runtime: Runtime[Context]) -> tuple[str, int]:
+    messages = list(state.messages)
+    existing_summary = state.conversation_summary.strip()
+    already_summarized = state.summary_message_count
+
+    if len(messages) < _SUMMARY_TRIGGER_MESSAGES:
+        return existing_summary, already_summarized
+
+    candidate_count = max(0, len(messages) - _SUMMARY_KEEP_RECENT)
+    if candidate_count <= already_summarized:
+        return existing_summary, already_summarized
+    if candidate_count - already_summarized < _SUMMARY_MIN_NEW_MESSAGES:
+        return existing_summary, already_summarized
+
+    transcript_lines = []
+    for message in messages[:candidate_count]:
+        content = get_message_text(message).strip()
+        if content:
+            transcript_lines.append(f"{_message_role(message)}: {content}")
+
+    if not transcript_lines:
+        return existing_summary, already_summarized
+
+    model = _build_runtime_model(runtime)
+    summary_prompt = (
+        "You maintain a running short-term memory summary for a career mentor. "
+        "Summarize only durable conversational context: the student's goals, background, "
+        "constraints, current projects, blockers, and important commitments. "
+        "Keep it under 220 words and avoid fluff.\n\n"
+    )
+    if existing_summary:
+        summary_prompt += f"Existing summary:\n{existing_summary}\n\n"
+    summary_prompt += "Conversation segment to summarize:\n" + "\n".join(transcript_lines)
+
+    response = await model.ainvoke(
+        [
+            {"role": "system", "content": "Return only the updated summary text."},
+            {"role": "user", "content": summary_prompt},
+        ]
+    )
+    new_summary = get_message_text(response).strip()
+    return (new_summary or existing_summary), candidate_count
+
+
+def _augment_system_prompt(system_message: str, conversation_summary: str, long_term_memories: list[str]) -> str:
+    blocks: list[str] = []
+
+    if conversation_summary:
+        blocks.append(
+            f"<short_term_memory>\nRunning summary of this thread:\n{conversation_summary}\n</short_term_memory>"
+        )
+
+    if long_term_memories:
+        rendered_memories = "\n".join(f"- {memory}" for memory in long_term_memories)
+        blocks.append(
+            "<long_term_memory>\n"
+            "Recalled user memories from prior conversations. Use them when relevant, but if the user "
+            "corrects or contradicts any memory, prefer the new information immediately.\n"
+            f"{rendered_memories}\n"
+            "</long_term_memory>"
+        )
+
+    if not blocks:
+        return system_message
+    return system_message + "\n\n" + "\n\n".join(blocks)
+
+
+def _prepare_messages_for_model(state: State, summary_available: bool) -> list[AnyMessage]:
+    messages = list(state.messages)
+    if summary_available and len(messages) > _SUMMARY_KEEP_RECENT:
+        messages = messages[-_SUMMARY_KEEP_RECENT:]
+
+    trimmed = trim_messages(
+        messages,
+        strategy="last",
+        token_counter=count_tokens_approximately,
+        max_tokens=_TRIM_MAX_TOKENS,
+        start_on="human",
+        end_on=("human", "tool"),
+        include_system=False,
+        allow_partial=False,
+    )
+    return list(trimmed)
+
+
+async def _persist_long_term_memories(state: State, runtime: Runtime[Context], response: AIMessage) -> None:
+    store = runtime.store
+    user_id = runtime.context.user_id
+    user_text = _latest_human_text(list(state.messages))
+
+    if not store or not user_id or not _should_extract_memories(user_text):
+        return
+
+    model = _build_runtime_model(runtime)
+    extraction_prompt = (
+        "Extract durable long-term memories from the user's message for a career mentor. "
+        "Only include stable facts, preferences, goals, background, constraints, or project history that "
+        "will matter in future conversations. Ignore transient requests and anything not explicitly stated. "
+        "Return strict JSON as an array of objects with keys 'category' and 'text'. If nothing should be "
+        "stored, return [].\n\n"
+        f"User message:\n{user_text}\n\n"
+        f"Assistant reply for context:\n{get_message_text(response).strip()}"
+    )
+
+    raw_result = await model.ainvoke(
+        [
+            {"role": "system", "content": "Return only valid JSON."},
+            {"role": "user", "content": extraction_prompt},
+        ]
+    )
+    raw_text = _clean_json_block(get_message_text(raw_result))
+
+    try:
+        candidates = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return
+
+    if not isinstance(candidates, list):
+        return
+
+    namespace = get_user_memory_namespace(user_id)
+    stored = 0
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        category = str(candidate.get("category", "note")).strip().lower() or "note"
+        text = str(candidate.get("text", "")).strip()
+        if not text:
+            continue
+        key = make_memory_key(category, text)
+        await store.aput(
+            namespace,
+            key,
+            {
+                "category": category,
+                "text": text,
+                "source": "auto",
+                "captured_at": datetime.now(tz=UTC).isoformat(),
+            },
+        )
+        stored += 1
+        if stored >= _LONG_TERM_STORE_LIMIT:
+            break
+
+
+async def _invoke_integrated_agent(
+    messages: list[AnyMessage], runtime: Runtime[Context], system_message: str
+) -> AIMessage:
     """Invoke a single integrated LangChain agent runtime for all providers."""
     agent = create_agent(
         model=_build_runtime_model(runtime),
@@ -151,7 +387,7 @@ async def _invoke_integrated_agent(state: State, runtime: Runtime[Context], syst
     )
 
     # Sanitize messages for Anthropic compatibility (removes problematic fields like index from tool_search_tool_result)
-    sanitized_messages = sanitize_messages_for_anthropic(list(state.messages))
+    sanitized_messages = sanitize_messages_for_anthropic(messages)
 
     result = await agent.ainvoke({"messages": sanitized_messages})
     messages = result.get("messages", [])
@@ -179,8 +415,14 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, list[
     """
     # Format the system prompt. Customize this to change the agent's behavior.
     system_message = runtime.context.system_prompt.format(system_time=datetime.now(tz=UTC).isoformat())
+    conversation_summary, summary_message_count = await _maybe_refresh_summary(state, runtime)
+    recalled_memories = await _recall_long_term_memories(state, runtime)
+    system_message = _augment_system_prompt(system_message, conversation_summary, recalled_memories)
+    prepared_messages = _prepare_messages_for_model(state, summary_available=bool(conversation_summary))
 
-    response = await _invoke_integrated_agent(state, runtime, system_message)
+    response = await _invoke_integrated_agent(prepared_messages, runtime, system_message)
+
+    await _persist_long_term_memories(state, runtime, response)
 
     # Handle the case when it's the last step and the model still wants to use a tool
     if state.is_last_step and response.tool_calls:
@@ -194,7 +436,12 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, list[
         }
 
     # Return the model's response as a list to be added to existing messages
-    return {"messages": [response]}
+    updates: dict[str, Any] = {"messages": [response]}
+    if conversation_summary != state.conversation_summary:
+        updates["conversation_summary"] = conversation_summary
+    if summary_message_count != state.summary_message_count:
+        updates["summary_message_count"] = summary_message_count
+    return updates
 
 
 async def generate_thread_title(state: State, runtime: Runtime[Context]) -> dict:

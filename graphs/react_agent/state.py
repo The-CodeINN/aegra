@@ -82,3 +82,15 @@ class State(InputState):
     Set once after the first complete exchange and never changed again.
     Exposed to the frontend via the thread state values.
     """
+
+    conversation_summary: str = field(default="")
+    """
+    Running short-term summary of the conversation.
+    Used to preserve older context without sending the full thread to the model.
+    """
+
+    summary_message_count: int = field(default=0)
+    """
+    Number of messages already incorporated into ``conversation_summary``.
+    Prevents re-summarizing the same span on every turn.
+    """

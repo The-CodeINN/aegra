@@ -73,7 +73,7 @@ async def generate_thread_title(user_message: str, model_name: str | None = None
         if "/" in model_name:
             provider, model = model_name.split("/", maxsplit=1)
         else:
-            provider = "openai"
+            provider = "anthropic"
             model = model_name
 
         llm = init_chat_model(model, model_provider=provider)

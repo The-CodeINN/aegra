@@ -20,9 +20,7 @@ from aegra_api.services.opportunity_discovery import opportunity_engine  # noqa:
 from aegra_api.services.scheduler import scheduler_service  # noqa: E402
 from aegra_api.settings import settings  # noqa: E402
 
-# Propagate OPENAI_API_KEY from .env into os.environ so langchain_openai picks it up
-if settings.discovery.OPENAI_API_KEY and not os.environ.get("OPENAI_API_KEY"):
-    os.environ["OPENAI_API_KEY"] = settings.discovery.OPENAI_API_KEY
+# ANTHROPIC_API_KEY is read directly from environment (set in .env)
 
 USER_ID = "68c30006cc08c47f660b1941"
 USER_EMAIL = "emijere.richard@gmail.com"

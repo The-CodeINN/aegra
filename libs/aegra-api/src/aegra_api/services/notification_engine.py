@@ -190,8 +190,8 @@ class NotificationEngine:
         persona = ADVISOR_PERSONAS.get(persona_name or DEFAULT_PERSONA, ADVISOR_PERSONAS[DEFAULT_PERSONA])
 
         try:
+            from langchain_anthropic import ChatAnthropic
             from langchain_core.messages import HumanMessage, SystemMessage
-            from langchain_openai import ChatOpenAI
 
             # Build context-aware system prompt with StudentProfile data
             ctx_parts = []
@@ -207,7 +207,7 @@ class NotificationEngine:
 
             context_str = "\n".join(ctx_parts) if ctx_parts else "No additional context."
 
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, max_tokens=200)
+            llm = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0.7, max_tokens=200)
             resp = await llm.ainvoke(
                 [
                     SystemMessage(

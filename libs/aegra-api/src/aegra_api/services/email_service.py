@@ -10,6 +10,7 @@ from __future__ import annotations
 import httpx
 import structlog
 
+from aegra_api.services.admin_auth import admin_token_manager
 from aegra_api.services.lms_cache import cached_lms_fetch
 from aegra_api.settings import settings
 
@@ -31,10 +32,14 @@ def _extract_contact(payload: dict) -> dict[str, str]:
 
 async def resolve_student_contact(user_id: str, auth_token: str | None = None) -> dict[str, str]:
     """Resolve a student's first name and email from the LMS."""
-    token = auth_token or settings.app.ADMIN_TOKEN
     lms_url = settings.app.LMS_URL
+    if not lms_url:
+        return {}
 
-    if not token or not lms_url:
+    try:
+        token = auth_token or await admin_token_manager.get_token()
+    except Exception as exc:
+        logger.warning("resolve_student_contact_no_token", user_id=user_id, error=str(exc))
         return {}
 
     client = httpx.AsyncClient()
