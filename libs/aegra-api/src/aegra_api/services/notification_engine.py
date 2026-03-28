@@ -688,7 +688,8 @@ class NotificationEngine:
         if not user_prefs.get("email_enabled", True):
             return
 
-        # Get student email from context
+        # Get student email from context; fall back to LMS lookup if not present
+        # (JWT tokens from the LMS do not carry the email field, so we must resolve it)
         student_email = None
         student_name = ""
         if student_context:
@@ -696,6 +697,18 @@ class NotificationEngine:
             student_name = student_context.get("first_name", "")
 
         if not student_email:
+            # Also check preferences cache (set by the preferences PUT endpoint)
+            student_email = user_prefs.get("user_email")
+            if not student_email:
+                from aegra_api.services.email_service import resolve_student_contact
+
+                contact = await resolve_student_contact(user_id)
+                student_email = contact.get("email")
+                if not student_name:
+                    student_name = contact.get("first_name", "")
+
+        if not student_email:
+            logger.debug("email_skipped_no_address", user_id=user_id, category=category)
             return
 
         subject = f"[DeDataHub] {title}"
