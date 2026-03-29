@@ -130,7 +130,7 @@ def build_notification_email(
             label = btn.get("title", "View")
             if not url.startswith("http"):
                 # Make relative URLs absolute
-                url = f"https://app.dedatahub.com{url}"
+                url = f"https://dedatahub.io{url}"
             btns.append(
                 f'<a href="{url}" style="display:inline-block;padding:12px 24px;'
                 f"background-color:{accent};color:#ffffff;text-decoration:none;"
@@ -166,7 +166,7 @@ def build_notification_email(
         <tr><td style="background-color:#f9fafb;padding:16px 32px;text-align:center;">
           <p style="color:#9ca3af;font-size:12px;margin:0;">
             You received this because you have email notifications enabled on DeDataHub.
-            <a href="https://app.dedatahub.com/dashboard/settings" style="color:#876EFF;">Manage preferences</a>
+            <a href="https://dedatahub.io/dashboard/settings" style="color:#876EFF;">Manage preferences</a>
           </p>
         </td></tr>
       </table>
@@ -182,7 +182,7 @@ def build_notification_email(
         for btn in action_buttons[:3]:
             url = btn.get("url", "")
             if url and not url.startswith("http"):
-                url = f"https://app.dedatahub.com{url}"
+                url = f"https://dedatahub.io{url}"
             text_body += f"\n- {btn.get('title', 'View')}: {url}"
 
     return html_body, text_body
@@ -238,7 +238,7 @@ def build_digest_email(
           <p style="color:#374151;font-size:16px;">Hi {student_name or "there"}, here's your latest jobs and opportunities update:</p>
           <table width="100%" cellpadding="0" cellspacing="0">{items_html}</table>
           <div style="margin:24px 0;text-align:center;">
-            <a href="https://app.dedatahub.com/dashboard" style="display:inline-block;padding:12px 32px;background-color:#876EFF;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;">Go to Dashboard</a>
+            <a href="https://dedatahub.io/dashboard" style="display:inline-block;padding:12px 32px;background-color:#876EFF;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;">Go to Dashboard</a>
           </div>
           <p style="color:#9ca3af;font-size:13px;border-top:1px solid #e5e7eb;padding-top:16px;">
             — {advisor_persona}
@@ -246,7 +246,7 @@ def build_digest_email(
         </td></tr>
         <tr><td style="background-color:#f9fafb;padding:16px 32px;text-align:center;">
           <p style="color:#9ca3af;font-size:12px;margin:0;">
-            <a href="https://app.dedatahub.com/dashboard/settings" style="color:#876EFF;">Manage notification preferences</a>
+            <a href="https://dedatahub.io/dashboard/settings" style="color:#876EFF;">Manage notification preferences</a>
           </p>
         </td></tr>
       </table>

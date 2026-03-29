@@ -23,6 +23,12 @@ from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
 
 from react_agent.context import Context
+from react_agent.guardrails import (
+    INJECTION_BLOCKED_RESPONSE,
+    LEAK_SAFE_RESPONSE,
+    screen_input_for_injection,
+    screen_output_for_leak,
+)
 from react_agent.memory import format_memory_value, get_user_memory_namespace, make_memory_key
 from react_agent.message_utils import sanitize_messages_for_anthropic
 from react_agent.sanitized_anthropic import SanitizedChatAnthropic
@@ -398,6 +404,39 @@ async def _invoke_integrated_agent(
     return AIMessage(content="I was unable to produce a response from the agent runtime.")
 
 
+async def screen_input(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Pre-screen the latest user message for prompt-injection / jailbreak attempts.
+
+    If guardrails are disabled or no injection is detected, returns an empty
+    dict so the graph proceeds to ``call_model`` unchanged.
+
+    If an injection is detected, adds a safe refusal ``AIMessage`` and sets
+    ``guardrail_blocked=True`` so the graph short-circuits to ``__end__``.
+    """
+    if not runtime.context.guardrails_enabled:
+        return {}
+
+    user_text = _latest_human_text(list(state.messages))
+    if not user_text:
+        return {}
+
+    guardrail_model = load_chat_model(runtime.context.guardrail_model)
+    is_injection = await screen_input_for_injection(user_text, guardrail_model)
+
+    if not is_injection:
+        return {}
+
+    return {
+        "messages": [AIMessage(content=INJECTION_BLOCKED_RESPONSE)],
+        "guardrail_blocked": True,
+    }
+
+
+def route_after_screening(state: State) -> Literal["call_model", "__end__"]:
+    """Route to ``__end__`` when an injection was blocked, otherwise to ``call_model``."""
+    return "__end__" if state.guardrail_blocked else "call_model"
+
+
 # Define the function that calls the model
 
 
@@ -421,6 +460,10 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, list[
     prepared_messages = _prepare_messages_for_model(state, summary_available=bool(conversation_summary))
 
     response = await _invoke_integrated_agent(prepared_messages, runtime, system_message)
+
+    # Output screening: replace the response if it leaks system-prompt content.
+    if runtime.context.guardrails_enabled and screen_output_for_leak(get_message_text(response)):
+        response = AIMessage(content=LEAK_SAFE_RESPONSE, id=response.id)
 
     await _persist_long_term_memories(state, runtime, response)
 
@@ -523,12 +566,13 @@ def route_model_output(state: State) -> Literal["__end__", "generate_thread_titl
 builder = StateGraph(State, input_schema=InputState, context_schema=Context)
 
 # Define the nodes
+builder.add_node(screen_input)
 builder.add_node(call_model)
 builder.add_node(generate_thread_title)
 
-# Set the entrypoint as `call_model`
-# This means that this node is the first one called
-builder.add_edge("__start__", "call_model")
+# Entry: screen for injection before reaching the main model
+builder.add_edge("__start__", "screen_input")
+builder.add_conditional_edges("screen_input", route_after_screening)
 builder.add_edge("generate_thread_title", "__end__")
 
 

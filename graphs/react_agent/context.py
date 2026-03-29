@@ -118,6 +118,19 @@ class Context:
         },
     )
 
+    guardrails_enabled: bool = field(
+        default=True,
+        metadata={"description": "Enable input injection screening and output leak detection guardrails."},
+    )
+
+    guardrail_model: str = field(
+        default="anthropic/claude-haiku-4-5-20250929",
+        metadata={
+            "description": "Lightweight model used for input injection classification. "
+            "Should be a fast, low-cost model. Format: provider/model-name."
+        },
+    )
+
     def __post_init__(self) -> None:
         """Apply env overrides for default values and build the dynamic prompt."""
         for f in fields(self):
