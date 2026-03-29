@@ -94,3 +94,10 @@ class State(InputState):
     Number of messages already incorporated into ``conversation_summary``.
     Prevents re-summarizing the same span on every turn.
     """
+
+    guardrail_blocked: bool = field(default=False)
+    """
+    Set to ``True`` by the ``screen_input`` node when a prompt-injection or
+    jailbreak attempt is detected.  Causes the graph to short-circuit to
+    ``__end__`` without invoking the main model.
+    """
