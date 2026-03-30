@@ -847,7 +847,7 @@ class OpportunityDiscoveryEngine:
         to_generate = scored[:max_strategies]
         remaining = scored[max_strategies:]
 
-        sem = asyncio.Semaphore(4)
+        sem = asyncio.Semaphore(2)
 
         async def _gen(item: dict[str, Any]) -> dict[str, Any]:
             async with sem:
@@ -982,7 +982,7 @@ class OpportunityDiscoveryEngine:
         queries_per_category: int = 2,
     ) -> list[dict[str, Any]]:
         """Discover events via Serper.dev."""
-        sem = asyncio.Semaphore(4)
+        sem = asyncio.Semaphore(2)
 
         async def _search_one(query: str, track: str) -> list[dict[str, Any]]:
             async with sem:
@@ -1030,7 +1030,7 @@ class OpportunityDiscoveryEngine:
         queries_per_category: int = 2,
     ) -> list[dict[str, Any]]:
         """Discover jobs via Serper.dev (site: operator queries)."""
-        sem = asyncio.Semaphore(4)
+        sem = asyncio.Semaphore(2)
 
         async def _search_one(query: str, track: str) -> list[dict[str, Any]]:
             async with sem:
