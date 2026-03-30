@@ -36,7 +36,8 @@ class Context:
 
     model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
         # default="openai/gpt-5-mini-2025-08-07",  # noqa: ERA001
-        default="anthropic/claude-sonnet-4-5-20250929",
+        # default="anthropic/claude-sonnet-4-5-20250929",  # noqa: ERA001
+        default="bedrock/eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
         metadata={
             "description": "The name of the language model to use for the agent's main interactions. "
             "Should be in the form: provider/model-name."
@@ -124,7 +125,7 @@ class Context:
     )
 
     guardrail_model: str = field(
-        default="anthropic/claude-haiku-4-5-20250929",
+        default="bedrock/eu.anthropic.claude-haiku-4-5-20250929-v1:0",
         metadata={
             "description": "Lightweight model used for input injection classification. "
             "Should be a fast, low-cost model. Format: provider/model-name."

@@ -30,7 +30,7 @@ from react_agent.guardrails import (
     screen_output_for_leak,
 )
 from react_agent.memory import format_memory_value, get_user_memory_namespace, make_memory_key
-from react_agent.message_utils import sanitize_messages_for_anthropic
+from react_agent.message_utils import sanitize_messages_for_anthropic as _sanitize_messages
 from react_agent.sanitized_anthropic import SanitizedChatAnthropic
 from react_agent.state import InputState, State
 from react_agent.tools import TOOLS
@@ -71,6 +71,10 @@ _LONG_TERM_STORE_LIMIT = 3
 
 def _is_anthropic_model(model_name: str) -> bool:
     return model_name.split("/", maxsplit=1)[0].lower() == "anthropic"
+
+
+def _is_bedrock_model(model_name: str) -> bool:
+    return model_name.split("/", maxsplit=1)[0].lower() == "bedrock"
 
 
 def _extract_provider_model(model_name: str) -> str:
@@ -125,6 +129,13 @@ def _build_anthropic_tools(runtime: Runtime[Context]) -> list[Any]:
 
 
 def _build_runtime_model(runtime: Runtime[Context]) -> Any:
+    if _is_bedrock_model(runtime.context.model):
+        return load_chat_model(
+            runtime.context.model,
+            enable_thinking=runtime.context.enable_thinking,
+            thinking_budget=runtime.context.thinking_budget,
+        )
+
     if _is_anthropic_model(runtime.context.model):
         model_kwargs: dict[str, Any] = {
             "model": _extract_provider_model(runtime.context.model),
@@ -149,12 +160,18 @@ def _build_runtime_model(runtime: Runtime[Context]) -> Any:
 
 
 def _build_runtime_middleware(runtime: Runtime[Context]) -> list[Any]:
+    if _is_bedrock_model(runtime.context.model):
+        # Bedrock handles caching at the infrastructure level; no client middleware needed.
+        return []
     if _is_anthropic_model(runtime.context.model) and runtime.context.anthropic_prompt_caching_enabled:
         return [AnthropicPromptCachingMiddleware(ttl=runtime.context.anthropic_prompt_caching_ttl)]
     return []
 
 
 def _build_runtime_tools(runtime: Runtime[Context]) -> list[Any]:
+    if _is_bedrock_model(runtime.context.model):
+        # Bedrock Converse supports standard tool calling natively — no provider-specific wrappers needed.
+        return list(TOOLS)
     if _is_anthropic_model(runtime.context.model):
         return _build_anthropic_tools(runtime)
     return list(TOOLS)
@@ -392,10 +409,12 @@ async def _invoke_integrated_agent(
         system_prompt=system_message,
     )
 
-    # Sanitize messages for Anthropic compatibility (removes problematic fields like index from tool_search_tool_result)
-    sanitized_messages = sanitize_messages_for_anthropic(messages)
+    # Always normalise frontend multimodal content blocks (image/file/text-plain) into
+    # the provider-specific format, and strip Anthropic beta incompatibilities from AIMessages.
+    provider = "bedrock" if _is_bedrock_model(runtime.context.model) else "anthropic"
+    messages = _sanitize_messages(messages, provider=provider)
 
-    result = await agent.ainvoke({"messages": sanitized_messages})
+    result = await agent.ainvoke({"messages": messages})
     messages = result.get("messages", [])
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):

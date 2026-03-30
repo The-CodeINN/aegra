@@ -34,6 +34,7 @@ from aegra_api.core.accountability_orm import (
     UserPreferences,
 )
 from aegra_api.services.web_push import web_push_service
+from aegra_api.settings import settings
 
 logger = structlog.get_logger()
 
@@ -190,7 +191,7 @@ class NotificationEngine:
         persona = ADVISOR_PERSONAS.get(persona_name or DEFAULT_PERSONA, ADVISOR_PERSONAS[DEFAULT_PERSONA])
 
         try:
-            from langchain_anthropic import ChatAnthropic
+            from langchain_aws import ChatBedrockConverse
             from langchain_core.messages import HumanMessage, SystemMessage
 
             # Build context-aware system prompt with StudentProfile data
@@ -207,7 +208,12 @@ class NotificationEngine:
 
             context_str = "\n".join(ctx_parts) if ctx_parts else "No additional context."
 
-            llm = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0.7, max_tokens=200)
+            llm = ChatBedrockConverse(
+                model="eu.anthropic.claude-haiku-4-5-20250929-v1:0",
+                region_name=settings.aws.AWS_REGION_NAME,
+                temperature=0.7,
+                max_tokens=200,
+            )
             resp = await llm.ainvoke(
                 [
                     SystemMessage(

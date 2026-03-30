@@ -64,6 +64,7 @@ dependencies = [
     # Langfuse
     "langfuse>=3.3.4",
     "pymongo[srv]>=4.16.0",
+    "langchain-aws>=1.4.1",
 ]
 
 [project.urls]
