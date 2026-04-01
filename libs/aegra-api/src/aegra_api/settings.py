@@ -97,7 +97,7 @@ class AppSettings(EnvBase):
     MONGODB_DB_NAME: str | None = None
 
     # Title Generator
-    TITLE_GENERATOR_MODEL: str = "anthropic/claude-haiku-4-5-20251001"
+    TITLE_GENERATOR_MODEL: str = "bedrock/eu.anthropic.claude-haiku-4-5-20250929-v1:0"
 
 
 class DatabaseSettings(EnvBase):
@@ -229,6 +229,13 @@ class RedisSettings(EnvBase):
     STREAMING_BROKER: LowerStr = "auto"
 
 
+class AWSSettings(EnvBase):
+    """AWS / Bedrock settings."""
+
+    AWS_REGION_NAME: str = "eu-west-2"
+    AWS_BEARER_TOKEN_BEDROCK: str | None = None
+
+
 class Settings:
     def __init__(self) -> None:
         self.app = AppSettings()
@@ -239,6 +246,7 @@ class Settings:
         self.discovery = DiscoverySettings()
         self.email = EmailSettings()
         self.redis = RedisSettings()
+        self.aws = AWSSettings()
 
 
 settings = Settings()

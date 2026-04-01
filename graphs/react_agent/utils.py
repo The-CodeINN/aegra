@@ -71,6 +71,20 @@ def load_chat_model(
     provider, model = fully_specified_name.split("/", maxsplit=1)
     init_kwargs: dict[str, object] = {}
 
+    if provider == "bedrock":
+        from langchain_aws import ChatBedrockConverse
+
+        region = os.getenv("AWS_REGION_NAME") or os.getenv("AWS_DEFAULT_REGION", "eu-west-2")
+        if enable_thinking:
+            # Extended thinking requires temperature=1 on Bedrock
+            return ChatBedrockConverse(
+                model=model,
+                region_name=region,
+                temperature=1,
+                additional_model_request_fields={"thinking": {"type": "enabled", "budget_tokens": thinking_budget}},
+            )
+        return ChatBedrockConverse(model=model, region_name=region, temperature=0)
+
     provider_api_key_env = {
         "anthropic": "ANTHROPIC_API_KEY",
         "openai": "OPENAI_API_KEY",
