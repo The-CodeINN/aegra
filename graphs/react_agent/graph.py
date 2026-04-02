@@ -14,7 +14,7 @@ Memory architecture (LangMem):
                 to store or search — no keyword heuristics are required.
 """
 
-import asyncio  # noqa: F401 – imported for future async helpers if needed
+import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -550,6 +550,10 @@ def route_after_consolidation(state: State) -> Literal["__end__", "generate_thre
     return "__end__"
 
 
+# Set of background tasks — prevents garbage collection of fire-and-forget tasks.
+_background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+
+
 async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     """Background memory extraction node.
 
@@ -561,6 +565,13 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
     Uses the same ``MEMORY_SCHEMAS`` and namespace as the hot-path tools so
     all three writers share a consistent, structured store.
 
+    The actual extraction work is dispatched as a fire-and-forget
+    ``asyncio.Task`` so the memory-manager's internal LangGraph subgraph does
+    NOT emit streaming events through the outer graph.  Without this, the
+    frontend (which sets ``streamSubgraphs: true``) receives the
+    extraction-LLM's ``<session_…>`` formatted prompt as a spurious ``values``
+    event, causing a visible flicker at the end of the AI response stream.
+
     Errors are silently swallowed so a failure here never interrupts the
     conversation flow.
     """
@@ -569,67 +580,70 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
     if not store or not user_id:
         return {}
 
+    # Capture everything the background task needs BEFORE returning, since the
+    # Runtime reference may not be valid after the graph node returns.
     namespace = (user_id, DEFAULT_MEMORY_NAMESPACE)
-    try:
-        # Snapshot existing memories before consolidation so we can diff afterwards
-        before = await store.asearch(namespace)
-        before_keys = {item.key for item in before}
+    model = _build_runtime_model(runtime)
+    messages = _normalize_messages_for_memory(list(state.messages))
 
-        # Purge old-format items that are missing the "kind" key required by the
-        # current LangMem schema.  Older versions stored memories as plain dicts
-        # ({"fact": "...", "category": "..."}) but the current version expects
-        # {"kind": "TypeName", "content": {...}}.  Stale items cause a KeyError
-        # inside extraction.py, so we delete them here and let the extractor
-        # re-create them in the new format.
-        stale_keys = [item.key for item in before if "kind" not in item.value]
-        if stale_keys:
-            logger.info(
-                "Purging %d old-format memory items for user=%s keys=%s",
-                len(stale_keys),
-                user_id,
-                stale_keys,
+    async def _run() -> None:
+        try:
+            # Snapshot existing memories before consolidation so we can diff afterwards
+            before = await store.asearch(namespace)
+            before_keys = {item.key for item in before}
+
+            # Purge old-format items that are missing the "kind" key required by the
+            # current LangMem schema.  Older versions stored memories as plain dicts
+            # ({"fact": "...", "category": "..."}) but the current version expects
+            # {"kind": "TypeName", "content": {...}}.  Stale items cause a KeyError
+            # inside extraction.py, so we delete them here and let the extractor
+            # re-create them in the new format.
+            stale_keys = [item.key for item in before if "kind" not in item.value]
+            if stale_keys:
+                logger.info(
+                    "Purging %d old-format memory items for user=%s keys=%s",
+                    len(stale_keys),
+                    user_id,
+                    stale_keys,
+                )
+                for key in stale_keys:
+                    await store.adelete(namespace, key)
+                before_keys -= set(stale_keys)
+
+            manager = create_memory_store_manager(
+                model,
+                schemas=MEMORY_SCHEMAS,
+                namespace=namespace,
+                store=store,
+                enable_deletes=True,
             )
-            for key in stale_keys:
-                await store.adelete(namespace, key)
-            before_keys -= set(stale_keys)
+            await manager.ainvoke({"messages": messages})
 
-        manager = create_memory_store_manager(
-            _build_runtime_model(runtime),
-            schemas=MEMORY_SCHEMAS,
-            namespace=namespace,
-            store=store,
-            enable_deletes=True,
-        )
-        # Normalize AIMessage content to plain strings before passing to the memory
-        # manager.  langmem.utils.get_conversation() calls msg.pretty_repr() on every
-        # message; for AIMessages whose .content is a list of content blocks,
-        # pretty_repr() renders the Python repr (single-quote dict format) rather than
-        # the actual text.  That repr is then wrapped in <session_…> XML tags and sent
-        # to the extraction LLM, and can surface in the visible chat stream when the
-        # agent echoes context back.
-        await manager.ainvoke({"messages": _normalize_messages_for_memory(list(state.messages))})
+            after = await store.asearch(namespace)
+            after_keys = {item.key for item in after}
+            created = after_keys - before_keys
+            deleted = before_keys - after_keys
+            updated = {
+                item.key
+                for item in after
+                if item.key in before_keys and next((b.value for b in before if b.key == item.key), None) != item.value
+            }
+            logger.info(
+                "Memory consolidation complete — user=%s total=%d created=%d updated=%d deleted=%d created_keys=%s deleted_keys=%s",
+                user_id,
+                len(after_keys),
+                len(created),
+                len(updated),
+                len(deleted),
+                sorted(created),
+                sorted(deleted),
+            )
+        except Exception:
+            logger.exception("Background memory consolidation failed; continuing.")
 
-        after = await store.asearch(namespace)
-        after_keys = {item.key for item in after}
-        created = after_keys - before_keys
-        deleted = before_keys - after_keys
-        updated = {
-            item.key
-            for item in after
-            if item.key in before_keys and next((b.value for b in before if b.key == item.key), None) != item.value
-        }
-        logger.info(
-            "Memory consolidation complete — user=%s total=%d created=%d updated=%d deleted=%d created_keys=%s deleted_keys=%s",
-            user_id,
-            len(after_keys),
-            len(created),
-            len(updated),
-            len(deleted),
-            sorted(created),
-            sorted(deleted),
-        )
-    except Exception:
-        logger.exception("Background memory consolidation failed; continuing.")
+    task = asyncio.create_task(_run())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {}
 
