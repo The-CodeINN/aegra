@@ -1,5 +1,7 @@
 """Database manager with LangGraph integration"""
 
+import os
+
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
@@ -75,8 +77,34 @@ class DatabaseManager:
         store_config = load_store_config()
         index_config = store_config.get("index") if store_config else None
 
+        # When the embed string targets Bedrock, materialise the embeddings object
+        # here so we can inject the AWS region.  LangChain's generic init_embeddings
+        # path (called inside AsyncPostgresStore.__init__) constructs BedrockEmbeddings
+        # without a region, causing a ValidationError at startup.
+        if index_config and isinstance(index_config.get("embed"), str):
+            embed_str: str = index_config["embed"]
+            if embed_str.startswith("bedrock:"):
+                from langchain_aws import BedrockEmbeddings
+
+                model_id = embed_str.removeprefix("bedrock:")
+                region = os.getenv("AWS_REGION_NAME") or os.getenv("AWS_DEFAULT_REGION") or "eu-west-2"
+                # Cohere models require input_type to distinguish indexing from retrieval.
+                # truncate="END" prevents ValueError when texts exceed Cohere's 2048-char limit.
+                model_kwargs = (
+                    {"input_type": "search_document", "truncate": "END"} if model_id.startswith("cohere.") else {}
+                )
+                index_config = {
+                    **index_config,
+                    "embed": BedrockEmbeddings(model_id=model_id, region_name=region, model_kwargs=model_kwargs),
+                }
+
+        # Migrate BEFORE setup() — setup() uses ADD COLUMN IF NOT EXISTS, which is
+        # a no-op if a wrong-dimension column already exists from a previous model.
+        if index_config and index_config.get("dims"):
+            await self._migrate_vector_column(int(index_config["dims"]))
+
         self._store = AsyncPostgresStore(conn=self.lg_pool, index=index_config)
-        await self._store.setup()  # Ensure tables exist
+        await self._store.setup()  # Ensure tables / indexes exist
 
         if index_config:
             embed_model = index_config.get("embed", "unknown")
@@ -88,6 +116,66 @@ class DatabaseManager:
         initialize_session_maker()
 
         logger.info("✅ Database and LangGraph components initialized")
+
+    async def _migrate_vector_column(self, target_dims: int) -> None:
+        """Ensure store_vectors.embedding has the correct vector dimensions.
+
+        LangGraph tracks vector migrations in a 'vector_migrations' table — once
+        applied it never re-runs them, even if the embedding model changes.
+        This method detects a dim mismatch, drops store_vectors, and resets the
+        tracked migration version so setup() recreates the table correctly.
+
+        Must be called BEFORE AsyncPostgresStore.setup().
+        """
+        import re
+
+        from psycopg.rows import tuple_row
+
+        async with self.lg_pool.connection() as conn:
+            # Check whether the store_vectors table and embedding column exist
+            async with conn.cursor(row_factory=tuple_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT format_type(pa.atttypid, pa.atttypmod)
+                    FROM pg_attribute pa
+                    JOIN pg_class pc ON pa.attrelid = pc.oid
+                    JOIN pg_namespace pn ON pc.relnamespace = pn.oid
+                    WHERE pn.nspname = 'public'
+                      AND pc.relname = 'store_vectors'
+                      AND pa.attname = 'embedding'
+                      AND pa.attnum > 0
+                      AND NOT pa.attisdropped
+                    """
+                )
+                row = await cur.fetchone()
+
+            if row is None:
+                logger.info("store_vectors not found; setup() will create it with correct dims")
+                return
+
+            col_type: str = row[0]  # e.g. "vector(1536)"
+            logger.info(f"store_vectors.embedding current type: {col_type}")
+
+            match = re.search(r"vector\((\d+)\)", col_type)
+            if not match:
+                logger.warning(f"Cannot parse vector dims from '{col_type}'; skipping migration")
+                return
+
+            current_dims = int(match.group(1))
+            if current_dims == target_dims:
+                logger.info(f"store_vectors.embedding already {target_dims} dims; no migration needed")
+                return
+
+            logger.info(
+                f"Migrating store_vectors.embedding: {current_dims} → {target_dims} dims. "
+                "Dropping table and resetting vector_migrations so setup() recreates it."
+            )
+            # Drop the table (CASCADE drops the index too)
+            await conn.execute("DROP TABLE IF EXISTS store_vectors CASCADE")
+            # Reset vector_migrations to v0 (extension-only) so setup() re-runs
+            # the CREATE TABLE and CREATE INDEX migrations (v1 and v2)
+            await conn.execute("DELETE FROM vector_migrations WHERE v >= 1")
+            logger.info("✅ store_vectors dropped and vector_migrations reset — setup() will recreate")
 
     async def close(self) -> None:
         """Close database connections"""

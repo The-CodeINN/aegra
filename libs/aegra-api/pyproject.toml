@@ -1,6 +1,6 @@
 [project]
 name = "aegra-api"
-version = "0.8.2"
+version = "0.8.4"
 description = "Aegra core API - Self-hosted Agent Protocol server"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -65,6 +65,7 @@ dependencies = [
     "langfuse>=3.3.4",
     "pymongo[srv]>=4.16.0",
     "langchain-aws>=1.4.1",
+    "langmem>=0.0.30",
 ]
 
 [project.urls]
