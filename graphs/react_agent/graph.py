@@ -171,6 +171,11 @@ def _normalize_messages_for_memory(messages: list[AnyMessage]) -> list[AnyMessag
                 normalized.append(new_msg)
             else:
                 normalized.append(msg)
+        elif isinstance(msg, HumanMessage) and isinstance(msg.content, list):
+            # Frontend sends multimodal blocks: [{'type': 'text', 'text': '...'}]
+            # get_message_text extracts the plain text from these blocks
+            text = _truncate_for_embedding(get_message_text(msg))
+            normalized.append(HumanMessage(content=text, id=msg.id))
         elif isinstance(msg, HumanMessage) and isinstance(msg.content, str):
             truncated = _truncate_for_embedding(msg.content)
             if truncated != msg.content:
