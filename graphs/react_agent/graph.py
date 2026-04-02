@@ -391,29 +391,50 @@ async def _invoke_integrated_agent(
 async def screen_input(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     """Pre-screen the latest user message for prompt-injection / jailbreak attempts.
 
+    Also normalises ``HumanMessage.content`` from the frontend's multimodal
+    content-block format (``[{'type': 'text', 'text': '...'}]``) to a plain
+    string.  Without this, every subsequent ``values`` stream event re-emits
+    the full state containing the list-format content, which the frontend
+    briefly renders as a raw Python repr — causing a visible flicker.
+
     If guardrails are disabled or no injection is detected, returns an empty
-    dict so the graph proceeds to ``summarize`` unchanged.
+    dict (plus any normalised messages) so the graph proceeds to ``summarize``
+    unchanged.
 
     If an injection is detected, adds a safe refusal ``AIMessage`` and sets
     ``guardrail_blocked=True`` so the graph short-circuits to ``__end__``.
     """
+    # Normalise HumanMessage list content → plain string so every values event
+    # emitted by downstream nodes (generate_thread_title, consolidate_memories)
+    # contains clean renderable content.
+    normalized_messages: list[AnyMessage] = []
+    needs_normalization = False
+    for msg in state.messages:
+        if isinstance(msg, HumanMessage) and isinstance(msg.content, list):
+            text = get_message_text(msg)
+            normalized_messages.append(HumanMessage(content=text, id=msg.id))
+            needs_normalization = True
+        else:
+            normalized_messages.append(msg)
+
     if not runtime.context.guardrails_enabled:
-        return {}
+        return {"messages": normalized_messages} if needs_normalization else {}
 
     user_text = _latest_human_text(list(state.messages))
     if not user_text:
-        return {}
+        return {"messages": normalized_messages} if needs_normalization else {}
 
     guardrail_model = load_chat_model(runtime.context.guardrail_model)
     is_injection = await screen_input_for_injection(user_text, guardrail_model)
 
     if not is_injection:
-        return {}
+        return {"messages": normalized_messages} if needs_normalization else {}
 
-    return {
+    result: dict[str, Any] = {
         "messages": [AIMessage(content=INJECTION_BLOCKED_RESPONSE)],
         "guardrail_blocked": True,
     }
+    return result
 
 
 def route_after_screening(state: State) -> Literal["summarize", "__end__"]:
