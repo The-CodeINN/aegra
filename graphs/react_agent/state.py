@@ -9,6 +9,7 @@ from typing import Annotated
 from langchain_core.messages import AnyMessage
 from langgraph.graph import add_messages
 from langgraph.managed import IsLastStep
+from langmem.short_term import RunningSummary
 
 
 def merge_tool_counts(existing: dict[str, int], new: dict[str, int]) -> dict[str, int]:
@@ -83,16 +84,23 @@ class State(InputState):
     Exposed to the frontend via the thread state values.
     """
 
-    conversation_summary: str = field(default="")
+    context: dict[str, RunningSummary] = field(default_factory=dict)
     """
-    Running short-term summary of the conversation.
-    Used to preserve older context without sending the full thread to the model.
+    LangMem short-term memory context.  Written by the ``summarize`` node and
+    read on subsequent turns so the SummarizationNode can incrementally update
+    the running summary rather than re-summarising already-condensed messages.
+
+    Shape: ``{"running_summary": RunningSummary}``
     """
 
-    summary_message_count: int = field(default=0)
+    summarized_messages: list[AnyMessage] = field(default_factory=list)
     """
-    Number of messages already incorporated into ``conversation_summary``.
-    Prevents re-summarizing the same span on every turn.
+    Token-bounded message window produced by the ``summarize`` node (LangMem
+    SummarizationNode).  This is what ``call_model`` actually sends to the LLM
+    each turn — it may contain a summary message prepended to recent messages.
+
+    Not annotated with ``add_messages`` because SummarizationNode always
+    overwrites the entire window rather than appending to it.
     """
 
     guardrail_blocked: bool = field(default=False)

@@ -25,7 +25,6 @@ from langchain_community.tools import BraveSearch
 from langgraph.runtime import get_runtime
 
 from react_agent.context import Context
-from react_agent.memory import get_user_memory, save_user_memory, search_user_memories
 
 logger = logging.getLogger(__name__)
 
@@ -1217,9 +1216,6 @@ TOOLS: list[Callable[..., Any]] = [
     get_subscription_state,
     get_portfolio_projects,
     review_project_submission,
-    get_user_memory,
-    save_user_memory,
-    search_user_memories,
 ]
 
 # Add course search tool if a backend is available

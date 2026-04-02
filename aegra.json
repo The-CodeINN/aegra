@@ -7,6 +7,13 @@
     "subgraph_hitl_agent": "./examples/subgraph_hitl_agent/graph.py:graph",
     "factory": "./examples/factory/graph.py:graph"
   },
+  "store": {
+    "index": {
+      "embed": "bedrock:cohere.embed-english-v3",
+      "dims": 1024,
+      "fields": ["$"]
+    }
+  },
   "auth": {
     "path": "./auth.py:auth"
   },

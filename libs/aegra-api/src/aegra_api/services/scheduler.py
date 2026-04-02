@@ -10,7 +10,9 @@ Features:
 - Motivational nudges (Mon/Wed/Fri/Sun) [§2.4.3]
 - Daily digest generation [§2.6.1]
 - Notification cleanup (90-day retention) [§2.6]
-- Opportunity expiration + daily discovery
+- Opportunity expiration + twice-daily discovery
+- Daily opportunity refresh: clears stale unactioned data at 5 AM UTC, then
+  immediately re-discovers fresh, location-personalised opportunities
 - Frequency-aware notification creation via NotificationEngine
 """
 
@@ -93,6 +95,13 @@ class SchedulerService:
                 self.run_discovery_job,
                 IntervalTrigger(hours=12),
                 id="run_discovery_job",
+                replace_existing=True,
+            )
+            # Daily opportunity refresh — clear stale data + re-discover at 5 AM UTC
+            self.scheduler.add_job(
+                self.daily_refresh_opportunities,
+                CronTrigger(hour=5),
+                id="daily_refresh_opportunities",
                 replace_existing=True,
             )
             # Motivational nudges — Mon/Wed/Fri/Sun at 9:00 AM UTC [§2.4.3]
@@ -388,6 +397,37 @@ class SchedulerService:
                 await session.commit()
         except Exception as e:
             logger.error("expire_opportunities error", error=str(e), exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Daily opportunity refresh (clear stale + re-discover)
+    # ------------------------------------------------------------------
+    async def daily_refresh_opportunities(self) -> None:
+        """Delete yesterday's unsaved/unapplied opportunities and run fresh discovery.
+
+        Runs once per day at 5 AM UTC so the board always shows live, personalised data.
+        Preserved statuses: 'saved', 'applied', 'dismissed' — these are user actions.
+        Cleared statuses: 'new', 'notified', 'expired'.
+        """
+        logger.info("daily_refresh_opportunities_started")
+        try:
+            if not db_manager.engine:
+                logger.warning("daily_refresh_aborted", reason="no db engine")
+                return
+            session_maker = async_sessionmaker(db_manager.engine, expire_on_commit=False)
+            async with session_maker() as session:
+                stmt = delete(DiscoveredOpportunity).where(
+                    DiscoveredOpportunity.status.in_(["new", "notified", "expired"])
+                )
+                result = await session.execute(stmt)
+                deleted_count = result.rowcount
+                await session.commit()
+                logger.info("daily_refresh_stale_cleared", deleted=deleted_count)
+
+            # Run fresh discovery for all active users immediately after clearing
+            await self.run_discovery_job()
+            logger.info("daily_refresh_opportunities_complete")
+        except Exception as e:
+            logger.error("daily_refresh_opportunities error", error=str(e), exc_info=True)
 
     # ------------------------------------------------------------------
     # Discovery job

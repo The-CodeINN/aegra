@@ -994,7 +994,7 @@ class OpportunityDiscoveryEngine:
         """Discover events via Serper.dev."""
         sem = asyncio.Semaphore(2)
 
-        async def _search_one(query: str, track: str) -> list[dict[str, Any]]:
+        async def _search_one(query: str, track: str, loc: str) -> list[dict[str, Any]]:
             async with sem:
                 results = await self.serper_search(query, num=10)
                 parsed_list: list[dict[str, Any]] = []
@@ -1007,10 +1007,10 @@ class OpportunityDiscoveryEngine:
                     desc = r.get("snippet", "") or r.get("description", "")
                     if not await self.should_keep_result("event", title, desc, url):
                         continue
-                    if not _is_location_compatible(location, title, desc):
+                    if not _is_location_compatible(loc, title, desc):
                         continue
 
-                    parsed = self.parse_result(r, track, location, profile=profile)
+                    parsed = self.parse_result(r, track, loc, profile=profile)
                     if parsed and parsed["opportunity_type"] == "event" and parsed["match_score"] >= Decimal("0.50"):
                         parsed["_query"] = query
                         parsed["_source"] = "serper"
@@ -1022,7 +1022,7 @@ class OpportunityDiscoveryEngine:
             for location in locations:
                 event_queries = self.build_event_queries(track_name, location, profile)
                 for q in event_queries[:queries_per_category]:
-                    tasks.append(_search_one(q, track_name))
+                    tasks.append(_search_one(q, track_name, location))
 
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
         all_events: list[dict[str, Any]] = []
@@ -1042,7 +1042,7 @@ class OpportunityDiscoveryEngine:
         """Discover jobs via Serper.dev (site: operator queries)."""
         sem = asyncio.Semaphore(2)
 
-        async def _search_one(query: str, track: str) -> list[dict[str, Any]]:
+        async def _search_one(query: str, track: str, loc: str) -> list[dict[str, Any]]:
             async with sem:
                 results = await self.serper_search(query, num=10)
                 parsed_list: list[dict[str, Any]] = []
@@ -1055,10 +1055,10 @@ class OpportunityDiscoveryEngine:
                     desc = r.get("snippet", "") or r.get("description", "")
                     if not await self.should_keep_result("job", title, desc, url):
                         continue
-                    if not _is_location_compatible(location, title, desc):
+                    if not _is_location_compatible(loc, title, desc):
                         continue
 
-                    parsed = self.parse_result(r, track, location, profile=profile)
+                    parsed = self.parse_result(r, track, loc, profile=profile)
                     if parsed and parsed["opportunity_type"] == "job" and parsed["match_score"] >= Decimal("0.50"):
                         parsed["_query"] = query
                         parsed["_source"] = "serper"
@@ -1070,7 +1070,7 @@ class OpportunityDiscoveryEngine:
             for location in locations:
                 job_queries = self.build_job_queries(track_name, location, profile)
                 for q in job_queries[:queries_per_category]:
-                    tasks.append(_search_one(q, track_name))
+                    tasks.append(_search_one(q, track_name, location))
 
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
         all_jobs: list[dict[str, Any]] = []

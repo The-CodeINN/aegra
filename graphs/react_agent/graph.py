@@ -1,10 +1,21 @@
 """Define a custom Reasoning and Action agent.
 
 Works with a chat model with tool calling support.
+
+Memory architecture (LangMem):
+  Short-term  — SummarizationNode runs before every call_model turn. When the
+                message history exceeds _SUMMARY_TRIGGER_TOKENS, older messages
+                are compressed into a running summary and replaced.  The model
+                always operates within the _TRIM_MAX_TOKENS budget.
+
+  Long-term   — create_manage_memory_tool / create_search_memory_tool give the
+                agent native tools to persist and retrieve durable facts about
+                the user across ALL threads.  The agent decides proactively when
+                to store or search — no keyword heuristics are required.
 """
 
-import json
-import re
+import asyncio  # noqa: F401 – imported for future async helpers if needed
+import logging
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -17,10 +28,12 @@ from langchain.agents import create_agent
 from langchain.tools import tool as lc_tool
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
-from langchain_core.messages.utils import count_tokens_approximately, trim_messages
+from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.config import get_stream_writer
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
+from langmem import create_manage_memory_tool, create_memory_store_manager, create_search_memory_tool
+from langmem.short_term import SummarizationNode
 
 from react_agent.context import Context
 from react_agent.guardrails import (
@@ -29,12 +42,14 @@ from react_agent.guardrails import (
     screen_input_for_injection,
     screen_output_for_leak,
 )
-from react_agent.memory import format_memory_value, get_user_memory_namespace, make_memory_key
+from react_agent.memory import DEFAULT_MEMORY_NAMESPACE, MEMORY_SCHEMAS
 from react_agent.message_utils import sanitize_messages_for_anthropic as _sanitize_messages
 from react_agent.sanitized_anthropic import SanitizedChatAnthropic
 from react_agent.state import InputState, State
 from react_agent.tools import TOOLS
 from react_agent.utils import get_message_text, load_chat_model
+
+logger = logging.getLogger(__name__)
 
 _NON_DEFERRED_TOOLS = {
     "get_student_profile",
@@ -57,16 +72,30 @@ _PROGRAMMATIC_SAFE_TOOLS = {
     "get_portfolio_projects",
     "review_project_submission",
     "search_course_content",
-    "get_user_memory",
-    "search_user_memories",
+    # LangMem long-term memory tools
+    "manage_memory",
+    "search_memory",
 }
 
-_TRIM_MAX_TOKENS = 8000
-_SUMMARY_TRIGGER_MESSAGES = 14
-_SUMMARY_KEEP_RECENT = 8
-_SUMMARY_MIN_NEW_MESSAGES = 4
-_LONG_TERM_RECALL_LIMIT = 4
-_LONG_TERM_STORE_LIMIT = 3
+# Short-term memory token budgets (LangMem SummarizationNode)
+_TRIM_MAX_TOKENS = 8000  # max tokens returned to call_model each turn
+_SUMMARY_TRIGGER_TOKENS = 6000  # summarise when history exceeds this
+_MAX_SUMMARY_TOKENS = 512  # budget for the generated summary itself
+
+# Module-level cache: one SummarizationNode per model string to avoid
+# rebuilding the LLM client on every graph turn.
+_summarization_node_cache: dict[str, SummarizationNode] = {}
+
+# Long-term memory system-prompt hint (agent hot-path)
+_MEMORY_INSTRUCTIONS = """
+
+<memory_instructions>
+You have long-term memory tools that persist facts across ALL conversations with this user:
+- `search_memory`: use proactively at the start of each conversation and whenever prior user context may be relevant (goals, background, location, career targets, preferences).
+- `manage_memory`: save any meaningful, durable information the user shares \u2014 career goals, target roles, location, skills, experience level, constraints, personal context, commitments.
+- When the user corrects or updates something you stored, immediately update it with `manage_memory`.
+- Always prefer recalled user context over generic responses.
+</memory_instructions>"""
 
 
 def _is_anthropic_model(model_name: str) -> bool:
@@ -81,11 +110,55 @@ def _extract_provider_model(model_name: str) -> str:
     return model_name.split("/", maxsplit=1)[1]
 
 
+def _get_summarization_node(runtime: Runtime[Context]) -> SummarizationNode:
+    """Return a cached SummarizationNode for the current model.
+
+    Nodes are cached by model name so the LLM client is only built once per
+    unique model string, not on every graph turn.
+    """
+    model_key = runtime.context.model
+    if model_key not in _summarization_node_cache:
+        model = _build_runtime_model(runtime)
+        _summarization_node_cache[model_key] = SummarizationNode(
+            model=model,
+            max_tokens=_TRIM_MAX_TOKENS,
+            max_tokens_before_summary=_SUMMARY_TRIGGER_TOKENS,
+            max_summary_tokens=_MAX_SUMMARY_TOKENS,
+            token_counter=count_tokens_approximately,
+            input_messages_key="messages",
+            output_messages_key="summarized_messages",
+        )
+    return _summarization_node_cache[model_key]
+
+
+def _build_langmem_tools(runtime: Runtime[Context]) -> list[Any]:
+    """Return LangMem manage_memory + search_memory tools scoped to this user.
+
+    Each tool is scoped to ``(user_id, "memories")`` in the runtime store so
+    memories from different users never bleed into each other.  Returns an
+    empty list when the store or user_id is unavailable.
+    """
+    store = runtime.store
+    user_id = runtime.context.user_id
+    if not store or not user_id:
+        return []
+    namespace = (user_id, DEFAULT_MEMORY_NAMESPACE)
+    return [
+        create_manage_memory_tool(
+            namespace=namespace,
+            store=store,
+            actions_permitted=("create", "update", "delete"),
+        ),
+        create_search_memory_tool(namespace=namespace, store=store),
+    ]
+
+
 def _build_anthropic_tools(runtime: Runtime[Context]) -> list[Any]:
     """Build Anthropic-compatible tools with optional defer/caller metadata."""
+    all_tools: list[Any] = list(TOOLS) + _build_langmem_tools(runtime)
     wrapped_tools: list[Any] = []
 
-    for tool_fn in TOOLS:
+    for tool_fn in all_tools:
         tool_name = getattr(tool_fn, "name", getattr(tool_fn, "__name__", "tool"))
         extras: dict[str, Any] = {}
 
@@ -170,11 +243,11 @@ def _build_runtime_middleware(runtime: Runtime[Context]) -> list[Any]:
 
 def _build_runtime_tools(runtime: Runtime[Context]) -> list[Any]:
     if _is_bedrock_model(runtime.context.model):
-        # Bedrock Converse supports standard tool calling natively — no provider-specific wrappers needed.
-        return list(TOOLS)
+        # Bedrock Converse supports standard tool calling natively.
+        return list(TOOLS) + _build_langmem_tools(runtime)
     if _is_anthropic_model(runtime.context.model):
         return _build_anthropic_tools(runtime)
-    return list(TOOLS)
+    return list(TOOLS) + _build_langmem_tools(runtime)
 
 
 def _latest_human_text(messages: list[AnyMessage]) -> str:
@@ -182,220 +255,6 @@ def _latest_human_text(messages: list[AnyMessage]) -> str:
         if isinstance(message, HumanMessage):
             return get_message_text(message).strip()
     return ""
-
-
-def _message_role(message: AnyMessage) -> str:
-    message_type = getattr(message, "type", message.__class__.__name__).lower()
-    if message_type == "human":
-        return "User"
-    if message_type == "ai":
-        return "Advisor"
-    if message_type == "tool":
-        return "Tool"
-    return message_type.title()
-
-
-def _clean_json_block(raw_text: str) -> str:
-    stripped = raw_text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
-        stripped = re.sub(r"\s*```$", "", stripped)
-    match = re.search(r"(\[.*\])", stripped, re.DOTALL)
-    return match.group(1) if match else stripped
-
-
-def _should_extract_memories(user_text: str) -> bool:
-    normalized = user_text.lower()
-    if len(normalized.strip()) < 24:
-        return False
-    triggers = (
-        "i am ",
-        "i'm ",
-        "my goal",
-        "i want",
-        "i need",
-        "i prefer",
-        "i like",
-        "i work",
-        "i worked",
-        "my background",
-        "my experience",
-        "remember",
-        "i have",
-    )
-    return any(trigger in normalized for trigger in triggers)
-
-
-async def _recall_long_term_memories(state: State, runtime: Runtime[Context]) -> list[str]:
-    store = runtime.store
-    user_id = runtime.context.user_id
-    query = _latest_human_text(list(state.messages))
-
-    if not store or not user_id or not query:
-        return []
-
-    namespace = get_user_memory_namespace(user_id)
-
-    try:
-        try:
-            results = await store.asearch(namespace, query=query, limit=_LONG_TERM_RECALL_LIMIT)
-        except Exception:
-            results = await store.asearch(namespace, limit=_LONG_TERM_RECALL_LIMIT)
-    except Exception:
-        return []
-
-    recalled: list[str] = []
-    for item in results:
-        if isinstance(item.value, dict):
-            rendered = format_memory_value(item.value)
-            if rendered:
-                recalled.append(rendered)
-    return recalled[:_LONG_TERM_RECALL_LIMIT]
-
-
-async def _maybe_refresh_summary(state: State, runtime: Runtime[Context]) -> tuple[str, int]:
-    messages = list(state.messages)
-    existing_summary = state.conversation_summary.strip()
-    already_summarized = state.summary_message_count
-
-    if len(messages) < _SUMMARY_TRIGGER_MESSAGES:
-        return existing_summary, already_summarized
-
-    candidate_count = max(0, len(messages) - _SUMMARY_KEEP_RECENT)
-    if candidate_count <= already_summarized:
-        return existing_summary, already_summarized
-    if candidate_count - already_summarized < _SUMMARY_MIN_NEW_MESSAGES:
-        return existing_summary, already_summarized
-
-    transcript_lines = []
-    for message in messages[:candidate_count]:
-        content = get_message_text(message).strip()
-        if content:
-            transcript_lines.append(f"{_message_role(message)}: {content}")
-
-    if not transcript_lines:
-        return existing_summary, already_summarized
-
-    model = _build_runtime_model(runtime)
-    summary_prompt = (
-        "You maintain a running short-term memory summary for a career mentor. "
-        "Summarize only durable conversational context: the student's goals, background, "
-        "constraints, current projects, blockers, and important commitments. "
-        "Keep it under 220 words and avoid fluff.\n\n"
-    )
-    if existing_summary:
-        summary_prompt += f"Existing summary:\n{existing_summary}\n\n"
-    summary_prompt += "Conversation segment to summarize:\n" + "\n".join(transcript_lines)
-
-    response = await model.ainvoke(
-        [
-            {"role": "system", "content": "Return only the updated summary text."},
-            {"role": "user", "content": summary_prompt},
-        ]
-    )
-    new_summary = get_message_text(response).strip()
-    return (new_summary or existing_summary), candidate_count
-
-
-def _augment_system_prompt(system_message: str, conversation_summary: str, long_term_memories: list[str]) -> str:
-    blocks: list[str] = []
-
-    if conversation_summary:
-        blocks.append(
-            f"<short_term_memory>\nRunning summary of this thread:\n{conversation_summary}\n</short_term_memory>"
-        )
-
-    if long_term_memories:
-        rendered_memories = "\n".join(f"- {memory}" for memory in long_term_memories)
-        blocks.append(
-            "<long_term_memory>\n"
-            "Recalled user memories from prior conversations. Use them when relevant, but if the user "
-            "corrects or contradicts any memory, prefer the new information immediately.\n"
-            f"{rendered_memories}\n"
-            "</long_term_memory>"
-        )
-
-    if not blocks:
-        return system_message
-    return system_message + "\n\n" + "\n\n".join(blocks)
-
-
-def _prepare_messages_for_model(state: State, summary_available: bool) -> list[AnyMessage]:
-    messages = list(state.messages)
-    if summary_available and len(messages) > _SUMMARY_KEEP_RECENT:
-        messages = messages[-_SUMMARY_KEEP_RECENT:]
-
-    trimmed = trim_messages(
-        messages,
-        strategy="last",
-        token_counter=count_tokens_approximately,
-        max_tokens=_TRIM_MAX_TOKENS,
-        start_on="human",
-        end_on=("human", "tool"),
-        include_system=False,
-        allow_partial=False,
-    )
-    return list(trimmed)
-
-
-async def _persist_long_term_memories(state: State, runtime: Runtime[Context], response: AIMessage) -> None:
-    store = runtime.store
-    user_id = runtime.context.user_id
-    user_text = _latest_human_text(list(state.messages))
-
-    if not store or not user_id or not _should_extract_memories(user_text):
-        return
-
-    model = _build_runtime_model(runtime)
-    extraction_prompt = (
-        "Extract durable long-term memories from the user's message for a career mentor. "
-        "Only include stable facts, preferences, goals, background, constraints, or project history that "
-        "will matter in future conversations. Ignore transient requests and anything not explicitly stated. "
-        "Return strict JSON as an array of objects with keys 'category' and 'text'. If nothing should be "
-        "stored, return [].\n\n"
-        f"User message:\n{user_text}\n\n"
-        f"Assistant reply for context:\n{get_message_text(response).strip()}"
-    )
-
-    raw_result = await model.ainvoke(
-        [
-            {"role": "system", "content": "Return only valid JSON."},
-            {"role": "user", "content": extraction_prompt},
-        ]
-    )
-    raw_text = _clean_json_block(get_message_text(raw_result))
-
-    try:
-        candidates = json.loads(raw_text)
-    except json.JSONDecodeError:
-        return
-
-    if not isinstance(candidates, list):
-        return
-
-    namespace = get_user_memory_namespace(user_id)
-    stored = 0
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            continue
-        category = str(candidate.get("category", "note")).strip().lower() or "note"
-        text = str(candidate.get("text", "")).strip()
-        if not text:
-            continue
-        key = make_memory_key(category, text)
-        await store.aput(
-            namespace,
-            key,
-            {
-                "category": category,
-                "text": text,
-                "source": "auto",
-                "captured_at": datetime.now(tz=UTC).isoformat(),
-            },
-        )
-        stored += 1
-        if stored >= _LONG_TERM_STORE_LIMIT:
-            break
 
 
 async def _invoke_integrated_agent(
@@ -427,7 +286,7 @@ async def screen_input(state: State, runtime: Runtime[Context]) -> dict[str, Any
     """Pre-screen the latest user message for prompt-injection / jailbreak attempts.
 
     If guardrails are disabled or no injection is detected, returns an empty
-    dict so the graph proceeds to ``call_model`` unchanged.
+    dict so the graph proceeds to ``summarize`` unchanged.
 
     If an injection is detected, adds a safe refusal ``AIMessage`` and sets
     ``guardrail_blocked=True`` so the graph short-circuits to ``__end__``.
@@ -451,40 +310,56 @@ async def screen_input(state: State, runtime: Runtime[Context]) -> dict[str, Any
     }
 
 
-def route_after_screening(state: State) -> Literal["call_model", "__end__"]:
-    """Route to ``__end__`` when an injection was blocked, otherwise to ``call_model``."""
-    return "__end__" if state.guardrail_blocked else "call_model"
+def route_after_screening(state: State) -> Literal["summarize", "__end__"]:
+    """Route to ``__end__`` when an injection was blocked, otherwise to ``summarize``."""
+    return "__end__" if state.guardrail_blocked else "summarize"
 
 
-# Define the function that calls the model
+async def summarize(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Short-term memory node — compress long message history with LangMem.
 
+    Uses LangMem's ``SummarizationNode`` which:
+    - Passes messages through unchanged when history is short.
+    - Once the token count exceeds ``_SUMMARY_TRIGGER_TOKENS``, compresses
+      older messages into a concise summary message at the front of the list.
+    - Tracks already-summarised message IDs in the ``RunningSummary`` stored
+      under ``state.context`` to avoid re-summarising the same messages.
 
-async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, list[AIMessage]]:
-    """Call the LLM powering our "agent".
-
-    This function prepares the prompt, initializes the model, and processes the response.
-
-    Args:
-        state (State): The current state of the conversation.
-        config (RunnableConfig): Configuration for the model run.
-
-    Returns:
-        dict: A dictionary containing the model's response message.
+    The resulting ``summarized_messages`` is what ``call_model`` sends to the
+    LLM, always within the ``_TRIM_MAX_TOKENS`` budget.
     """
-    # Format the system prompt. Customize this to change the agent's behavior.
+    try:
+        node = _get_summarization_node(runtime)
+        return await node.ainvoke({"messages": list(state.messages), "context": dict(state.context or {})})
+    except Exception:
+        # Passthrough on failure so call_model always has something to work with.
+        return {"summarized_messages": list(state.messages)}
+
+
+async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Call the LLM powering the agent.
+
+    Uses ``state.summarized_messages`` (produced by the ``summarize`` node) as
+    the message window so the model always operates within its token budget.
+
+    Long-term memory is handled entirely by the agent's own ``manage_memory``
+    and ``search_memory`` tools (LangMem hot path).  No manual extraction,
+    keyword detection, or system-prompt injection is required here.
+    """
     system_message = runtime.context.system_prompt.format(system_time=datetime.now(tz=UTC).isoformat())
-    conversation_summary, summary_message_count = await _maybe_refresh_summary(state, runtime)
-    recalled_memories = await _recall_long_term_memories(state, runtime)
-    system_message = _augment_system_prompt(system_message, conversation_summary, recalled_memories)
-    prepared_messages = _prepare_messages_for_model(state, summary_available=bool(conversation_summary))
+    # Append the long-term memory tool usage hint.
+    system_message += _MEMORY_INSTRUCTIONS
+
+    # Use the token-bounded summarised messages from the previous node.
+    # Fall back to the full message list on the very first turn (before
+    # summarize has had a chance to produce output).
+    prepared_messages = list(state.summarized_messages) or list(state.messages)
 
     response = await _invoke_integrated_agent(prepared_messages, runtime, system_message)
 
     # Output screening: replace the response if it leaks system-prompt content.
     if runtime.context.guardrails_enabled and screen_output_for_leak(get_message_text(response)):
         response = AIMessage(content=LEAK_SAFE_RESPONSE, id=response.id)
-
-    await _persist_long_term_memories(state, runtime, response)
 
     # Handle the case when it's the last step and the model still wants to use a tool
     if state.is_last_step and response.tool_calls:
@@ -497,13 +372,7 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, list[
             ]
         }
 
-    # Return the model's response as a list to be added to existing messages
-    updates: dict[str, Any] = {"messages": [response]}
-    if conversation_summary != state.conversation_summary:
-        updates["conversation_summary"] = conversation_summary
-    if summary_message_count != state.summary_message_count:
-        updates["summary_message_count"] = summary_message_count
-    return updates
+    return {"messages": [response]}
 
 
 async def generate_thread_title(state: State, runtime: Runtime[Context]) -> dict:
@@ -555,29 +424,83 @@ async def generate_thread_title(state: State, runtime: Runtime[Context]) -> dict
     return {"thread_name": title}
 
 
-def route_model_output(state: State) -> Literal["__end__", "generate_thread_title"]:
-    """Determine the next node based on the model's output.
-
-    This function checks if the model's last message contains tool calls.
-
-    Args:
-        state (State): The current state of the conversation.
-
-    Returns:
-        str: The name of the next node to call.
-    """
+def route_model_output(state: State) -> Literal["__end__", "consolidate_memories"]:
+    """Route to background memory consolidation on a final answer, or end immediately
+    when the model issued tool calls (already handled inside create_agent)."""
     last_message = state.messages[-1]
     if not isinstance(last_message, AIMessage):
         raise ValueError(f"Expected AIMessage in output edges, but got {type(last_message).__name__}")
-    # Tool calls are handled inside create_agent; no external ToolNode loop.
     if last_message.tool_calls:
         return "__end__"
-    # Generate a title once — only on the first complete exchange
+    return "consolidate_memories"
+
+
+def route_after_consolidation(state: State) -> Literal["__end__", "generate_thread_title"]:
+    """Generate a thread title on the first complete exchange; otherwise finish."""
     if not state.thread_name:
         human_count = sum(1 for m in state.messages if isinstance(m, HumanMessage))
         if human_count == 1:
             return "generate_thread_title"
     return "__end__"
+
+
+async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Background memory extraction node.
+
+    Runs ``create_memory_store_manager`` over the full thread after every final
+    AI response to automatically extract, update, and consolidate durable facts
+    into the user's long-term store — even when the agent didn't call
+    ``manage_memory`` during the hot path.
+
+    Uses the same ``MEMORY_SCHEMAS`` and namespace as the hot-path tools so
+    all three writers share a consistent, structured store.
+
+    Errors are silently swallowed so a failure here never interrupts the
+    conversation flow.
+    """
+    store = runtime.store
+    user_id = runtime.context.user_id
+    if not store or not user_id:
+        return {}
+
+    namespace = (user_id, DEFAULT_MEMORY_NAMESPACE)
+    try:
+        # Snapshot existing memories before consolidation so we can diff afterwards
+        before = await store.asearch(namespace)
+        before_keys = {item.key for item in before}
+
+        manager = create_memory_store_manager(
+            _build_runtime_model(runtime),
+            schemas=MEMORY_SCHEMAS,
+            namespace=namespace,
+            store=store,
+            enable_deletes=True,
+        )
+        await manager.ainvoke({"messages": list(state.messages)})
+
+        after = await store.asearch(namespace)
+        after_keys = {item.key for item in after}
+        created = after_keys - before_keys
+        deleted = before_keys - after_keys
+        updated = {
+            item.key
+            for item in after
+            if item.key in before_keys and next((b.value for b in before if b.key == item.key), None) != item.value
+        }
+        logger.info(
+            "Memory consolidation complete — user=%s total=%d created=%d updated=%d deleted=%d created_keys=%s deleted_keys=%s",
+            user_id,
+            len(after_keys),
+            len(created),
+            len(updated),
+            len(deleted),
+            sorted(created),
+            sorted(deleted),
+        )
+    except Exception:
+        logger.exception("Background memory consolidation failed; continuing.")
+
+    return {}
 
 
 # Define a new graph
@@ -586,22 +509,21 @@ builder = StateGraph(State, input_schema=InputState, context_schema=Context)
 
 # Define the nodes
 builder.add_node(screen_input)
+builder.add_node(summarize)
 builder.add_node(call_model)
+builder.add_node(consolidate_memories)
 builder.add_node(generate_thread_title)
 
-# Entry: screen for injection before reaching the main model
+# Entry: screen for injection → compress messages → call model
 builder.add_edge("__start__", "screen_input")
 builder.add_conditional_edges("screen_input", route_after_screening)
+builder.add_edge("summarize", "call_model")
 builder.add_edge("generate_thread_title", "__end__")
 
-
-# Add a conditional edge to determine the next step after `call_model`
-builder.add_conditional_edges(
-    "call_model",
-    # After call_model finishes running, the next node(s) are scheduled
-    # based on the output from route_model_output
-    route_model_output,
-)
+# call_model → consolidate_memories (final answer) or __end__ (tool call)
+builder.add_conditional_edges("call_model", route_model_output)
+# consolidate_memories → generate_thread_title (first exchange) or __end__
+builder.add_conditional_edges("consolidate_memories", route_after_consolidation)
 
 # Compile the builder into an executable graph
 graph = builder.compile(name="ReAct Agent")
