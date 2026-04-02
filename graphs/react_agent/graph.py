@@ -86,6 +86,102 @@ _MAX_SUMMARY_TOKENS = 512  # budget for the generated summary itself
 # rebuilding the LLM client on every graph turn.
 _summarization_node_cache: dict[str, SummarizationNode] = {}
 
+
+class _StringContentModel:
+    """Thin wrapper around a chat model that normalises `.content` to a plain string.
+
+    Anthropic and Bedrock both return `AIMessage.content` as a list of content
+    blocks (e.g. ``[{'type': 'text', 'text': '...'}]``).  LangMem's
+    ``SummarizationNode`` stores the raw ``.content`` value directly in
+    ``RunningSummary.summary`` which is declared as ``str``.  When the summary
+    is later injected into the next context window (via ``DEFAULT_FINAL_SUMMARY_PROMPT``
+    / ``DEFAULT_EXISTING_SUMMARY_PROMPT``), Python's ``str.format()`` calls
+    ``str()`` on the list − producing the Python-repr form
+    ``[{'type': 'text', 'text': '...'}]`` with single quotes.  That repr leaks
+    into the agent's visible system context and ultimately into streamed output.
+
+    This wrapper intercepts the model response and replaces list content with
+    the extracted plain text before returning, so ``RunningSummary.summary``
+    is always a ``str``.
+    """
+
+    def __init__(self, model: Any) -> None:
+        self._model = model
+
+    def _normalise(self, response: Any) -> Any:
+        """Replace list content with extracted plain text."""
+        if isinstance(getattr(response, "content", None), list):
+            response.content = get_message_text(response)
+        return response
+
+    def invoke(self, messages: Any, **kwargs: Any) -> Any:
+        return self._normalise(self._model.invoke(messages, **kwargs))
+
+    async def ainvoke(self, messages: Any, **kwargs: Any) -> Any:
+        return self._normalise(await self._model.ainvoke(messages, **kwargs))
+
+    def __getattr__(self, name: str) -> Any:  # forward everything else
+        return getattr(self._model, name)
+
+
+_COHERE_MAX_CHARS = 1800  # Cohere embedding API hard limit is 2048 chars; leave headroom
+
+
+def _truncate_for_embedding(text: str) -> str:
+    """Truncate *text* to fit within Cohere's embedding character limit."""
+    if len(text) <= _COHERE_MAX_CHARS:
+        return text
+    return text[:_COHERE_MAX_CHARS]
+
+
+def _normalize_messages_for_memory(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """Return a copy of *messages* where every AIMessage has plain-string content.
+
+    ``langmem.utils.get_conversation()`` calls ``msg.pretty_repr()`` on each
+    message.  For AIMessages whose ``.content`` is a list of content blocks,
+    ``pretty_repr()`` renders the Python repr of that list (single quotes,
+    dict format) rather than the actual text.  This raw repr then appears
+    inside the ``<session_…>`` XML tags sent to the memory-extraction LLM and
+    can bleed into streamed output when the agent echoes context back.
+
+    Converting list content to a plain string here ensures that only readable
+    text flows into the memory pipeline.  All message texts are also truncated
+    to stay within Cohere's 2048-character embedding limit.
+    """
+    normalized: list[AnyMessage] = []
+    for msg in messages:
+        if isinstance(msg, AIMessage) and isinstance(msg.content, list):
+            text = _truncate_for_embedding(get_message_text(msg))
+            new_msg = AIMessage(
+                content=text,
+                id=msg.id,
+                tool_calls=getattr(msg, "tool_calls", []),
+                response_metadata=getattr(msg, "response_metadata", {}),
+            )
+            normalized.append(new_msg)
+        elif isinstance(msg, AIMessage) and isinstance(msg.content, str):
+            truncated = _truncate_for_embedding(msg.content)
+            if truncated != msg.content:
+                new_msg = AIMessage(
+                    content=truncated,
+                    id=msg.id,
+                    tool_calls=getattr(msg, "tool_calls", []),
+                    response_metadata=getattr(msg, "response_metadata", {}),
+                )
+                normalized.append(new_msg)
+            else:
+                normalized.append(msg)
+        elif isinstance(msg, HumanMessage) and isinstance(msg.content, str):
+            truncated = _truncate_for_embedding(msg.content)
+            if truncated != msg.content:
+                normalized.append(HumanMessage(content=truncated, id=msg.id))
+            else:
+                normalized.append(msg)
+        else:
+            normalized.append(msg)
+    return normalized
+
+
 # Long-term memory system-prompt hint (agent hot-path)
 _MEMORY_INSTRUCTIONS = """
 
@@ -118,7 +214,12 @@ def _get_summarization_node(runtime: Runtime[Context]) -> SummarizationNode:
     """
     model_key = runtime.context.model
     if model_key not in _summarization_node_cache:
-        model = _build_runtime_model(runtime)
+        # Wrap with _StringContentModel so that RunningSummary.summary is always a
+        # plain str.  Without this, Anthropic/Bedrock returns content blocks
+        # ([{'type':'text','text':'...'}]) which LangMem stores verbatim; the list
+        # is later str()-formatted into the summary SystemMessage, producing the
+        # Python repr with single quotes that leaks into the agent's context.
+        model = _StringContentModel(_build_runtime_model(runtime))
         _summarization_node_cache[model_key] = SummarizationNode(
             model=model,
             max_tokens=_TRIM_MAX_TOKENS,
@@ -469,6 +570,24 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
         before = await store.asearch(namespace)
         before_keys = {item.key for item in before}
 
+        # Purge old-format items that are missing the "kind" key required by the
+        # current LangMem schema.  Older versions stored memories as plain dicts
+        # ({"fact": "...", "category": "..."}) but the current version expects
+        # {"kind": "TypeName", "content": {...}}.  Stale items cause a KeyError
+        # inside extraction.py, so we delete them here and let the extractor
+        # re-create them in the new format.
+        stale_keys = [item.key for item in before if "kind" not in item.value]
+        if stale_keys:
+            logger.info(
+                "Purging %d old-format memory items for user=%s keys=%s",
+                len(stale_keys),
+                user_id,
+                stale_keys,
+            )
+            for key in stale_keys:
+                await store.adelete(namespace, key)
+            before_keys -= set(stale_keys)
+
         manager = create_memory_store_manager(
             _build_runtime_model(runtime),
             schemas=MEMORY_SCHEMAS,
@@ -476,7 +595,14 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
             store=store,
             enable_deletes=True,
         )
-        await manager.ainvoke({"messages": list(state.messages)})
+        # Normalize AIMessage content to plain strings before passing to the memory
+        # manager.  langmem.utils.get_conversation() calls msg.pretty_repr() on every
+        # message; for AIMessages whose .content is a list of content blocks,
+        # pretty_repr() renders the Python repr (single-quote dict format) rather than
+        # the actual text.  That repr is then wrapped in <session_…> XML tags and sent
+        # to the extraction LLM, and can surface in the visible chat stream when the
+        # agent echoes context back.
+        await manager.ainvoke({"messages": _normalize_messages_for_memory(list(state.messages))})
 
         after = await store.asearch(namespace)
         after_keys = {item.key for item in after}
