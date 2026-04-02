@@ -463,6 +463,19 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
 
     response = await _invoke_integrated_agent(prepared_messages, runtime, system_message)
 
+    # Anthropic/Bedrock return AIMessage.content as a list of content blocks
+    # (e.g. [{'type': 'text', 'text': '...'}]).  Normalise to a plain string
+    # so that every `values` stream event the frontend receives has clean,
+    # renderable content — preventing the raw Python repr from flashing on
+    # re-renders triggered by later graph nodes (e.g. generate_thread_title).
+    if isinstance(response.content, list):
+        response = AIMessage(
+            content=get_message_text(response),
+            id=response.id,
+            tool_calls=getattr(response, "tool_calls", []),
+            response_metadata=getattr(response, "response_metadata", {}),
+        )
+
     # Output screening: replace the response if it leaks system-prompt content.
     if runtime.context.guardrails_enabled and screen_output_for_leak(get_message_text(response)):
         response = AIMessage(content=LEAK_SAFE_RESPONSE, id=response.id)
