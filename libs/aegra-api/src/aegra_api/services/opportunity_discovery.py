@@ -750,7 +750,7 @@ class OpportunityDiscoveryEngine:
             from langchain_core.messages import HumanMessage, SystemMessage
 
             llm = ChatBedrockConverse(
-                model="eu.anthropic.claude-haiku-4-5-20250929-v1:0",
+                model="eu.anthropic.claude-haiku-4-5-20251001-v1:0",
                 region_name=settings.aws.AWS_REGION_NAME,
                 temperature=0.7,
                 max_tokens=500,
@@ -794,7 +794,7 @@ class OpportunityDiscoveryEngine:
             from langchain_core.messages import HumanMessage, SystemMessage
 
             llm = ChatBedrockConverse(
-                model="eu.anthropic.claude-haiku-4-5-20250929-v1:0",
+                model="eu.anthropic.claude-haiku-4-5-20251001-v1:0",
                 region_name=settings.aws.AWS_REGION_NAME,
                 temperature=0.7,
                 max_tokens=500,

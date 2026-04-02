@@ -97,7 +97,7 @@ class AppSettings(EnvBase):
     MONGODB_DB_NAME: str | None = None
 
     # Title Generator
-    TITLE_GENERATOR_MODEL: str = "bedrock/eu.anthropic.claude-haiku-4-5-20250929-v1:0"
+    TITLE_GENERATOR_MODEL: str = "bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 
 class DatabaseSettings(EnvBase):
