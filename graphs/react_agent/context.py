@@ -67,6 +67,7 @@ class Context:
 
     user_token: str | None = field(
         default=None,
+        repr=False,  # Never include in repr — prevents JWT leaking into logs
         metadata={"description": "JWT access token for authenticating with external LMS API."},
     )
 
@@ -89,6 +90,7 @@ class Context:
 
     brave_search_api_key: str | None = field(
         default=None,
+        repr=False,  # Never include in repr — prevents API key leaking into logs
         metadata={"description": "The API key for Brave Search."},
     )
 
@@ -125,7 +127,7 @@ class Context:
     )
 
     guardrail_model: str = field(
-        default="bedrock/eu.anthropic.claude-haiku-4-5-20250929-v1:0",
+        default="bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0",
         metadata={
             "description": "Lightweight model used for input injection classification. "
             "Should be a fast, low-cost model. Format: provider/model-name."

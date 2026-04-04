@@ -25,6 +25,8 @@ from langchain_community.tools import BraveSearch
 from langgraph.runtime import get_runtime
 
 from react_agent.context import Context
+from react_agent.retry import with_retry
+from react_agent.sanitization import validate_resource_id as _validate_id
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +41,32 @@ _TTL_ENROLLMENT = 45
 # In-memory cache: key → (json_str, expiry_ts)
 _mem_cache: dict[str, tuple[str, float]] = {}
 
+# Per-key async locks prevent the thundering-herd race where N concurrent
+# requests all find the cache cold and each fire an independent LMS call.
+# A defaultdict(asyncio.Lock) isn't safe to initialise at module level because
+# asyncio.Lock() must be created on the running event loop; we create lazily.
+_mem_cache_locks: dict[str, asyncio.Lock] = {}
+
 # Lazy Redis client reference (set once on first use)
 _redis_client: Any = None
 _redis_checked = False
+
+# MongoDB / sync-service call timeout (seconds).  A hanging MongoDB connection
+# would otherwise block an asyncio thread-pool worker indefinitely, starving
+# all other coroutines sharing that event loop.
+_MONGO_TIMEOUT_SECONDS = 10.0
+
+
+async def _mongo_call(fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """Run a synchronous MongoDB call in a thread with a hard timeout.
+
+    Prevents a hanging MongoDB connection from blocking the asyncio thread
+    pool indefinitely.  Raises ``asyncio.TimeoutError`` on timeout.
+    """
+    return await asyncio.wait_for(
+        asyncio.to_thread(fn, *args, **kwargs),
+        timeout=_MONGO_TIMEOUT_SECONDS,
+    )
 
 
 def _normalize_auth_token(token: str | None) -> str | None:
@@ -114,12 +139,17 @@ async def _cached_lms_get_with_evidence(
 
     # Critical paths enforce live fetch.
     if ttl <= 0:
-        resp = await client.get(
-            url,
-            headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
-        )
-        resp.raise_for_status()
-        data: dict[str, Any] = resp.json()
+
+        @with_retry(max_retries=3)
+        async def _live_get() -> dict[str, Any]:
+            resp = await client.get(
+                url,
+                headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        data: dict[str, Any] = await _live_get()
         return data, {
             "endpoint": path,
             "fetched_at": fetched_at,
@@ -141,31 +171,43 @@ async def _cached_lms_get_with_evidence(
                     "live_verified": False,
                 }
 
-    entry = _mem_cache.get(key)
-    if entry is not None:
-        value, expiry = entry
-        if time.time() < expiry:
-            return json.loads(value), {
-                "endpoint": path,
-                "fetched_at": fetched_at,
-                "cache_source": "memory",
-                "cache_ttl_seconds": ttl,
-                "live_verified": False,
-            }
-        del _mem_cache[key]
+    # Per-key lock: guarantees only ONE coroutine hits the live LMS endpoint
+    # when multiple requests arrive simultaneously for the same cold cache entry
+    # (thundering-herd prevention).
+    if key not in _mem_cache_locks:
+        _mem_cache_locks[key] = asyncio.Lock()
+    async with _mem_cache_locks[key]:
+        # Re-check cache after acquiring the lock — a sibling coroutine may have
+        # already populated it while we were waiting.
+        entry = _mem_cache.get(key)
+        if entry is not None:
+            value, expiry = entry
+            if time.time() < expiry:
+                return json.loads(value), {
+                    "endpoint": path,
+                    "fetched_at": fetched_at,
+                    "cache_source": "memory",
+                    "cache_ttl_seconds": ttl,
+                    "live_verified": False,
+                }
+            del _mem_cache[key]
 
-    resp = await client.get(
-        url,
-        headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
-    )
-    resp.raise_for_status()
-    data = resp.json()
+        @with_retry(max_retries=3)
+        async def _live_get_cached() -> dict[str, Any]:
+            resp = await client.get(
+                url,
+                headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+            return resp.json()
 
-    serialized = json.dumps(data)
-    if rc is not None:
-        with contextlib.suppress(Exception):
-            await rc.setex(key, ttl, serialized)
-    _mem_cache[key] = (serialized, time.time() + ttl)
+        data = await _live_get_cached()
+
+        serialized = json.dumps(data)
+        if rc is not None:
+            with contextlib.suppress(Exception):
+                await rc.setex(key, ttl, serialized)
+        _mem_cache[key] = (serialized, time.time() + ttl)
 
     return data, {
         "endpoint": path,
@@ -406,6 +448,52 @@ async def get_student_profile() -> dict[str, Any]:
         return {"error": "Unexpected error", "message": str(e)}
 
 
+def _detect_onboarding_contradictions(onboarding_data: dict[str, Any]) -> list[str]:
+    """Detect contradictions between structured fields and freeform text in onboarding data.
+
+    Returns a list of human-readable notes describing each contradiction found.
+    The model should use structured/dropdown fields as the source of truth and
+    ask the user to clarify when contradictions are present.
+    """
+    notes: list[str] = []
+    s2 = onboarding_data.get("s2", {})
+    if not isinstance(s2, dict):
+        return notes
+
+    role_summary = (s2.get("roleSummary") or "").strip()
+    years_experience = (s2.get("yearsExperience") or "").strip()
+    years_tech = (s2.get("yearsTech") or "").strip()
+
+    if not role_summary:
+        return notes
+
+    # Extract any "N years" claim from the freeform roleSummary
+    match = re.search(r"(\d+)\s*(?:\+\s*)?years?\b", role_summary, re.IGNORECASE)
+    if match:
+        claimed_years = int(match.group(1))
+        # Check against yearsExperience dropdown
+        is_beginner_experience = years_experience.lower() in (
+            "less than 1 year",
+            "0",
+            "none",
+            "zero",
+        )
+        is_beginner_tech = "zero" in years_tech.lower() or "beginner" in years_tech.lower()
+
+        if claimed_years >= 2 and (is_beginner_experience or is_beginner_tech):
+            notes.append(
+                f"DATA CONFLICT in employment section (s2): The freeform 'roleSummary' says "
+                f"'{role_summary}' (implying {claimed_years} years of experience), but the "
+                f"structured fields say yearsExperience='{years_experience}' and "
+                f"yearsTech='{years_tech}'. The structured dropdown fields are more reliable. "
+                f"When referencing this user's experience level, use the structured fields "
+                f"(yearsExperience, yearsTech) as the source of truth and ask the user to "
+                f"clarify the discrepancy rather than assuming either is correct."
+            )
+
+    return notes
+
+
 async def get_student_onboarding() -> dict[str, Any]:
     """Get the current student's onboarding information from the LMS.
 
@@ -497,6 +585,11 @@ async def get_student_onboarding() -> dict[str, Any]:
                 "confidence": "high" if evidence.get("live_verified") else "medium",
             }
 
+            # Flag any contradictions between freeform text and structured fields
+            contradictions = _detect_onboarding_contradictions(onboarding_data)
+            if contradictions:
+                onboarding["data_quality_notes"] = contradictions
+
             logger.info(f"Successfully fetched onboarding for learning track: {onboarding.get('learningTrack')}")
             return onboarding
 
@@ -579,6 +672,11 @@ async def get_student_ai_career_advisor_onboarding() -> dict[str, Any]:
                 "confidence": "high" if evidence.get("live_verified") else "medium",
             }
 
+            # Flag any contradictions between freeform text and structured fields
+            contradictions = _detect_onboarding_contradictions(onboarding_data)
+            if contradictions:
+                career_advisor_onboarding["data_quality_notes"] = contradictions
+
             logger.info(
                 f"Successfully fetched AI career advisor onboarding, completed: {career_advisor_onboarding.get('completed')}"
             )
@@ -620,7 +718,7 @@ async def get_student_enrollment_overview() -> dict[str, Any]:
 
     try:
         mongo_client = get_course_content_mongo_client()
-        data = await asyncio.to_thread(mongo_client.get_enrollment_overview, user_id)
+        data = await _mongo_call(mongo_client.get_enrollment_overview, user_id)
         return {
             "ok": True,
             "source": "mongo",
@@ -648,6 +746,10 @@ async def get_course_structure(course_id: str) -> dict[str, Any]:
             "confidence": "low",
             "error": "course_id is required",
         }
+    try:
+        _validate_id(course_id, "course_id")
+    except ValueError as exc:
+        return {"ok": False, "source": "mongo", "confidence": "low", "error": str(exc)}
     if not user_id:
         return {
             "ok": False,
@@ -660,7 +762,7 @@ async def get_course_structure(course_id: str) -> dict[str, Any]:
     try:
         mongo_client = get_course_content_mongo_client()
         if not enrolled_course_ids:
-            enrolled_course_ids = await asyncio.to_thread(mongo_client.get_active_enrolled_course_ids, user_id)
+            enrolled_course_ids = await _mongo_call(mongo_client.get_active_enrolled_course_ids, user_id)
         if course_id not in enrolled_course_ids:
             return {
                 "ok": False,
@@ -670,7 +772,7 @@ async def get_course_structure(course_id: str) -> dict[str, Any]:
                 "enrolled_course_ids": enrolled_course_ids,
             }
 
-        data = await asyncio.to_thread(mongo_client.get_course_structure, user_id, course_id)
+        data = await _mongo_call(mongo_client.get_course_structure, user_id, course_id)
         return {
             "ok": data is not None,
             "source": "mongo",
@@ -698,6 +800,10 @@ async def get_course_progress(course_id: str) -> dict[str, Any]:
             "confidence": "low",
             "error": "course_id is required",
         }
+    try:
+        _validate_id(course_id, "course_id")
+    except ValueError as exc:
+        return {"ok": False, "source": "mongo", "confidence": "low", "error": str(exc)}
     if not user_id:
         return {
             "ok": False,
@@ -710,7 +816,7 @@ async def get_course_progress(course_id: str) -> dict[str, Any]:
     try:
         mongo_client = get_course_content_mongo_client()
         if not enrolled_course_ids:
-            enrolled_course_ids = await asyncio.to_thread(mongo_client.get_active_enrolled_course_ids, user_id)
+            enrolled_course_ids = await _mongo_call(mongo_client.get_active_enrolled_course_ids, user_id)
         if course_id not in enrolled_course_ids:
             return {
                 "ok": False,
@@ -720,7 +826,7 @@ async def get_course_progress(course_id: str) -> dict[str, Any]:
                 "enrolled_course_ids": enrolled_course_ids,
             }
 
-        data = await asyncio.to_thread(mongo_client.get_course_progress, user_id, course_id)
+        data = await _mongo_call(mongo_client.get_course_progress, user_id, course_id)
         return {
             "ok": data is not None,
             "source": "mongo",
@@ -760,7 +866,7 @@ async def get_course_materials(course_id: str, include_content: bool = True, lim
     try:
         mongo_client = get_course_content_mongo_client()
         if not enrolled_course_ids:
-            enrolled_course_ids = await asyncio.to_thread(mongo_client.get_active_enrolled_course_ids, user_id)
+            enrolled_course_ids = await _mongo_call(mongo_client.get_active_enrolled_course_ids, user_id)
         if course_id not in enrolled_course_ids:
             return {
                 "ok": False,
@@ -770,7 +876,7 @@ async def get_course_materials(course_id: str, include_content: bool = True, lim
                 "enrolled_course_ids": enrolled_course_ids,
             }
 
-        materials = await asyncio.to_thread(
+        materials = await _mongo_call(
             mongo_client.get_course_materials,
             course_id,
             include_content=include_content,
@@ -821,6 +927,10 @@ async def get_student_attempts(student_id: str) -> dict[str, Any]:
             "confidence": "low",
             "error": "student_id is required",
         }
+    try:
+        _validate_id(student_id, "student_id")
+    except ValueError as exc:
+        return {"ok": False, "source": "mongo", "confidence": "low", "error": str(exc)}
     if not user_id or student_id != user_id:
         return {
             "ok": False,
@@ -831,7 +941,7 @@ async def get_student_attempts(student_id: str) -> dict[str, Any]:
 
     try:
         mongo_client = get_course_content_mongo_client()
-        data = await asyncio.to_thread(mongo_client.get_student_attempts, user_id)
+        data = await _mongo_call(mongo_client.get_student_attempts, user_id)
         return {
             "ok": True,
             "source": "mongo",
@@ -862,7 +972,7 @@ async def get_subscription_state() -> dict[str, Any]:
 
     try:
         mongo_client = get_course_content_mongo_client()
-        data = await asyncio.to_thread(mongo_client.get_subscription_state, user_id)
+        data = await _mongo_call(mongo_client.get_subscription_state, user_id)
         return {
             "ok": data is not None,
             "source": "mongo",
@@ -934,7 +1044,7 @@ async def search_course_content(
         search_service = get_course_content_search_service()
 
         if not enrolled_course_ids:
-            enrolled_course_ids = await asyncio.to_thread(mongo_client.get_active_enrolled_course_ids, user_id)
+            enrolled_course_ids = await _mongo_call(mongo_client.get_active_enrolled_course_ids, user_id)
 
         if course_id and course_id not in enrolled_course_ids:
             return {
@@ -951,7 +1061,7 @@ async def search_course_content(
                 "message": "No active enrollments found for this user.",
             }
 
-        results = await asyncio.to_thread(
+        results = await _mongo_call(
             search_service.search_enrolled_course_content,
             query=query,
             enrolled_course_ids=enrolled_course_ids,
