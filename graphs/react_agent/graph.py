@@ -1267,9 +1267,9 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
                     if len(after) > MAX_MEMORIES_PER_USER:
                         sorted_items = sorted(
                             after,
-                            key=lambda item: getattr(item, "updated_at", None)
-                            or getattr(item, "created_at", None)
-                            or "",
+                            key=lambda item: (
+                                getattr(item, "updated_at", None) or getattr(item, "created_at", None) or ""
+                            ),
                         )
                         excess = len(after) - MAX_MEMORIES_PER_USER
                         pruned_keys = [item.key for item in sorted_items[:excess]]
