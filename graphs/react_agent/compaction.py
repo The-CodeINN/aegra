@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
@@ -30,7 +30,7 @@ from langchain_core.runnables import RunnableConfig
 logger = logging.getLogger(__name__)
 
 
-class CompactionTier(str, Enum):
+class CompactionTier(StrEnum):
     """Compaction tiers in order of cost."""
 
     SNIP = "snip"
