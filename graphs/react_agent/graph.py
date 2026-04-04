@@ -514,9 +514,18 @@ async def screen_input(state: State, runtime: Runtime[Context]) -> dict[str, Any
     needs_normalization = False
     for msg in state.messages:
         if isinstance(msg, HumanMessage) and isinstance(msg.content, list):
-            text = get_message_text(msg)
-            normalized_messages.append(HumanMessage(content=text, id=msg.id))
-            needs_normalization = True
+            # Only flatten to a plain string when the list is text-only.
+            # Messages that include non-text blocks (images, PDFs, documents)
+            # must keep their list structure so the model receives the
+            # attachments.  Flattening those strips the file content and causes
+            # the AI to report that no document was attached.
+            has_non_text = any(isinstance(block, dict) and block.get("type") not in ("text",) for block in msg.content)
+            if has_non_text:
+                normalized_messages.append(msg)
+            else:
+                text = get_message_text(msg)
+                normalized_messages.append(HumanMessage(content=text, id=msg.id))
+                needs_normalization = True
         else:
             normalized_messages.append(msg)
 
