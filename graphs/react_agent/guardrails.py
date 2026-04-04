@@ -1,6 +1,6 @@
 """Guardrails for prompt injection detection and prompt leak prevention.
 
-Two layers of protection:
+Three layers of protection:
 
 1. Input screening  — run before calling the main model.
    Classifies whether the incoming user message is a prompt-injection or
@@ -9,13 +9,25 @@ Two layers of protection:
 2. Output screening — run after the main model responds.
    Scans the response for fragments that suggest the system prompt has been
    leaked verbatim (XML directive tags, unique internal phrases, etc.).
+
+3. Hallucination screening — run after the main model responds.
+   Checks whether the response introduces factual claims about the user
+   (institutions, companies, degrees, experience) that are not grounded
+   in tool results or the user's own input.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
+
+from langchain_core.runnables import RunnableConfig
+
+from react_agent.retry import with_retry
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Injection / jailbreak screening
@@ -65,7 +77,8 @@ async def screen_input_for_injection(user_message: str, model: Any) -> bool:
     if not user_message or not user_message.strip():
         return False
 
-    try:
+    @with_retry(max_retries=2, fail_open=True)
+    async def _classify() -> bool:
         response = await model.ainvoke(
             [
                 {
@@ -76,7 +89,8 @@ async def screen_input_for_injection(user_message: str, model: Any) -> bool:
                     "role": "user",
                     "content": _INJECTION_SCREEN_PROMPT.format(user_message=user_message[:2000]),
                 },
-            ]
+            ],
+            config=RunnableConfig(callbacks=[]),
         )
 
         text = response.content if hasattr(response, "content") else str(response)
@@ -91,8 +105,17 @@ async def screen_input_for_injection(user_message: str, model: Any) -> bool:
             text = re.sub(r"\s*```$", "", text.strip())
 
         data = json.loads(text)
-        return bool(data.get("is_injection", False))
+        is_injection = bool(data.get("is_injection", False))
+        if is_injection:
+            logger.warning(
+                "Prompt injection detected — blocked",
+                extra={"user_input_preview": user_message[:120]},
+            )
+        return is_injection
 
+    try:
+        result = await _classify()
+        return bool(result)  # None (fail_open on exhausted retries) → False
     except Exception:
         # Fail open: if classification fails, let the request through.
         return False
@@ -151,3 +174,130 @@ def screen_output_for_leak(response_text: str) -> bool:
     if not response_text:
         return False
     return bool(_LEAK_REGEX.search(response_text))
+
+
+# ---------------------------------------------------------------------------
+# Hallucination / grounding screening
+# ---------------------------------------------------------------------------
+
+# Safe fallback response when a hallucination is detected in the model's output.
+HALLUCINATION_SAFE_RESPONSE = (
+    "I want to make sure I only reference information you've actually shared with me. "
+    "Could you provide the details about your background so I can give you accurate, "
+    "personalized guidance?"
+)
+
+_HALLUCINATION_SCREEN_PROMPT = """You are a factual accuracy checker for an AI career advisor.
+
+The AI was given the following user input and tool evidence, then produced a response.
+Check whether the AI response introduces factual claims about the USER that are NOT
+grounded in the provided evidence.
+
+<user_input>
+{user_input}
+</user_input>
+
+<tool_evidence>
+{tool_evidence}
+</tool_evidence>
+
+<ai_response>
+{ai_response}
+</ai_response>
+
+Check SPECIFICALLY for:
+1. Names of educational institutions (universities, colleges, schools) NOT mentioned in user input or tool evidence
+2. Names of companies or organisations NOT mentioned in user input or tool evidence
+3. Degrees, certifications, or qualifications NOT mentioned in user input or tool evidence
+4. Work experience, job titles, or roles NOT mentioned in user input or tool evidence
+5. Specific dates, locations, or personal facts not supported by user input or tool evidence
+
+IMPORTANT RULES:
+- Generic career advice, industry facts, or job market information are NOT hallucinations.
+- Only flag claims that are presented as facts ABOUT THIS SPECIFIC USER and are NOT supported by ANY of the evidence above.
+- If the tool evidence contains CONTRADICTORY information about the user (e.g. one field says "5 years experience" while another says "Less than 1 year"), the AI is NOT hallucinating by referencing EITHER value — the contradiction exists in the source data, not in the AI's response. Do NOT flag this as a hallucination.
+- If a claim can be traced back to ANY field in the tool evidence, it is grounded and must NOT be flagged.
+- Tool evidence may include recalled MEMORIES about the user from previous conversations. The AI may reasonably paraphrase, summarize, or reword memory content — this is NOT hallucination as long as the underlying meaning can be traced back to the evidence. Only flag claims that have NO basis whatsoever in any evidence.
+
+Respond with JSON only — no markdown, no explanation:
+{{"has_hallucination": true, "details": "brief description of fabricated content"}}
+or
+{{"has_hallucination": false, "details": ""}}"""
+
+
+async def screen_output_for_hallucination(
+    response_text: str,
+    tool_results: list[str],
+    user_message: str,
+    model: Any,
+) -> tuple[bool, str]:
+    """Check whether the response contains hallucinated user facts.
+
+    Returns:
+        ``(is_hallucination, details)`` — a boolean flag and a short
+        description of what was fabricated (empty string when clean).
+
+    Uses a lightweight guardrail model to check if the AI response introduces
+    factual claims about the user (institutions, companies, degrees, experience)
+    that are not grounded in tool results or the user's own input.
+
+    Returns ``(False, "")`` (safe / pass-through) on any parsing or network
+    error so that legitimate requests are never blocked by infrastructure
+    failures.
+    """
+    if not response_text or not response_text.strip():
+        return False, ""
+
+    # Build evidence corpus from tool results + user message
+    evidence_corpus = "\n---\n".join(r[:2000] for r in tool_results if r)
+    if not evidence_corpus:
+        evidence_corpus = "(no tool results available)"
+
+    @with_retry(max_retries=2, fail_open=True)
+    async def _classify() -> tuple[bool, str]:
+        response = await model.ainvoke(
+            [
+                {
+                    "role": "system",
+                    "content": "You are a factual accuracy classifier. Return only valid JSON.",
+                },
+                {
+                    "role": "user",
+                    "content": _HALLUCINATION_SCREEN_PROMPT.format(
+                        user_input=user_message[:3000],
+                        tool_evidence=evidence_corpus[:5000],
+                        ai_response=response_text[:4000],
+                    ),
+                },
+            ],
+            config=RunnableConfig(callbacks=[]),
+        )
+
+        text = response.content if hasattr(response, "content") else str(response)
+        if isinstance(text, list):
+            text = " ".join(block.get("text", "") if isinstance(block, dict) else str(block) for block in text)
+        text = text.strip()
+
+        # Strip any markdown code fence
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text.strip())
+
+        data = json.loads(text)
+        has_hallucination = bool(data.get("has_hallucination", False))
+        details = str(data.get("details", ""))[:300]
+        if has_hallucination:
+            logger.warning(
+                "Hallucination detected in model output — details: %s",
+                details[:200],
+            )
+        return has_hallucination, details
+
+    try:
+        result = await _classify()
+        if result is None:
+            return False, ""
+        return result
+    except Exception:
+        # Fail open: if classification fails, let the response through.
+        return False, ""
