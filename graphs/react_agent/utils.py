@@ -1,7 +1,9 @@
 """Utility & helper functions."""
 
+import asyncio
 import os
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
@@ -9,6 +11,15 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 
 _ENV_LOADED = False
+
+# ---------------------------------------------------------------------------
+# Model client cache
+# ---------------------------------------------------------------------------
+# Caches LLM client instances by (provider, model, enable_thinking, thinking_budget)
+# so callers like generate_thread_title and screen_input don't build a new Bedrock
+# or Anthropic client on every single turn.
+_model_client_cache: dict[tuple[Any, ...], BaseChatModel] = {}
+_model_client_cache_lock = asyncio.Lock()
 
 
 def _find_env_file() -> Path | None:
@@ -59,14 +70,22 @@ def load_chat_model(
     enable_thinking: bool = False,
     thinking_budget: int = 10000,
 ) -> BaseChatModel:
-    """Load a chat model from a fully specified name.
+    """Load a chat model from a fully specified name, with module-level caching.
 
     Args:
         fully_specified_name (str): String in the format 'provider/model'.
         enable_thinking (bool): Whether to enable extended thinking for supported models.
         thinking_budget (int): Token budget for thinking (min 1024, max 128000).
+
+    Returns a cached instance when called with the same arguments, avoiding
+    redundant SDK client construction on every graph turn.
     """
     _ensure_env_loaded()
+
+    cache_key = (fully_specified_name, enable_thinking, thinking_budget)
+    # Fast path — no lock needed for a pure read on an already-populated cache
+    if cache_key in _model_client_cache:
+        return _model_client_cache[cache_key]
 
     provider, model = fully_specified_name.split("/", maxsplit=1)
     init_kwargs: dict[str, object] = {}
@@ -77,22 +96,27 @@ def load_chat_model(
         region = os.getenv("AWS_REGION_NAME") or os.getenv("AWS_DEFAULT_REGION", "eu-west-2")
         if enable_thinking:
             # Extended thinking requires temperature=1 on Bedrock
-            return ChatBedrockConverse(
+            client = ChatBedrockConverse(
                 model=model,
                 region_name=region,
                 temperature=1,
                 additional_model_request_fields={"thinking": {"type": "enabled", "budget_tokens": thinking_budget}},
             )
-        return ChatBedrockConverse(model=model, region_name=region, temperature=0)
+        else:
+            client = ChatBedrockConverse(model=model, region_name=region, temperature=0)
+    else:
+        provider_api_key_env = {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openai": "OPENAI_API_KEY",
+        }
+        api_key_env = provider_api_key_env.get(provider)
+        if api_key_env:
+            api_key = os.getenv(api_key_env)
+            if api_key:
+                init_kwargs["api_key"] = api_key
+        client = init_chat_model(model, model_provider=provider, **init_kwargs)
 
-    provider_api_key_env = {
-        "anthropic": "ANTHROPIC_API_KEY",
-        "openai": "OPENAI_API_KEY",
-    }
-    api_key_env = provider_api_key_env.get(provider)
-    if api_key_env:
-        api_key = os.getenv(api_key_env)
-        if api_key:
-            init_kwargs["api_key"] = api_key
-
-    return init_chat_model(model, model_provider=provider, **init_kwargs)
+    # Populate cache — race condition is benign: worst case two callers build
+    # the same client simultaneously and one is discarded.
+    _model_client_cache[cache_key] = client
+    return client

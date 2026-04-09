@@ -6,11 +6,13 @@ learning track information. Uses Redis when available, falls back to in-memory c
 Cache Strategy:
 1. Redis (distributed) - TTL of 1 hour for learning track
 2. In-memory (fallback) - TTL of 1 hour for learning track
-3. Thread metadata - Persists advisor for the conversation lifetime
+
+The advisor is never cached independently — it is always derived from the
+cached learning track so the two can never become out-of-sync after a track
+change or standalone advisor purchase.
 """
 
 import asyncio
-import json
 import time
 from typing import Any, cast
 
@@ -240,7 +242,12 @@ async def get_cached_learning_track(user_id: str, token: str) -> str | None:
 
 
 async def get_cached_advisor(user_id: str, token: str) -> tuple[dict[str, Any], str | None]:
-    """Get the student's career advisor, using cache when available.
+    """Get the student's career advisor, always derived from the cached learning track.
+
+    The advisor is NOT cached separately — it is always derived from the learning
+    track (which has its own Redis + in-memory cache).  This prevents the advisor
+    and learning track from ever becoming out-of-sync when the student changes track
+    or purchases a standalone advisor subscription with a different track selection.
 
     Args:
         user_id: The user's unique identifier
@@ -249,35 +256,14 @@ async def get_cached_advisor(user_id: str, token: str) -> tuple[dict[str, Any], 
     Returns:
         Tuple of (advisor_dict, learning_track)
     """
-    advisor_cache_key = _get_advisor_cache_key(user_id)
-
-    # Try to get cached advisor from Redis
-    cached_advisor = await _get_from_redis(advisor_cache_key)
-    if cached_advisor:
-        try:
-            advisor_data = json.loads(cached_advisor)
-            logger.debug("Advisor cache hit (Redis)", user_id=user_id)
-            return advisor_data["advisor"], advisor_data.get("learning_track")
-        except (json.JSONDecodeError, KeyError):
-            pass
-
-    # Get learning track (which has its own caching)
     learning_track = await get_cached_learning_track(user_id, token)
 
-    # Get advisor based on track
     if learning_track:
         advisor = get_advisor_by_track(learning_track)
         if not advisor:
             advisor = get_default_advisor()
     else:
         advisor = get_default_advisor()
-
-    # Cache the advisor in Redis
-    advisor_data = {
-        "advisor": advisor,
-        "learning_track": learning_track,
-    }
-    await _set_in_redis(advisor_cache_key, json.dumps(advisor_data))
 
     return advisor, learning_track
 
@@ -291,12 +277,13 @@ async def invalidate_user_cache(user_id: str) -> None:
     - Admin resets user data
     """
     track_key = _get_cache_key(user_id)
-    advisor_key = _get_advisor_cache_key(user_id)
+    # Also clear any legacy advisor cache keys that may exist from older deployments.
+    legacy_advisor_key = _get_advisor_cache_key(user_id)
 
     # Clear Redis cache
     try:
         client = redis_manager.get_client()
-        await client.delete(track_key, advisor_key)
+        await client.delete(track_key, legacy_advisor_key)
         logger.info("Invalidated Redis cache", user_id=user_id)
     except Exception as e:
         logger.warning("Failed to invalidate Redis cache", error=str(e))

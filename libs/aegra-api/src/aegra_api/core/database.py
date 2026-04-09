@@ -4,6 +4,7 @@ import os
 
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -71,7 +72,12 @@ class DatabaseManager:
 
         logger.info(f"Initializing LangGraph components with shared pool (max {lg_max} conns)...")
 
-        self._checkpointer = AsyncPostgresSaver(conn=self.lg_pool)
+        self._checkpointer = AsyncPostgresSaver(
+            conn=self.lg_pool,
+            serde=JsonPlusSerializer(
+                allowed_msgpack_modules={("react_agent.cost_tracker", "SessionCost")},
+            ),
+        )
         await self._checkpointer.setup()  # Ensure tables exist
 
         # Load store configuration for semantic search (if configured)
@@ -90,13 +96,26 @@ class DatabaseManager:
                 model_id = embed_str.removeprefix("bedrock:")
                 region = os.getenv("AWS_REGION_NAME") or os.getenv("AWS_DEFAULT_REGION") or "eu-west-2"
                 # Cohere models require input_type to distinguish indexing from retrieval.
-                # truncate="END" prevents ValueError when texts exceed Cohere's 2048-char limit.
                 model_kwargs = (
                     {"input_type": "search_document", "truncate": "END"} if model_id.startswith("cohere.") else {}
                 )
+                base_embed = BedrockEmbeddings(model_id=model_id, region_name=region, model_kwargs=model_kwargs)
+
+                # Wrap with auto-truncation for Cohere v3.  The langchain_aws
+                # library validates text length client-side (2048 char limit)
+                # BEFORE sending to the API, so the truncate="END" kwarg never
+                # gets a chance to help.  This wrapper truncates inputs before
+                # they reach that validation.
+                if model_id.startswith("cohere.") and not getattr(base_embed, "_is_cohere_v4", False):
+                    from aegra_api.core._truncating_embeddings import TruncatingEmbeddings
+
+                    embed = TruncatingEmbeddings(wrapped=base_embed, max_chars=2000)
+                else:
+                    embed = base_embed
+
                 index_config = {
                     **index_config,
-                    "embed": BedrockEmbeddings(model_id=model_id, region_name=region, model_kwargs=model_kwargs),
+                    "embed": embed,
                 }
 
         # Migrate BEFORE setup() — setup() uses ADD COLUMN IF NOT EXISTS, which is

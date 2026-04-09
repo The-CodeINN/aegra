@@ -56,7 +56,14 @@ def _get_user_token(user: User | None) -> str | None:
 
 
 async def _enrich_run_context_with_user_data(context: dict[str, Any] | None, user: User | None) -> dict[str, Any]:
-    """Inject user-scoped runtime data and resolve the assigned advisor when missing."""
+    """Inject user-scoped runtime data and always resolve the advisor server-side.
+
+    The advisor and learning_track are ALWAYS resolved from the LMS cache, regardless
+    of what the client sends.  Client-supplied values (from browser cookies or UI state)
+    can be stale — e.g. a user who purchased a standalone advisor and selected a
+    different track, or changed their onboarding track selection.  The server's cached
+    LMS lookup is the single source of truth.
+    """
     runtime_context = context.copy() if context else {}
     if not user:
         return runtime_context
@@ -67,15 +74,17 @@ async def _enrich_run_context_with_user_data(context: dict[str, Any] | None, use
     if token:
         runtime_context.setdefault("user_token", token)
 
-    needs_advisor = not runtime_context.get("advisor")
-    needs_track = not runtime_context.get("learning_track")
-
-    if token and (needs_advisor or needs_track):
+    if token:
+        # Always resolve advisor and learning_track server-side — overwrite any
+        # client-supplied values to guarantee the correct persona is always used.
         advisor, learning_track = await get_cached_advisor(user.identity, token)
-        if needs_advisor:
-            runtime_context["advisor"] = advisor
-        if needs_track and learning_track:
+        runtime_context["advisor"] = advisor
+        if learning_track:
             runtime_context["learning_track"] = learning_track
+        else:
+            # Server found no track — remove any client-supplied value to prevent
+            # a mismatch between the advisor persona and the track scope directive.
+            runtime_context.pop("learning_track", None)
 
     if "enrolled_course_ids" not in runtime_context:
         try:
