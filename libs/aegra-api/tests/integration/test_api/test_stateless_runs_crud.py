@@ -120,7 +120,7 @@ class TestStatelessWaitForRun:
 
         with (
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
-            patch("aegra_api.api.runs.get_langgraph_service") as mock_service,
+            patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_service,
             patch("aegra_api.api.stateless_runs._delete_thread_by_id", new_callable=AsyncMock),
         ):
             mock_service.return_value.list_graphs.return_value = ["test-graph"]
@@ -214,12 +214,16 @@ class TestStatelessWaitForRun:
         override_session_dependency(app, Session)
         client = make_client(app)
 
+        # Mock executor so wait_for_completion completes immediately
+        mock_executor = MagicMock()
+        mock_executor.wait_for_completion = AsyncMock(return_value=None)
+        mock_executor.submit = AsyncMock(return_value=None)
+
         with (
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
-            patch("aegra_api.api.runs.get_langgraph_service") as mock_service,
-            patch("aegra_api.api.runs.execute_run_async"),
-            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
-            patch("asyncio.wait_for", new_callable=AsyncMock),
+            patch("aegra_api.services.run_waiters._get_session_maker", return_value=mock_maker),
+            patch("aegra_api.services.run_waiters.executor", mock_executor),
+            patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_service,
             patch("aegra_api.api.stateless_runs._delete_thread_by_id", new_callable=AsyncMock),
         ):
             mock_service.return_value.list_graphs.return_value = ["test-graph"]
@@ -265,7 +269,7 @@ class TestStatelessStreamRun:
         client = make_client(app)
 
         with (
-            patch("aegra_api.api.runs.get_langgraph_service") as mock_service,
+            patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_service,
             patch("aegra_api.api.stateless_runs._delete_thread_by_id", new_callable=AsyncMock),
         ):
             mock_service.return_value.list_graphs.return_value = ["test-graph"]
@@ -322,7 +326,7 @@ class TestStatelessCreateRun:
         client = make_client(app)
 
         with (
-            patch("aegra_api.api.runs.get_langgraph_service") as mock_service,
+            patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_service,
             patch("aegra_api.api.stateless_runs._delete_thread_by_id", new_callable=AsyncMock),
         ):
             mock_service.return_value.list_graphs.return_value = ["test-graph"]
@@ -365,8 +369,8 @@ class TestStatelessCreateRun:
         )
         assert resp.status_code == 422
 
-    def test_config_context_conflict(self) -> None:
-        """Both configurable and context → 400."""
+    def test_config_context_allowed(self) -> None:
+        """Both configurable and context are allowed."""
         app = create_test_app(include_runs=True, include_threads=False)
 
         class Session(DummySessionBase):
@@ -385,7 +389,8 @@ class TestStatelessCreateRun:
                 "context": {"key": "val"},
             },
         )
-        assert resp.status_code == 400
+        # Validation conflict is removed; request proceeds to assistant lookup
+        assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------

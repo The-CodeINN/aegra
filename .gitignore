@@ -36,3 +36,9 @@ htmlcov/
 # Backup files
 *.bak
 *.pem
+
+# MacOS
+.DS_Store
+
+# Claude
+.claude/

@@ -695,8 +695,8 @@ class TestWaitForRun:
         # Should fail because thread is not interrupted
         assert resp.status_code == 400
 
-    def test_wait_for_run_with_config_and_context_conflict(self):
-        """Test wait endpoint rejects both configurable and context"""
+    def test_wait_for_run_with_config_and_context_allowed(self) -> None:
+        """Test wait endpoint allows both configurable and context."""
         app = create_test_app(include_runs=True, include_threads=False)
 
         override_session_dependency(app, BasicSession)
@@ -713,15 +713,15 @@ class TestWaitForRun:
                 },
             )
 
-        # Should reject having both configurable and context
-        assert resp.status_code == 400
+        # Validation conflict is removed; request proceeds to assistant lookup
+        assert resp.status_code == 404
 
 
 class TestCreateRunValidation:
     """Additional validation tests for create_run."""
 
-    def test_create_run_config_context_conflict(self):
-        """Test create_run rejects both configurable and context."""
+    def test_create_run_config_context_allowed(self) -> None:
+        """Test create_run allows both configurable and context."""
         app = create_test_app(include_runs=True, include_threads=False)
         override_session_dependency(app, BasicSession)
         client = make_client(app)
@@ -735,8 +735,8 @@ class TestCreateRunValidation:
                 "context": {"key": "value"},
             },
         )
-        assert resp.status_code == 400
-        assert "Cannot specify both" in resp.json()["detail"]
+        # Validation conflict is removed; request proceeds to assistant lookup
+        assert resp.status_code == 404
 
     def test_create_run_assistant_not_found(self):
         """Test create_run with non-existent assistant."""
@@ -760,7 +760,12 @@ class TestCreateRunValidation:
 
 
 class TestWaitForRunTimeouts:
-    """Test wait_for_run timeout behavior."""
+    """Test wait_for_run timeout behavior.
+
+    wait_for_run now returns a StreamingResponse wrapping heartbeat_wait_body.
+    On timeout, the heartbeat generator reads the run's current output from DB
+    and yields it as the final JSON chunk.
+    """
 
     def test_wait_for_run_timeout(self):
         """Test that wait_for_run returns current state on timeout."""
@@ -797,16 +802,19 @@ class TestWaitForRunTimeouts:
 
         mock_maker = _make_session_maker(Session())
 
+        # Mock executor so wait_for_completion raises TimeoutError immediately
+        mock_executor = MagicMock()
+        mock_executor.wait_for_completion = AsyncMock(side_effect=TimeoutError)
+        mock_executor.submit = AsyncMock(return_value=None)
+
         override_session_dependency(app, Session)
         client = make_client(app)
 
-        # Mock asyncio.wait_for to raise TimeoutError
         with (
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
-            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
-            patch("asyncio.wait_for", side_effect=TimeoutError),
-            patch("aegra_api.api.runs.get_langgraph_service") as mock_service,
-            patch("aegra_api.api.runs.execute_run_async"),
+            patch("aegra_api.services.run_waiters._get_session_maker", return_value=mock_maker),
+            patch("aegra_api.services.run_waiters.executor", mock_executor),
+            patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_service,
         ):
             mock_service.return_value.list_graphs.return_value = ["test-graph"]
 
@@ -819,5 +827,5 @@ class TestWaitForRunTimeouts:
             )
 
             assert resp.status_code == 200
-            # Should return output even if timed out (running state)
+            # StreamingResponse: body is heartbeat newlines + final JSON
             assert resp.json() == {"partial": "data"}

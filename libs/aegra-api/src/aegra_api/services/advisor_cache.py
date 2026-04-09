@@ -17,7 +17,7 @@ from typing import Any, cast
 import httpx
 import structlog
 
-from aegra_api.core.redis import redis_manager
+from aegra_api.core.redis_manager import redis_manager
 from aegra_api.data.career_advisors import (
     get_advisor_by_track,
     get_default_advisor,
@@ -50,9 +50,6 @@ def _get_advisor_cache_key(user_id: str) -> str:
 
 async def _get_from_redis(key: str) -> str | None:
     """Get value from Redis cache."""
-    if not redis_manager.is_available():
-        return None
-
     try:
         client = redis_manager.get_client()
         value = await client.get(key)
@@ -64,9 +61,6 @@ async def _get_from_redis(key: str) -> str | None:
 
 async def _set_in_redis(key: str, value: str, ttl: int = LEARNING_TRACK_CACHE_TTL) -> bool:
     """Set value in Redis cache with TTL."""
-    if not redis_manager.is_available():
-        return False
-
     try:
         client = redis_manager.get_client()
         await client.setex(key, ttl, value)
@@ -300,13 +294,12 @@ async def invalidate_user_cache(user_id: str) -> None:
     advisor_key = _get_advisor_cache_key(user_id)
 
     # Clear Redis cache
-    if redis_manager.is_available():
-        try:
-            client = redis_manager.get_client()
-            await client.delete(track_key, advisor_key)
-            logger.info("Invalidated Redis cache", user_id=user_id)
-        except Exception as e:
-            logger.warning("Failed to invalidate Redis cache", error=str(e))
+    try:
+        client = redis_manager.get_client()
+        await client.delete(track_key, advisor_key)
+        logger.info("Invalidated Redis cache", user_id=user_id)
+    except Exception as e:
+        logger.warning("Failed to invalidate Redis cache", error=str(e))
 
     # Clear in-memory cache
     async with _cache_lock:

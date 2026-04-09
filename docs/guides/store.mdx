@@ -12,19 +12,26 @@ The store works without any configuration — it's available by default.
 ### Put an item
 
 ```python
+import asyncio
 from langgraph_sdk import get_client
 
-client = get_client(url="http://localhost:2026")
 
-await client.store.put_item(
-    namespace=["users", "alice", "preferences"],
-    key="theme",
-    value={"color": "dark", "font_size": 14},
-)
+async def main():
+    client = get_client(url="http://localhost:2026")
+
+    await client.store.put_item(
+        namespace=["users", "alice", "preferences"],
+        key="theme",
+        value={"color": "dark", "font_size": 14},
+    )
+
+
+asyncio.run(main())
 ```
 
 <Note>
   Values must be JSON objects (dicts). Primitive values like strings or numbers are not accepted.
+  The snippets below assume you are inside an `async def` function with an initialized `client` — see the example above.
 </Note>
 
 ### Get an item
@@ -79,7 +86,13 @@ namespaces = await client.store.list_namespaces(
 
 ### Namespace scoping
 
-When authentication is enabled, all store operations are automatically scoped to the authenticated user's namespace. This means users can't access each other's data.
+All store operations are automatically scoped to the authenticated user's namespace under `["users", <user_id>]`. This means:
+
+- An empty namespace defaults to `["users", <user_id>]`
+- A namespace already under your user prefix (e.g. `["users", "alice", "docs"]`) passes through unchanged
+- Any other namespace (e.g. `["configs"]`) is automatically prefixed to `["users", <user_id>, "configs"]`
+
+This ensures users can never access each other's data, even if they craft a request with another user's namespace.
 
 ## Semantic search
 

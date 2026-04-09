@@ -1,6 +1,6 @@
 [project]
 name = "aegra-api"
-version = "0.8.2"
+version = "0.9.2"
 description = "Aegra core API - Self-hosted Agent Protocol server"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -59,8 +59,8 @@ dependencies = [
     "openpyxl>=3.1.5",
     # Email
     "aiosmtplib>=3.0.0",
-    # Redis
-    "redis>=5.0.0",
+    # Redis (optional broker backend for multi-instance streaming)
+    "redis[hiredis]>=5.0.0",
     # Langfuse
     "langfuse>=3.3.4",
     "pymongo[srv]>=4.16.0",
@@ -120,6 +120,7 @@ testpaths = ["tests"]
 markers = [
     "unit: unit tests",
     "e2e: end-to-end tests requiring a running server",
+    "prod_only: tests that require Redis workers (skipped in dev mode)",
 ]
 
 [dependency-groups]

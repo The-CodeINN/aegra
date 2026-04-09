@@ -21,7 +21,7 @@ from typing import Any
 import httpx
 import structlog
 
-from aegra_api.core.redis import redis_manager
+from aegra_api.core.redis_manager import redis_manager
 
 logger = structlog.get_logger()
 
@@ -57,8 +57,6 @@ def _cache_key(user_id: str, path: str) -> str:
 
 
 async def _redis_get(key: str) -> str | None:
-    if not redis_manager.is_available():
-        return None
     try:
         client = redis_manager.get_client()
         val = await client.get(key)
@@ -69,8 +67,6 @@ async def _redis_get(key: str) -> str | None:
 
 
 async def _redis_set(key: str, value: str, ttl: int) -> None:
-    if not redis_manager.is_available():
-        return
     try:
         client = redis_manager.get_client()
         await client.setex(key, ttl, value)
@@ -216,21 +212,20 @@ async def invalidate_lms_cache(user_id: str, paths: list[str] | None = None) -> 
         return any(pattern.match(endpoint_path) for pattern in template_patterns)
 
     # Redis
-    if redis_manager.is_available():
-        try:
-            client = redis_manager.get_client()
-            await client.delete(*keys)
+    try:
+        client = redis_manager.get_client()
+        await client.delete(*keys)
 
-            # Also clear concrete keys that match templated paths (e.g. {courseId}).
-            dynamic_keys: list[str] = []
-            async for raw_key in client.scan_iter(match=f"{user_prefix}*"):
-                key_str = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else str(raw_key)
-                if _key_matches_templates(key_str):
-                    dynamic_keys.append(key_str)
-            if dynamic_keys:
-                await client.delete(*dynamic_keys)
-        except Exception as exc:
-            logger.debug("lms_cache_invalidate_redis_error", error=str(exc))
+        # Also clear concrete keys that match templated paths (e.g. {courseId}).
+        dynamic_keys: list[str] = []
+        async for raw_key in client.scan_iter(match=f"{user_prefix}*"):
+            key_str = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else str(raw_key)
+            if _key_matches_templates(key_str):
+                dynamic_keys.append(key_str)
+        if dynamic_keys:
+            await client.delete(*dynamic_keys)
+    except Exception as exc:
+        logger.debug("lms_cache_invalidate_redis_error", error=str(exc))
 
     # Memory
     async with _cache_lock:
