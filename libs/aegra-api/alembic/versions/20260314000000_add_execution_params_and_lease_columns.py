@@ -7,7 +7,7 @@ Supports the worker executor architecture:
 - lease_expires_at: when the lease expires; a reaper re-enqueues runs
   whose leases have expired (worker crashed).
 
-Revision ID: a1b2c3d4e5f6
+Revision ID: c4d5e6f7a8b9
 Revises: e7f3a1b2c4d5
 Create Date: 2026-03-14 00:00:00.000000
 
@@ -19,7 +19,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision = "a1b2c3d4e5f6"
+revision = "c4d5e6f7a8b9"
 down_revision = "e7f3a1b2c4d5"
 branch_labels = None
 depends_on = None
