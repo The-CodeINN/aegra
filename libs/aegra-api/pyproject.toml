@@ -1,6 +1,6 @@
 [project]
 name = "aegra-api"
-version = "0.9.2"
+version = "0.9.3"
 description = "Aegra core API - Self-hosted Agent Protocol server"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -37,6 +37,10 @@ dependencies = [
     "opentelemetry-sdk>=1.39.1",
     "opentelemetry-exporter-otlp>=1.39.1",
     "openinference-instrumentation-langchain>=0.1.58",
+
+    # Metrics
+    "prometheus-fastapi-instrumentator>=7.1.0",
+
     # Utils
     "structlog>=25.4.0",
     "asgi-correlation-id>=4.3.4",
@@ -69,10 +73,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ibbybuilds/aegra"
-Documentation = "https://github.com/ibbybuilds/aegra#readme"
-Repository = "https://github.com/ibbybuilds/aegra"
-Issues = "https://github.com/ibbybuilds/aegra/issues"
+Homepage = "https://github.com/aegra/aegra"
+Documentation = "https://github.com/aegra/aegra#readme"
+Repository = "https://github.com/aegra/aegra"
+Issues = "https://github.com/aegra/aegra/issues"
 
 [build-system]
 requires = ["hatchling"]
