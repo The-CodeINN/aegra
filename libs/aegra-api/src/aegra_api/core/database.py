@@ -75,7 +75,7 @@ class DatabaseManager:
         self._checkpointer = AsyncPostgresSaver(
             conn=self.lg_pool,
             serde=JsonPlusSerializer(
-                allowed_msgpack_modules={("react_agent.cost_tracker", "SessionCost")},
+                allowed_json_modules=[("react_agent.cost_tracker", "SessionCost")],
             ),
         )
         await self._checkpointer.setup()  # Ensure tables exist
@@ -99,7 +99,43 @@ class DatabaseManager:
                 model_kwargs = (
                     {"input_type": "search_document", "truncate": "END"} if model_id.startswith("cohere.") else {}
                 )
-                base_embed = BedrockEmbeddings(model_id=model_id, region_name=region, model_kwargs=model_kwargs)
+                # BedrockEmbeddings uses invoke_model which only supports SigV4 (IAM) auth.
+                # ChatBedrockConverse uses converse which supports bearer token auth and may
+                # set AWS_BEARER_TOKEN_BEDROCK in os.environ at init time.  botocore's
+                # _set_auth_scheme_preference_signer event handler reads that env var at
+                # request time and overrides the signer to 'bearer' for ALL bedrock-runtime
+                # clients — including our IAM-based embedding client — causing invoke_model
+                # to fail with "Invalid API Key format" or "Unable to locate auth token".
+                #
+                # Fix: pass Config(signature_version='v4') when creating the boto3 client.
+                # botocore wraps the value as ClientConfigString, which sets
+                # has_in_code_configuration=True in _set_auth_scheme_preference_signer,
+                # preventing the bearer token override entirely.
+                import boto3
+                from botocore.config import Config as BotocoreConfig
+
+                bedrock_access_key = os.getenv("BEDROCK_AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
+                bedrock_secret_key = os.getenv("BEDROCK_AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
+                bedrock_session_token = os.getenv("BEDROCK_AWS_SESSION_TOKEN") or os.getenv("AWS_SESSION_TOKEN")
+
+                sigv4_config = BotocoreConfig(signature_version="v4")
+
+                if bedrock_access_key and bedrock_secret_key:
+                    session = boto3.Session(
+                        aws_access_key_id=bedrock_access_key,
+                        aws_secret_access_key=bedrock_secret_key,
+                        **({"aws_session_token": bedrock_session_token} if bedrock_session_token else {}),
+                    )
+                    bedrock_client = session.client("bedrock-runtime", region_name=region, config=sigv4_config)
+                else:
+                    # No explicit IAM creds — fall back to boto3 default credential chain.
+                    bedrock_client = boto3.client("bedrock-runtime", region_name=region, config=sigv4_config)
+                base_embed = BedrockEmbeddings(
+                    model_id=model_id,
+                    region_name=region,
+                    model_kwargs=model_kwargs,
+                    client=bedrock_client,
+                )
 
                 # Wrap with auto-truncation for Cohere v3.  The langchain_aws
                 # library validates text length client-side (2048 char limit)

@@ -1,20 +1,27 @@
-"""Opportunity Discovery Engine — v7.
+"""Opportunity Discovery Engine — v8.
 
 AI-powered discovery of events and job opportunities
 matched to each user's enrolled courses, career goals, and profile.
 
-Changes in v7
+Changes in v8
 --------------
-* Both events AND jobs use Serper.dev (Google Search via google.serper.dev)
-* Brave, SerpAPI, Claude all REMOVED
-* Provider selection REMOVED — single backend: Serper.dev
+* Job search backend replaced: SerpAPI / Serper.dev REMOVED for jobs
+* Events still use Serper.dev (Google Search via google.serper.dev)
+* Jobs now use two free, structured job-board APIs (no auth required):
+  - Arbeitnow (arbeitnow.com) — Germany / EU focused; visa sponsorship,
+    4-day week, remote-friendly listings; 100 jobs/page via GET API
+  - Rise (api.joinrise.io) — Global; AI-enriched metadata: one-sentence
+    summaries, skill requirements, salary estimates; link-back attribution
+    to joinrise.co as required by Rise ToS
+* Single parallel fetch (one call per source) — results matched in-memory
+  across all user tracks; total outbound job requests = 2 regardless of
+  track count
 * Auto scan: 2× per day (scheduler)
 * Manual scan: max 4 per user per day (rate-limited at API layer)
 * AI strategy generation restored DURING discovery (per requirement.md)
   - Events → generate_networking_strategy()
-  - Jobs → generate_application_strategy()
+  - Jobs  → generate_application_strategy()
 * Redundant LMS calls removed — profile.enrolled_tracks reused for tracks
-* Parallel search per track via asyncio.gather for speed
 """
 
 from __future__ import annotations
@@ -247,6 +254,9 @@ JOB_DOMAINS = frozenset(
         "totaljobs.com",
         "cwjobs.co.uk",
         "monster.com",
+        # Structured job board APIs used directly
+        "arbeitnow.com",  # Germany / EU focused, free API
+        "joinrise.co",  # Global, free API with AI-enriched metadata
     ]
 )
 
@@ -397,7 +407,11 @@ def _classify_result(url: str, title: str, description: str) -> str | None:
 class OpportunityDiscoveryEngine:
     """Discovers relevant opportunities (events, jobs) for users.
 
-    Architecture: Serper.dev (google.serper.dev) for both events and jobs.
+    Architecture:
+    - Events: Serper.dev (google.serper.dev) via Google Search
+    - Jobs:   Arbeitnow (arbeitnow.com, Germany/EU) + Rise (joinrise.co, global)
+              Both job APIs are free with no authentication required.
+              Rise attribution: stored URLs link back to joinrise.co per their ToS.
     """
 
     def __init__(
@@ -1031,52 +1045,279 @@ class OpportunityDiscoveryEngine:
                 all_events.extend(batch)
         return all_events
 
+    # ------------------------------------------------------------------
+    # Arbeitnow + Rise: raw fetch helpers
+    # ------------------------------------------------------------------
+
+    async def _search_arbeitnow_raw(self, page: int = 1) -> list[dict[str, Any]]:
+        """Fetch a page of job listings from Arbeitnow's free public API.
+
+        No authentication required. Returns Germany/EU-focused listings.
+        100 jobs per page, sorted newest-first.
+        """
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://www.arbeitnow.com/api/job-board-api",
+                    params={"page": page, "limit": 100},
+                    headers={"Accept": "application/json"},
+                    timeout=15.0,
+                )
+                resp.raise_for_status()
+                jobs = resp.json().get("data", [])
+                logger.info("arbeitnow_fetched", count=len(jobs), page=page)
+                return jobs
+        except httpx.HTTPError as e:
+            logger.error("arbeitnow_fetch_failed", error=str(e))
+            return []
+
+    async def _search_rise_raw(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Fetch trending jobs from Rise's free public API.
+
+        No authentication required. Returns global listings with AI-enriched
+        metadata: salary estimates, skill requirements, one-sentence summaries.
+        Attribution: URLs point to joinrise.co per Rise ToS.
+        """
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://api.joinrise.io/api/v1/jobs/public",
+                    params={
+                        "page": 1,
+                        "limit": limit,
+                        "sort": "desc",
+                        "sortedBy": "createdAt",
+                        "includeDescription": "true",
+                        "isTrending": "true",
+                    },
+                    headers={"Accept": "application/json"},
+                    timeout=15.0,
+                )
+                resp.raise_for_status()
+                jobs = resp.json().get("result", {}).get("jobs", [])
+                logger.info("rise_fetched", count=len(jobs))
+                return jobs
+        except httpx.HTTPError as e:
+            logger.error("rise_fetch_failed", error=str(e))
+            return []
+
+    # ------------------------------------------------------------------
+    # Arbeitnow + Rise: per-job parsers
+    # ------------------------------------------------------------------
+
+    def _parse_arbeitnow_job(
+        self,
+        job: dict[str, Any],
+        track: str,
+        locations: list[str],
+        profile: StudentProfile | None = None,
+    ) -> dict[str, Any] | None:
+        """Parse an Arbeitnow raw job record into the standard opportunity format.
+
+        Drops jobs that don't match the track keywords or the user's location
+        (unless the listing is explicitly remote-friendly).
+        """
+        title = job.get("title", "")
+        raw_html = job.get("description", "")
+        url = job.get("url", "")
+        company = job.get("company_name", "")
+        job_location = job.get("location", "Germany")
+        is_remote = bool(job.get("remote", False))
+        tags: list[str] = job.get("tags", []) or []
+
+        if not url or not title:
+            return None
+
+        # Strip HTML to get plain-text description for matching
+        clean_desc = re.sub(r"<[^>]+>", " ", raw_html)
+        clean_desc = re.sub(r"\s+", " ", clean_desc).strip()
+        short_desc = clean_desc[:500]
+
+        tag_text = " ".join(tags).lower()
+        content = f"{title} {short_desc} {tag_text}".lower()
+
+        # Track keyword relevance gate
+        track_keywords = self._keywords_for_track(track)
+        if not any(kw.lower() in content for kw in track_keywords):
+            return None
+
+        # Location gate
+        display_location = "Remote" if is_remote else _readable_location(job_location)
+        target_loc = locations[0] if locations else "remote"
+        if not is_remote:
+            loc_check = f"{title} {short_desc} {display_location}".lower()
+            if not _is_location_compatible(target_loc, title, loc_check):
+                return None
+
+        # Scoring
+        match_score = Decimal("0.50")
+        for kw in track_keywords:
+            if kw.lower() in content:
+                match_score += Decimal("0.08")
+        match_score = min(match_score, Decimal("1.00"))
+
+        reason_tags = ["matched_track", "matched_skill_signals"]
+        if is_remote or _is_remote_friendly(content):
+            reason_tags.append("matched_location")
+
+        return {
+            "opportunity_type": "job",
+            "title": title,
+            "description": short_desc,
+            "url": url,
+            "location": display_location,
+            "matched_track": track,
+            "match_score": match_score,
+            "company": company,
+            "salary_range": None,
+            "reason_tags": reason_tags,
+            "_source": "arbeitnow",
+            "_query": "",
+        }
+
+    def _parse_rise_job(
+        self,
+        job: dict[str, Any],
+        track: str,
+        locations: list[str],
+        profile: StudentProfile | None = None,
+    ) -> dict[str, Any] | None:
+        """Parse a Rise API job record into the standard opportunity format.
+
+        Uses the AI-enriched ``descriptionBreakdown`` block for the summary,
+        skill requirements, and salary range. The stored URL links back to
+        joinrise.co to satisfy Rise attribution requirements.
+        """
+        title = job.get("title", "")
+        url = job.get("url", "")
+        job_location = job.get("locationAddress", "") or ""
+        work_type = job.get("type", "") or ""  # "Remote" | "Hybrid" | "Onsite"
+        owner = job.get("owner") or {}
+        company = owner.get("companyName", "")
+
+        desc_bd = job.get("descriptionBreakdown") or {}
+        summary: str = desc_bd.get("oneSentenceJobSummary", "") or ""
+        skill_reqs: list[str] = desc_bd.get("skillRequirements") or []
+        keywords_list: list[str] = desc_bd.get("keywords") or []
+        salary_min = desc_bd.get("salaryRangeMinYearly")
+        salary_max = desc_bd.get("salaryRangeMaxYearly")
+
+        if not url or not title:
+            return None
+
+        # Track keyword relevance gate
+        track_keywords = self._keywords_for_track(track)
+        content = f"{title} {summary} {' '.join(skill_reqs)} {' '.join(keywords_list)}".lower()
+        if not any(kw.lower() in content for kw in track_keywords):
+            return None
+
+        # Location gate
+        is_remote = "remote" in work_type.lower() or "remote" in job_location.lower()
+        display_location = "Remote" if is_remote else _readable_location(job_location) if job_location else ""
+        target_loc = locations[0] if locations else "remote"
+        if (
+            not is_remote
+            and job_location
+            and not _is_location_compatible(target_loc, title, f"{summary} {job_location}")
+        ):
+            return None
+
+        # Build plain-text description from AI breakdown
+        description = summary
+        if skill_reqs:
+            description += " | Skills: " + ", ".join(skill_reqs[:5])
+
+        # Salary string
+        salary_range: str | None = None
+        if salary_min and salary_max:
+            salary_range = f"${int(salary_min):,}–${int(salary_max):,}/yr"
+        elif salary_min:
+            salary_range = f"${int(salary_min):,}+/yr"
+
+        # Scoring
+        match_score = Decimal("0.50")
+        for kw in track_keywords:
+            if kw.lower() in content:
+                match_score += Decimal("0.08")
+        match_score = min(match_score, Decimal("1.00"))
+
+        reason_tags = ["matched_track", "matched_skill_signals"]
+        if is_remote:
+            reason_tags.append("matched_location")
+
+        return {
+            "opportunity_type": "job",
+            "title": title,
+            "description": description,
+            "url": url,  # joinrise.co link — satisfies Rise ToS attribution
+            "location": display_location,
+            "matched_track": track,
+            "match_score": match_score,
+            "company": company,
+            "salary_range": salary_range,
+            "reason_tags": reason_tags,
+            "_source": "rise",
+            "_query": "",
+        }
+
+    # ------------------------------------------------------------------
+    # Job discovery — consolidated Arbeitnow + Rise
+    # ------------------------------------------------------------------
+
     async def _discover_jobs(
         self,
         tracks: list[str],
         locations: list[str],
         profile: StudentProfile | None,
         seen_urls: set[str],
-        queries_per_category: int = 2,
+        queries_per_category: int = 2,  # kept for call-site compatibility
     ) -> list[dict[str, Any]]:
-        """Discover jobs via Serper.dev (site: operator queries)."""
-        sem = asyncio.Semaphore(2)
+        """Discover jobs via Arbeitnow (Germany/EU) and Rise (global).
 
-        async def _search_one(query: str, track: str, loc: str) -> list[dict[str, Any]]:
-            async with sem:
-                results = await self.serper_search(query, num=10)
-                parsed_list: list[dict[str, Any]] = []
-                for r in results:
-                    url = r.get("link", "") or r.get("url", "")
-                    if not url or url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    title = r.get("title", "")
-                    desc = r.get("snippet", "") or r.get("description", "")
-                    if not await self.should_keep_result("job", title, desc, url):
-                        continue
-                    if not _is_location_compatible(loc, title, desc):
-                        continue
+        Both APIs are free and require no authentication.  A single parallel
+        fetch pulls a fresh batch from each source; results are then matched
+        against every user track in-memory — one combined fetch, not one per
+        track — keeping total outbound requests to exactly two.
 
-                    parsed = self.parse_result(r, track, loc, profile=profile)
-                    if parsed and parsed["opportunity_type"] == "job" and parsed["match_score"] >= Decimal("0.50"):
-                        parsed["_query"] = query
-                        parsed["_source"] = "serper"
-                        parsed_list.append(parsed)
-                return parsed_list
+        Rise attribution: matched results store the joinrise.co URL as
+        required by Rise's API Terms of Service.
+        """
+        # Single parallel fetch — one call to each source
+        arbeitnow_raw, rise_raw = await asyncio.gather(
+            self._search_arbeitnow_raw(),
+            self._search_rise_raw(),
+        )
 
-        tasks = []
-        for track_name in tracks:
-            for location in locations:
-                job_queries = self.build_job_queries(track_name, location, profile)
-                for q in job_queries[:queries_per_category]:
-                    tasks.append(_search_one(q, track_name, location))
-
-        gathered = await asyncio.gather(*tasks, return_exceptions=True)
         all_jobs: list[dict[str, Any]] = []
-        for batch in gathered:
-            if isinstance(batch, list):
-                all_jobs.extend(batch)
+
+        for track_name in tracks:
+            # Arbeitnow — Germany / EU listings
+            for raw_job in arbeitnow_raw:
+                url = raw_job.get("url", "")
+                if not url or url in seen_urls:
+                    continue
+                parsed = self._parse_arbeitnow_job(raw_job, track_name, locations, profile)
+                if parsed:
+                    seen_urls.add(url)
+                    all_jobs.append(parsed)
+
+            # Rise — global listings with AI-enriched metadata
+            for raw_job in rise_raw:
+                url = raw_job.get("url", "")
+                if not url or url in seen_urls:
+                    continue
+                parsed = self._parse_rise_job(raw_job, track_name, locations, profile)
+                if parsed:
+                    seen_urls.add(url)
+                    all_jobs.append(parsed)
+
+        logger.info(
+            "job_discovery_complete",
+            total=len(all_jobs),
+            arbeitnow=len([j for j in all_jobs if j.get("_source") == "arbeitnow"]),
+            rise=len([j for j in all_jobs if j.get("_source") == "rise"]),
+            tracks=tracks,
+        )
         return all_jobs
 
     async def discover_for_user(

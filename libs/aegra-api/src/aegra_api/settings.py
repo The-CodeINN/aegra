@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 from typing import Annotated
 
+from dotenv import load_dotenv
 from pydantic import BeforeValidator, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -49,6 +50,12 @@ def _find_env_file() -> str | None:
 
 
 _ENV_FILE = _find_env_file()
+
+if _ENV_FILE:
+    # BaseSettings reads known fields from env_file, but arbitrary values such as
+    # BEDROCK_AWS_ACCESS_KEY_ID must also exist in os.environ for runtime code
+    # that uses os.getenv() directly.
+    load_dotenv(_ENV_FILE, override=False)
 
 
 class EnvBase(BaseSettings):

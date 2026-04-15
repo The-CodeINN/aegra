@@ -1096,6 +1096,70 @@ async def search_course_content(
         }
 
 
+async def _fetch_github_profile(username: str) -> dict[str, Any]:
+    """Fetch a public GitHub profile and top repos via the GitHub REST API.
+
+    The GitHub API allows unauthenticated access to public data (60 req/hour).
+    This avoids the browser-session requirement of the github.com profile page.
+    """
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "DeDataHubBot/1.0",
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Fetch profile and repos in parallel
+        profile_resp, repos_resp = await asyncio.gather(
+            client.get(f"https://api.github.com/users/{username}", headers=headers),
+            client.get(
+                f"https://api.github.com/users/{username}/repos",
+                headers=headers,
+                params={"sort": "pushed", "per_page": 10, "type": "owner"},
+            ),
+            return_exceptions=True,
+        )
+
+    profile: dict[str, Any] = {}
+    if not isinstance(profile_resp, Exception):
+        profile_resp.raise_for_status()
+        p = profile_resp.json()
+        profile = {
+            "name": p.get("name"),
+            "bio": p.get("bio"),
+            "company": p.get("company"),
+            "location": p.get("location"),
+            "blog": p.get("blog"),
+            "public_repos": p.get("public_repos"),
+            "followers": p.get("followers"),
+        }
+
+    repos: list[dict[str, Any]] = []
+    if not isinstance(repos_resp, Exception):
+        repos_resp.raise_for_status()
+        for r in repos_resp.json():
+            if r.get("fork"):
+                continue  # skip forks — own work only
+            repos.append(
+                {
+                    "name": r.get("name"),
+                    "description": r.get("description"),
+                    "language": r.get("language"),
+                    "stars": r.get("stargazers_count"),
+                    "forks": r.get("forks_count"),
+                    "topics": r.get("topics", []),
+                    "updated_at": (r.get("pushed_at") or "")[:10],
+                }
+            )
+
+    return {
+        "source": "github_api",
+        "username": username,
+        "profile": profile,
+        "repos": repos[:8],
+    }
+
+
 async def read_webpage(url: str) -> dict[str, Any]:
     """Fetch and summarize a webpage so advice can be based on page content, not just snippet text."""
     if not isinstance(url, str) or not url.strip():
@@ -1104,6 +1168,60 @@ async def read_webpage(url: str) -> dict[str, Any]:
     cleaned_url = url.strip()
     if not cleaned_url.startswith(("http://", "https://")):
         cleaned_url = f"https://{cleaned_url}"
+
+    parsed = urlparse(cleaned_url)
+    hostname = parsed.hostname or ""
+
+    # GitHub profile pages require a browser session to render, but the REST API
+    # provides richer structured data for public profiles — use it instead.
+    if hostname in ("github.com", "www.github.com"):
+        path_parts = [p for p in parsed.path.strip("/").split("/") if p]
+        if path_parts:
+            username = path_parts[0]
+            try:
+                return await _fetch_github_profile(username)
+            except Exception as e:
+                logger.warning(f"GitHub API fetch failed for {username}: {e}")
+                return {
+                    "error": "github_api_error",
+                    "message": "GitHub profile could not be fetched. Use the self-reported onboarding fields instead.",
+                    "url": cleaned_url,
+                }
+        return {
+            "error": "invalid_github_url",
+            "message": "Could not extract a GitHub username from the URL.",
+            "url": cleaned_url,
+        }
+
+    # LinkedIn enforces HTTP 999 + TLS fingerprinting for direct access.
+    # Use Brave Search to retrieve indexed profile snippets instead — Brave caches
+    # LinkedIn pages and returns headline, current role, and experience blurbs.
+    if hostname in ("linkedin.com", "www.linkedin.com") or hostname.endswith(".linkedin.com"):
+        try:
+            # Extract just the username slug from /in/<username> — quoting the full path
+            # or including the slash kills Brave's index lookup. Plain username works best.
+            path_parts = [p for p in parsed.path.strip("/").split("/") if p]
+            # path_parts[0] == "in", path_parts[1] == username (if present)
+            username_slug = path_parts[1] if len(path_parts) >= 2 else path_parts[0] if path_parts else ""
+            query = f"site:linkedin.com {username_slug}" if username_slug else f"site:linkedin.com {cleaned_url}"
+            search_result = await brave_search(query)
+            if search_result and not search_result.startswith("Search failed"):
+                return {
+                    "source": "brave_search_linkedin",
+                    "url": cleaned_url,
+                    "note": "LinkedIn blocks direct access; content retrieved via Brave Search index.",
+                    "content": search_result,
+                }
+        except Exception as e:
+            logger.warning(f"Brave Search fallback for LinkedIn failed: {e}")
+        return {
+            "error": "linkedin_unavailable",
+            "message": (
+                "LinkedIn blocks direct access and the Brave Search fallback returned no results. "
+                "Use the self-reported onboarding fields (s2, s3, s5) as the source of truth instead."
+            ),
+            "url": cleaned_url,
+        }
 
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:

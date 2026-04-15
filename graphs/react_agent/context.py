@@ -9,6 +9,22 @@ from typing import Annotated, Any
 from react_agent import prompts
 
 
+def _default_lms_api_url() -> str:
+    """Resolve LMS URL from env, settings, or a safe local default."""
+    lms_url = os.getenv("LMS_URL")
+    if lms_url:
+        return lms_url
+
+    try:
+        from aegra_api.settings import settings
+
+        return settings.app.LMS_URL
+    except Exception as exc:
+        raise RuntimeError(
+            "LMS_URL is not configured. Set LMS_URL in environment or configure AppSettings.LMS_URL."
+        ) from exc
+
+
 @dataclass(kw_only=True)
 class Context:
     """The context for the agent."""
@@ -84,7 +100,7 @@ class Context:
     )
 
     lms_api_url: str = field(
-        default_factory=lambda: os.environ["LMS_URL"],
+        default_factory=_default_lms_api_url,
         metadata={"description": "Base URL for the LMS API to fetch student information."},
     )
 

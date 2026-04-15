@@ -1121,8 +1121,14 @@ async def generate_thread_title(state: State, runtime: Runtime[Context]) -> dict
     first_human = get_message_text(human_messages[0])[:400]
     first_ai = get_message_text(ai_messages[0])[:400] if ai_messages else ""
 
+    # Base the title on the user's message — it reflects their actual intent.
+    # Only supplement with the AI response when the user's message is too short
+    # to produce a meaningful title (pure greetings like "hi" or "hello").
+    # Never derive the title from the AI response alone — if the agent refused
+    # or gave an unexpected reply, we do not want that echoed as the thread title.
+    _human_is_greeting = len(first_human.strip()) <= 20
     exchange = f"User: {first_human}"
-    if first_ai:
+    if first_ai and _human_is_greeting:
         exchange += f"\nAssistant: {first_ai}"
 
     model = load_chat_model(
@@ -1135,7 +1141,8 @@ async def generate_thread_title(state: State, runtime: Runtime[Context]) -> dict
                 "role": "system",
                 "content": (
                     "Generate a concise 4-6 word title for this conversation. "
-                    "Base it on the actual topic discussed, not on greetings. "
+                    "Base it on the user's message — it reflects their actual intent. "
+                    "Do not echo or paraphrase the assistant's response. "
                     "Return only the title text — no quotes, no punctuation, no explanation."
                 ),
             },
@@ -1303,6 +1310,10 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
                             "operationalerror",
                         )
                     )
+                    is_bedrock_auth_error = (
+                        type(exc).__name__ in {"NoAuthTokenError", "NoCredentialsError"}
+                        or "unable to locate authorization token" in exc_str
+                    )
                     if is_connection_error and attempt == 0:
                         logger.warning(
                             "Memory consolidation hit a transient connection error — retrying (attempt %d): %s",
@@ -1311,6 +1322,12 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
                         )
                         await asyncio.sleep(1)
                         continue
+                    if is_bedrock_auth_error:
+                        logger.warning(
+                            "Skipping background memory consolidation due to missing Bedrock auth token. "
+                            "Configure AWS credentials to enable embedding-based memory search.",
+                        )
+                        break
                     logger.exception("Background memory consolidation failed; continuing.")
                     break
 

@@ -21,7 +21,8 @@
         "https://dedatahub.io",
         "https://www.dedatahub.io",
         "http://localhost:3000",
-        "http://127.0.0.1:3000"
+        "http://127.0.0.1:3000",
+        "https://dedatahub-api.vercel.app"
       ],
       "allow_credentials": true,
       "allow_methods": ["*"],
