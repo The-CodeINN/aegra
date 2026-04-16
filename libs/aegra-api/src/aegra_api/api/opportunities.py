@@ -11,8 +11,9 @@ Endpoints:
 - POST  /opportunities/discover      manual scan (max 4/day per user)
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
@@ -88,23 +89,114 @@ class OpportunityListResponse(BaseModel):
 
 class DiscoverRequest(BaseModel):
     auth_token: str | None = None
+    timezone_name: str | None = None
+    timezone_offset_minutes: int | None = None
 
 
 # ── Rate limiting helpers ────────────────────────────────────────────
 
 
-async def _get_scan_count_today(session: AsyncSession, user_id: str) -> int:
+def _get_scan_timezone(timezone_name: str | None = None, timezone_offset_minutes: int | None = None) -> tzinfo:
+    """Resolve the client timezone used for manual-scan daily limits."""
+    if timezone_name:
+        normalized = timezone_name.strip()
+        if normalized:
+            try:
+                return ZoneInfo(normalized)
+            except ZoneInfoNotFoundError:
+                pass
+
+    if timezone_offset_minutes is not None:
+        max_offset_minutes = 14 * 60
+        if -max_offset_minutes <= timezone_offset_minutes <= max_offset_minutes:
+            return timezone(timedelta(minutes=timezone_offset_minutes))
+
+    return UTC
+
+
+def _scan_day_key(
+    *,
+    timezone_name: str | None = None,
+    timezone_offset_minutes: int | None = None,
+    now: datetime | None = None,
+) -> str:
+    current_time = now or datetime.now(UTC)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=UTC)
+
+    scan_timezone = _get_scan_timezone(timezone_name, timezone_offset_minutes)
+    return current_time.astimezone(scan_timezone).strftime("%Y-%m-%d")
+
+
+def _scan_count_for_day(
+    scan_log: dict[str, int] | None,
+    *,
+    timezone_name: str | None = None,
+    timezone_offset_minutes: int | None = None,
+    now: datetime | None = None,
+) -> int:
+    if not scan_log:
+        return 0
+
+    today = _scan_day_key(
+        timezone_name=timezone_name,
+        timezone_offset_minutes=timezone_offset_minutes,
+        now=now,
+    )
+    return int(scan_log.get(today, 0))
+
+
+def _increment_scan_log(
+    scan_log: dict[str, int] | None,
+    *,
+    timezone_name: str | None = None,
+    timezone_offset_minutes: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    current_time = now or datetime.now(UTC)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=UTC)
+
+    updated_scan_log = dict(scan_log or {})
+    today = _scan_day_key(
+        timezone_name=timezone_name,
+        timezone_offset_minutes=timezone_offset_minutes,
+        now=current_time,
+    )
+    updated_scan_log[today] = int(updated_scan_log.get(today, 0)) + 1
+
+    scan_timezone = _get_scan_timezone(timezone_name, timezone_offset_minutes)
+    cutoff = (current_time.astimezone(scan_timezone).date() - timedelta(days=7)).isoformat()
+    return {key: int(value) for key, value in updated_scan_log.items() if key >= cutoff}
+
+
+async def _get_scan_count_today(
+    session: AsyncSession,
+    user_id: str,
+    *,
+    timezone_name: str | None = None,
+    timezone_offset_minutes: int | None = None,
+) -> int:
     """Return how many manual scans the user has done today."""
     result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
     prefs = result.scalar_one_or_none()
     if not prefs or not prefs.preferences:
         return 0
     scan_log = prefs.preferences.get("scan_log", {})
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    return scan_log.get(today, 0)
+    return _scan_count_for_day(
+        scan_log,
+        timezone_name=timezone_name,
+        timezone_offset_minutes=timezone_offset_minutes,
+    )
 
 
-async def _record_scan(session: AsyncSession, user_id: str) -> None:
+async def _record_scan(
+    session: AsyncSession,
+    user_id: str,
+    *,
+    timezone_name: str | None = None,
+    timezone_offset_minutes: int | None = None,
+) -> None:
     """Increment the user's manual scan count for today."""
     result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
     prefs = result.scalar_one_or_none()
@@ -113,13 +205,11 @@ async def _record_scan(session: AsyncSession, user_id: str) -> None:
         session.add(prefs)
 
     preferences = dict(prefs.preferences or {})
-    scan_log = dict(preferences.get("scan_log", {}))
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    scan_log[today] = scan_log.get(today, 0) + 1
-
-    # Keep only the last 7 days
-    cutoff = (datetime.now(UTC) - timedelta(days=7)).strftime("%Y-%m-%d")
-    scan_log = {k: v for k, v in scan_log.items() if k >= cutoff}
+    scan_log = _increment_scan_log(
+        preferences.get("scan_log", {}),
+        timezone_name=timezone_name,
+        timezone_offset_minutes=timezone_offset_minutes,
+    )
 
     preferences["scan_log"] = scan_log
     prefs.preferences = preferences
@@ -248,9 +338,17 @@ async def trigger_discovery(
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Manually trigger opportunity discovery scan (max 4/day per user)."""
+    timezone_name = request.timezone_name if request else None
+    timezone_offset_minutes = request.timezone_offset_minutes if request else None
+
     # Rate limiting
     max_scans = settings.discovery.DISCOVERY_MAX_MANUAL_SCANS_PER_DAY
-    count = await _get_scan_count_today(session, user.identity)
+    count = await _get_scan_count_today(
+        session,
+        user.identity,
+        timezone_name=timezone_name,
+        timezone_offset_minutes=timezone_offset_minutes,
+    )
     if count >= max_scans:
         raise HTTPException(
             status_code=429,
@@ -278,7 +376,12 @@ async def trigger_discovery(
     await opportunity_engine.create_notifications_batch(session, discovered)
 
     # Record the scan for rate limiting
-    await _record_scan(session, user.identity)
+    await _record_scan(
+        session,
+        user.identity,
+        timezone_name=timezone_name,
+        timezone_offset_minutes=timezone_offset_minutes,
+    )
 
     return {
         "status": "success",

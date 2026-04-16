@@ -1,7 +1,8 @@
+import json
 import os
 import re
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from dotenv import load_dotenv
 from pydantic import BeforeValidator, computed_field, model_validator
@@ -219,11 +220,142 @@ class PushNotificationSettings(EnvBase):
 class DiscoverySettings(EnvBase):
     """Opportunity discovery settings."""
 
-    SERPER_API_KEY: str | None = None
     OPENAI_API_KEY: str | None = None
     DISCOVERY_MAX_TRACKS: int = 2
     DISCOVERY_QUERIES_PER_CATEGORY: int = 2
     DISCOVERY_MAX_MANUAL_SCANS_PER_DAY: int = 4
+    DISCOVERY_COMPANY_JOB_BOARDS_FILE: str = "discovery_company_job_board.json"
+    DISCOVERY_COMPANY_JOB_BOARDS_JSON: str = "[]"
+
+    def _resolve_company_job_boards_file(self) -> Path | None:
+        raw_path = self.DISCOVERY_COMPANY_JOB_BOARDS_FILE.strip()
+        if not raw_path:
+            return None
+
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_file():
+            return candidate
+
+        search_roots: list[Path] = []
+        if _ENV_FILE:
+            search_roots.append(Path(_ENV_FILE).resolve().parent)
+        search_roots.extend(
+            [
+                Path.cwd(),
+                Path(__file__).resolve().parents[4],
+            ]
+        )
+
+        seen: set[Path] = set()
+        for root in search_roots:
+            resolved_root = root.resolve()
+            if resolved_root in seen:
+                continue
+            seen.add(resolved_root)
+
+            resolved_candidate = (resolved_root / candidate).resolve()
+            if resolved_candidate.is_file():
+                return resolved_candidate
+
+        return None
+
+    @staticmethod
+    def _parse_company_job_boards_payload(raw_value: str) -> list[dict[str, Any]]:
+        text = raw_value.strip()
+        if not text:
+            return []
+
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+
+        if not isinstance(payload, list):
+            return []
+
+        return [item for item in payload if isinstance(item, dict)]
+
+    def _load_company_job_boards_file_payload(self) -> list[dict[str, Any]]:
+        boards_file = self._resolve_company_job_boards_file()
+        if boards_file is None:
+            return []
+
+        try:
+            return self._parse_company_job_boards_payload(boards_file.read_text(encoding="utf-8"))
+        except OSError:
+            return []
+
+    @staticmethod
+    def _normalize_company_job_boards(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str, str, str]] = set()
+
+        for item in payload:
+            provider = str(item.get("provider") or "").strip().lower()
+            if not provider:
+                continue
+
+            record: dict[str, Any] = {"provider": provider}
+            for key in ("company", "board_token", "url", "label"):
+                value = item.get(key)
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    record[key] = text
+
+            country = item.get("country")
+            if country is not None:
+                country_text = str(country).strip()
+                if country_text:
+                    record["country"] = country_text
+
+            regions = item.get("regions")
+            if isinstance(regions, list):
+                normalized_regions = [str(region).strip() for region in regions if str(region).strip()]
+                if normalized_regions:
+                    record["regions"] = normalized_regions
+            elif regions is not None:
+                region_text = str(regions).strip()
+                if region_text:
+                    record["regions"] = [region_text]
+
+            identity = (
+                provider,
+                record.get("company", ""),
+                record.get("board_token", ""),
+                record.get("url", ""),
+            )
+            if identity in seen_keys:
+                continue
+
+            seen_keys.add(identity)
+            normalized.append(record)
+
+        return normalized
+
+    @computed_field
+    @property
+    def company_job_boards(self) -> list[dict[str, Any]]:
+        """Configured ATS boards to scrape in addition to search-based sources.
+
+        Boards are loaded automatically from DISCOVERY_COMPANY_JOB_BOARDS_FILE
+        and then extended by DISCOVERY_COMPANY_JOB_BOARDS_JSON.
+
+        Expected inline env value example:
+        [
+          {"provider":"greenhouse","company":"openai"},
+          {"provider":"lever","company":"vercel"},
+          {"provider":"ashby","company":"notion"},
+          {"provider":"rippling","board_token":"rippling"}
+        ]
+        """
+
+        payload = [
+            *self._load_company_job_boards_file_payload(),
+            *self._parse_company_job_boards_payload(self.DISCOVERY_COMPANY_JOB_BOARDS_JSON),
+        ]
+        return self._normalize_company_job_boards(payload)
 
 
 class EmailSettings(EnvBase):

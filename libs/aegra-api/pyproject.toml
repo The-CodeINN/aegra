@@ -37,10 +37,8 @@ dependencies = [
     "opentelemetry-sdk>=1.39.1",
     "opentelemetry-exporter-otlp>=1.39.1",
     "openinference-instrumentation-langchain>=0.1.58",
-
     # Metrics
     "prometheus-fastapi-instrumentator>=7.1.0",
-
     # Utils
     "structlog>=25.4.0",
     "asgi-correlation-id>=4.3.4",
@@ -70,6 +68,7 @@ dependencies = [
     "pymongo[srv]>=4.16.0",
     "langchain-aws>=1.4.1",
     "langmem>=0.0.30",
+    "python-jobspy @ git+https://github.com/speedyapply/JobSpy.git@main",
 ]
 
 [project.urls]
@@ -81,6 +80,9 @@ Issues = "https://github.com/aegra/aegra/issues"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aegra_api"]
