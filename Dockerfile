@@ -24,6 +24,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.10.0 /uv /bin/uv
 # Install system build dependencies required for compiling Python extensions.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    git \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
