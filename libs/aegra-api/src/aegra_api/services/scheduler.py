@@ -10,12 +10,14 @@ Features:
 - Motivational nudges (Mon/Wed/Fri/Sun) [§2.4.3]
 - Daily digest generation [§2.6.1]
 - Notification cleanup (90-day retention) [§2.6]
-- Opportunity expiration + twice-daily discovery
+- Opportunity expiration + twice-daily discovery (5 AM + 5 PM UTC)
 - Daily opportunity refresh: clears stale unactioned data at 5 AM UTC, then
   immediately re-discovers fresh, location-personalised opportunities
+- Concurrent per-user discovery with semaphore (max 5 in parallel)
 - Frequency-aware notification creation via NotificationEngine
 """
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -36,6 +38,7 @@ from aegra_api.core.database import db_manager
 from aegra_api.services.email_service import build_digest_email, resolve_student_contact, send_email
 from aegra_api.services.notification_engine import notification_engine
 from aegra_api.services.opportunity_discovery import opportunity_engine
+from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
 
@@ -90,10 +93,10 @@ class SchedulerService:
                 id="expire_opportunities",
                 replace_existing=True,
             )
-            # Discovery — twice daily (every 12 hours)
+            # Discovery — 5 PM UTC (paired with 5 AM daily_refresh, giving true twice-daily)
             self.scheduler.add_job(
                 self.run_discovery_job,
-                IntervalTrigger(hours=12),
+                CronTrigger(hour=17),
                 id="run_discovery_job",
                 replace_existing=True,
             )
@@ -432,8 +435,67 @@ class SchedulerService:
     # ------------------------------------------------------------------
     # Discovery job
     # ------------------------------------------------------------------
+
+    # Maximum number of users to discover for concurrently.
+    # Keeps external job-board API pressure bounded.
+    _DISCOVERY_CONCURRENCY = 5
+
+    async def _discover_and_notify_user(self, session_maker: async_sessionmaker, user_id: str) -> None:  # type: ignore[type-arg]
+        """Run discovery for a single user and create in-app/web-push notifications."""
+        max_tracks = settings.discovery.DISCOVERY_MAX_TRACKS
+        queries_per_category = settings.discovery.DISCOVERY_QUERIES_PER_CATEGORY
+        try:
+            logger.info("discovery_job_user_start", user_id=user_id)
+            # Each user gets its own session to avoid cross-user state leakage
+            async with session_maker() as session:
+                discovered = await opportunity_engine.discover_for_user(
+                    session=session,
+                    user_id=user_id,
+                    auth_token="",  # nosec B106
+                    max_tracks=max_tracks,
+                    queries_per_category=queries_per_category,
+                )
+                logger.info(
+                    "discovery_job_user_done",
+                    user_id=user_id,
+                    opportunities_found=len(discovered),
+                )
+                for opp in discovered:
+                    type_label = opp.opportunity_type
+                    if type_label == "event":
+                        title = "🎯 New Event Matches Your Track"
+                        content = f"We found a {opp.matched_track} event: {opp.title}"
+                    else:
+                        company_part = f" at {opp.company}" if opp.company else ""
+                        title = "💼 Job Opportunity Alert"
+                        content = f"New {opp.matched_track} role: {opp.title}{company_part}"
+
+                    await notification_engine.create_notification(
+                        session=session,
+                        user_id=user_id,
+                        title=title,
+                        content=content,
+                        priority="normal",
+                        category="opportunity",
+                        action_buttons=[
+                            {"action": "view", "title": "View", "url": opp.url},
+                            {"action": "dismiss", "title": "Dismiss"},
+                        ],
+                        metadata={
+                            "opportunity_id": opp.id,
+                            "opportunity_type": opp.opportunity_type,
+                            "url": opp.url,
+                        },
+                        check_frequency=False,
+                    )
+                    opp.status = "notified"
+                await session.commit()
+                logger.info("discovery_job_notifications_sent", user_id=user_id, count=len(discovered))
+        except Exception as e:
+            logger.error("discovery_failed_for_user", user_id=user_id, error=str(e), exc_info=True)
+
     async def run_discovery_job(self) -> None:
-        """Periodic opportunity discovery for all active users."""
+        """Periodic opportunity discovery for all active users, run concurrently."""
         logger.info("discovery_job_started")
         try:
             if not db_manager.engine:
@@ -442,68 +504,21 @@ class SchedulerService:
             session_maker = async_sessionmaker(db_manager.engine, expire_on_commit=False)
             async with session_maker() as session:
                 result = await session.execute(select(UserActivityTracking.user_id))
-                user_ids = result.scalars().all()
-                logger.info("discovery_job_users_found", count=len(user_ids), user_ids=user_ids)
+                user_ids = list(result.scalars().all())
 
-                if not user_ids:
-                    logger.warning("discovery_job_no_users", reason="user_activity_tracking table is empty")
-                    return
+            logger.info("discovery_job_users_found", count=len(user_ids))
+            if not user_ids:
+                logger.warning("discovery_job_no_users", reason="user_activity_tracking table is empty")
+                return
 
-                for user_id in user_ids:
-                    try:
-                        logger.info("discovery_job_user_start", user_id=user_id)
-                        discovered = await opportunity_engine.discover_for_user(
-                            session=session,
-                            user_id=user_id,
-                            auth_token="",  # nosec B106
-                            max_tracks=2,
-                            queries_per_category=1,
-                        )
-                        logger.info(
-                            "discovery_job_user_done",
-                            user_id=user_id,
-                            opportunities_found=len(discovered),
-                        )
-                        for opp in discovered:
-                            # Use notification_engine so web push is triggered
-                            type_label = opp.opportunity_type
-                            if type_label == "event":
-                                title = "🎯 New Event Matches Your Track"
-                                content = f"We found a {opp.matched_track} event: {opp.title}"
-                            else:
-                                # Jobs
-                                company_part = f" at {opp.company}" if opp.company else ""
-                                title = "💼 Job Opportunity Alert"
-                                content = f"New {opp.matched_track} role: {opp.title}{company_part}"
+            semaphore = asyncio.Semaphore(self._DISCOVERY_CONCURRENCY)
 
-                            await notification_engine.create_notification(
-                                session=session,
-                                user_id=user_id,
-                                title=title,
-                                content=content,
-                                priority="normal",
-                                category="opportunity",
-                                action_buttons=[
-                                    {"action": "view", "title": "View", "url": opp.url},
-                                    {"action": "dismiss", "title": "Dismiss"},
-                                ],
-                                metadata={
-                                    "opportunity_id": opp.id,
-                                    "opportunity_type": opp.opportunity_type,
-                                    "url": opp.url,
-                                },
-                                check_frequency=False,
-                            )
-                            opp.status = "notified"
-                        await session.commit()
-                        logger.info("discovery_job_notifications_sent", user_id=user_id, count=len(discovered))
-                    except Exception as e:
-                        logger.error(
-                            "discovery_failed_for_user",
-                            user_id=user_id,
-                            error=str(e),
-                            exc_info=True,
-                        )
+            async def _bounded(uid: str) -> None:
+                async with semaphore:
+                    await self._discover_and_notify_user(session_maker, uid)
+
+            await asyncio.gather(*(_bounded(uid) for uid in user_ids))
+            logger.info("discovery_job_complete", user_count=len(user_ids))
         except Exception as e:
             logger.error("run_discovery_job error", error=str(e), exc_info=True)
 
