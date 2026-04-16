@@ -141,20 +141,28 @@ async def update_preferences(
 ) -> dict[str, Any]:
     data = body.model_dump(exclude_none=True)
 
-    # Gate: enabling job opportunity mail requires an active AI Mentor add-on
+    # Gate: enabling job opportunity mail requires an active AI Mentor add-on.
+    # Admin/facilitator roles bypass the subscription check because the LMS
+    # subscription endpoint is not accessible to those roles.
     if data.get("job_opportunity_mail_enabled") is True:
-        auth_header = request.headers.get("Authorization", "")
-        token = auth_header.removeprefix("Bearer ").strip()
-        addon = await check_ai_mentor_addon(token)
-        if not addon["active"]:
-            raise HTTPException(
-                status_code=403,
-                detail="Jobs & Opportunity email requires an active AI Mentor add-on subscription.",
-            )
-        # Cache the add-on state so the scheduler can verify without a token
-        data["ai_mentor_addon_active"] = True
-        if addon.get("expires_at"):
-            data["ai_mentor_addon_expires_at"] = addon["expires_at"]
+        user_role = getattr(user, "role", None)
+        if user_role and user_role != "student":
+            # Non-student roles (admin, admin_facilitator, facilitator, etc.)
+            # are trusted and do not need an add-on subscription.
+            data["ai_mentor_addon_active"] = True
+        else:
+            auth_header = request.headers.get("Authorization", "")
+            token = auth_header.removeprefix("Bearer ").strip()
+            addon = await check_ai_mentor_addon(token)
+            if not addon["active"]:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Jobs & Opportunity email requires an active AI Mentor add-on subscription.",
+                )
+            # Cache the add-on state so the scheduler can verify without a token
+            data["ai_mentor_addon_active"] = True
+            if addon.get("expires_at"):
+                data["ai_mentor_addon_expires_at"] = addon["expires_at"]
 
     # Always persist the caller's email/name so the scheduler can use them
     # without calling the LMS.
