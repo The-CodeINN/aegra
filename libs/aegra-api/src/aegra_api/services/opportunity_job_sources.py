@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import httpx
+import pycountry
 import structlog
 
 try:
@@ -716,6 +717,158 @@ class RipplingSource(ConfiguredBoardSource):
         return jobs[: context.max_results_per_source]
 
 
+SMARTRECRUITERS_SEARCH_URL = "https://jobs.smartrecruiters.com/sr-jobs/search"
+
+
+def _country_code_to_name(code: str) -> str:
+    """Convert a 2-letter ISO country code to a full country name via pycountry."""
+    if not code:
+        return code
+    try:
+        country = pycountry.countries.get(alpha_2=code.upper())
+        return country.name if country else code
+    except (LookupError, AttributeError):
+        return code
+
+
+def _location_to_alpha2(location: str) -> str | None:
+    """Convert any location string to a lowercase ISO-3166-1 alpha-2 code via pycountry.
+
+    Returns None for blank / remote locations or unrecognised strings.
+    Handles full country names, ISO codes, common aliases (e.g. 'UAE', 'uk').
+    """
+    stripped = location.strip()
+    if not stripped or stripped.lower() == "remote":
+        return None
+    try:
+        results = pycountry.countries.search_fuzzy(stripped)
+        return results[0].alpha_2.lower() if results else None
+    except LookupError:
+        return None
+
+
+class SmartRecruitersSource(JobSource):
+    """Fetches jobs from the SmartRecruiters public search API.
+
+    Passes the search term as ``keyword`` and optionally a readable location
+    string for server-side narrowing.  Results are post-filtered by the
+    ``location.country`` code so only jobs from the requested country are kept.
+    """
+
+    name = "smartrecruiters"
+
+    async def _get_json(self, **params: Any) -> dict[str, Any]:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as client:
+            response = await client.get(SMARTRECRUITERS_SEARCH_URL, params=params)
+            response.raise_for_status()
+            payload = response.json()
+            return payload if isinstance(payload, dict) else {}
+
+    def _extract_location(self, job: dict[str, Any]) -> str:
+        # Prefer the pre-formatted shortLocation if available
+        short = _safe_text(job.get("shortLocation"))
+        if short:
+            return short
+
+        loc = job.get("location") or {}
+        if not isinstance(loc, dict):
+            return ""
+
+        if loc.get("remote"):
+            return "Remote"
+
+        parts = [
+            _safe_text(loc.get("city")),
+            _safe_text(loc.get("region")),
+        ]
+        country_code = _safe_text(loc.get("country")).upper()
+        country_name = _country_code_to_name(country_code)
+        if country_name:
+            parts.append(country_name)
+
+        return _join_unique_parts(parts)
+
+    async def fetch(self, context: JobDiscoveryContext) -> list[RawJobOpportunity]:
+        jobs: list[RawJobOpportunity] = []
+        seen_urls: set[str] = set()
+
+        # Determine the country code to filter results client-side
+        allowed_country = _location_to_alpha2(context.primary_location)
+
+        for search_term in context.search_terms[: context.max_search_terms]:
+            params: dict[str, Any] = {
+                "limit": 100,
+                "keyword": search_term,
+            }
+            # Pass location as a hint to SmartRecruiters for server-side narrowing
+            if context.primary_location and context.primary_location.lower() not in ("remote", ""):
+                params["location"] = context.primary_location
+
+            try:
+                payload = await self._get_json(**params)
+            except Exception as exc:
+                logger.warning(
+                    "smartrecruiters_fetch_failed",
+                    search_term=search_term,
+                    location=context.primary_location,
+                    error=repr(exc),
+                )
+                continue
+
+            for job in payload.get("content", []):
+                loc = job.get("location") or {}
+                is_remote = bool(loc.get("remote"))
+                is_hybrid = bool(loc.get("hybrid"))
+                job_country = _safe_text(loc.get("country")).lower()
+
+                # Client-side country filter: keep only jobs whose country matches
+                # the requested country, or jobs with no country code set
+                # (truly global remote listings).  SmartRecruiters marks many
+                # location-specific "remote" roles with the actual office country,
+                # so we apply the filter regardless of the remote flag.
+                if allowed_country and job_country and job_country != allowed_country:
+                    continue
+
+                # Freshness filter
+                posted_at = _parse_posted_at(job.get("releasedDate"))
+                if not _is_recent_job(posted_at, context.max_job_age_days):
+                    continue
+
+                title = _safe_text(job.get("name"))
+                url = _safe_text(job.get("applyUrl"))
+                if not title or not url or url in seen_urls:
+                    continue
+
+                seen_urls.add(url)
+                company_info = job.get("company") or {}
+                company_name = _safe_text(company_info.get("name")) or None
+
+                jobs.append(
+                    RawJobOpportunity(
+                        title=title,
+                        url=url,
+                        description="",  # details endpoint not called to keep latency low
+                        location=self._extract_location(job),
+                        company=company_name,
+                        source=self.name,
+                        source_query=search_term,
+                        metadata={
+                            "provider": self.name,
+                            "job_id": _safe_text(job.get("id")) or None,
+                            "posted_at": posted_at.isoformat() if posted_at else None,
+                            "remote": is_remote,
+                            "hybrid": is_hybrid,
+                            "country": job_country or None,
+                        },
+                    )
+                )
+
+                if len(jobs) >= context.max_results_per_source:
+                    return jobs[: context.max_results_per_source]
+
+        return jobs[: context.max_results_per_source]
+
+
 class JobSourceRegistry:
     def __init__(self, board_configs: list[dict[str, str]] | None = None) -> None:
         self._board_configs = []
@@ -755,6 +908,7 @@ class JobSourceRegistry:
             JobSpySource("linkedin"),
             JobSpySource("indeed"),
             WorkableSource(),
+            SmartRecruitersSource(),
         ]
         provider_map: dict[str, type[ConfiguredBoardSource]] = {
             "greenhouse": GreenhouseSource,

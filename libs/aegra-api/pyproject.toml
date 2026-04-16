@@ -69,6 +69,7 @@ dependencies = [
     "langchain-aws>=1.4.1",
     "langmem>=0.0.30",
     "python-jobspy @ git+https://github.com/speedyapply/JobSpy.git@main",
+    "pycountry>=24.6.1",
 ]
 
 [project.urls]

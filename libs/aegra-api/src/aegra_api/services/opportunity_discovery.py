@@ -19,6 +19,7 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
+import pycountry
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -95,21 +96,18 @@ TRACK_KEYWORDS: dict[str, list[str]] = {
 # Small utilities
 # ---------------------------------------------------------------------------
 
-COUNTRY_NAMES: dict[str, str] = {
-    "GB": "United Kingdom",
-    "UK": "United Kingdom",
-    "US": "United States",
-    "USA": "United States",
+# Indeed expects specific country strings; map ISO alpha-2 → jobspy/Indeed string
+_INDEED_ALPHA2_MAP: dict[str, str] = {
+    "GB": "UK",
+    "US": "USA",
     "CA": "Canada",
     "AU": "Australia",
     "DE": "Germany",
     "FR": "France",
-    "NL": "Netherlands",
-    "IE": "Ireland",
-    "NG": "Nigeria",
-    "KE": "Kenya",
-    "ZA": "South Africa",
     "IN": "India",
+    "NG": "Nigeria",
+    "ZA": "South Africa",
+    "KE": "Kenya",
     "SG": "Singapore",
     "AE": "United Arab Emirates",
     "SE": "Sweden",
@@ -121,21 +119,33 @@ COUNTRY_NAMES: dict[str, str] = {
     "PT": "Portugal",
     "PL": "Poland",
     "CH": "Switzerland",
-    "AT": "Austria",
-    "BE": "Belgium",
-    "NZ": "New Zealand",
-    "JP": "Japan",
+    "NL": "Netherlands",
+    "IE": "Ireland",
     "BR": "Brazil",
     "MX": "Mexico",
+    "NZ": "New Zealand",
+    "JP": "Japan",
 }
 
 
 def _readable_location(raw: str) -> str:
-    """Convert a raw location (could be a 2-letter code) to a readable name."""
+    """Convert a raw location (2-letter ISO code or full name) to a readable country name."""
     stripped = raw.strip()
-    upper = stripped.upper()
-    if upper in COUNTRY_NAMES:
-        return COUNTRY_NAMES[upper]
+    if not stripped:
+        return stripped
+    # Only attempt lookup for short strings that look like ISO codes or aliases
+    if len(stripped) <= 3:
+        try:
+            # Fast direct alpha-2 lookup first
+            country = pycountry.countries.get(alpha_2=stripped.upper())
+            if country:
+                return country.name
+            # Fuzzy fallback handles aliases like "UAE", "USA"
+            results = pycountry.countries.search_fuzzy(stripped)
+            if results:
+                return results[0].name
+        except (LookupError, AttributeError):
+            pass
     return stripped
 
 
@@ -502,27 +512,19 @@ class OpportunityDiscoveryEngine:
     # ------------------------------------------------------------------
 
     def _indeed_country(self, locations: list[str]) -> str:
-        """Pick the best Indeed country code from the user's locations."""
-        mapping = {
-            "GB": "UK",
-            "UK": "UK",
-            "UNITED KINGDOM": "UK",
-            "US": "USA",
-            "USA": "USA",
-            "UNITED STATES": "USA",
-            "CA": "Canada",
-            "CANADA": "Canada",
-            "AU": "Australia",
-            "AUSTRALIA": "Australia",
-            "DE": "Germany",
-            "GERMANY": "Germany",
-            "NG": "Nigeria",
-            "NIGERIA": "Nigeria",
-        }
+        """Resolve the best Indeed country string from the user's locations via pycountry."""
         for loc in locations:
-            key = loc.strip().upper()
-            if key in mapping:
-                return mapping[key]
+            stripped = loc.strip()
+            if not stripped:
+                continue
+            try:
+                results = pycountry.countries.search_fuzzy(stripped)
+                if results:
+                    code = results[0].alpha_2
+                    if code in _INDEED_ALPHA2_MAP:
+                        return _INDEED_ALPHA2_MAP[code]
+            except LookupError:
+                pass
         return "UK"
 
     def _job_location_allowed(self, job_location: str, readable_locations: set[str]) -> bool:
