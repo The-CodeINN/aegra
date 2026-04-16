@@ -525,6 +525,13 @@ class OpportunityDiscoveryEngine:
                 return mapping[key]
         return "UK"
 
+    def _job_location_allowed(self, job_location: str, readable_locations: set[str]) -> bool:
+        """Return True if the job location matches one of the user's allowed locations or is remote."""
+        loc_lower = job_location.lower().strip()
+        if not loc_lower or "remote" in loc_lower or "hybrid" in loc_lower:
+            return True
+        return any(allowed in loc_lower or loc_lower in allowed for allowed in readable_locations)
+
     async def _discover_jobs(
         self,
         tracks: list[str],
@@ -532,9 +539,16 @@ class OpportunityDiscoveryEngine:
         seen_urls: set[str],
         queries_per_category: int = 2,
     ) -> list[dict[str, Any]]:
-        """Discover jobs via the board-based JobSourceRegistry."""
-        primary_location = _readable_location(locations[0]) if locations else "remote"
-        indeed_country = self._indeed_country(locations)
+        """Discover jobs via the board-based JobSourceRegistry.
+
+        Runs a separate fetch for EACH user location (resident_country and
+        work_countries) so that no profile location is skipped, then
+        post-filters results to strictly keep only jobs matching one of the
+        user's locations (or remote/hybrid).
+        """
+        search_locations = [_readable_location(loc) for loc in locations] if locations else ["remote"]
+        # Lowercase set used for post-filtering
+        allowed_set = {loc.lower() for loc in search_locations}
 
         # Build a combined search-term list from all tracks
         search_terms: list[str] = []
@@ -545,18 +559,36 @@ class OpportunityDiscoveryEngine:
                     seen_terms.add(kw.lower())
                     search_terms.append(kw)
 
-        context = JobDiscoveryContext(
-            search_terms=search_terms,
-            primary_location=primary_location,
-            indeed_country=indeed_country,
-            max_search_terms=queries_per_category,
-        )
+        # Fetch jobs for every user location independently so both
+        # resident_country and work_countries are searched
+        all_raw_jobs: list[RawJobOpportunity] = []
+        for loc in search_locations:
+            context = JobDiscoveryContext(
+                search_terms=search_terms,
+                primary_location=loc,
+                indeed_country=self._indeed_country([loc]),
+                max_search_terms=queries_per_category,
+            )
+            try:
+                batch = await self._job_registry.fetch_all(context)
+                all_raw_jobs.extend(batch)
+            except Exception as exc:
+                logger.warning("job_registry_fetch_failed", location=loc, error=repr(exc))
 
-        raw_jobs: list[RawJobOpportunity] = await self._job_registry.fetch_all(context)
-
+        primary_location = search_locations[0] if search_locations else "remote"
         all_jobs: list[dict[str, Any]] = []
-        for raw in raw_jobs:
+        for raw in all_raw_jobs:
             if not raw.url or raw.url in seen_urls:
+                continue
+
+            # Strict location guard — only keep jobs from the user's own locations or remote
+            if not self._job_location_allowed(raw.location, allowed_set):
+                logger.debug(
+                    "job_location_filtered",
+                    title=raw.title[:60],
+                    job_location=raw.location,
+                    allowed=list(allowed_set),
+                )
                 continue
 
             # Match against all tracks, pick the best-scoring one
@@ -595,6 +627,7 @@ class OpportunityDiscoveryEngine:
             "job_discovery_complete",
             total=len(all_jobs),
             tracks=tracks,
+            locations=search_locations,
         )
         return all_jobs
 
