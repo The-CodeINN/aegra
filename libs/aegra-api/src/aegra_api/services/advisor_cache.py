@@ -124,8 +124,10 @@ async def check_ai_mentor_addon(token: str) -> dict:
     """Check whether the student's subscription includes an active AI Mentor add-on.
 
     Returns a dict with:
-      - active (bool): True if aiMentorAddOn.active is True on a non-expired subscription
-      - expires_at (str | None): ISO timestamp from aiMentorAddOn.expiresAt, if present
+      - active (bool): True if the user has an active AI Mentor entitlement, either via:
+          1. aiMentorAddOn.active (bolt-on add-on to an existing plan), OR
+          2. A standalone AI Mentor subscription (planType="ai-mentor", sku="ADVISOR_ONLY", active=true)
+      - expires_at (str | None): ISO timestamp when the entitlement expires, if present
     """
     subscription_endpoint = f"{LMS_API_URL}/api/v1/subscription/me"
     try:
@@ -136,10 +138,37 @@ async def check_ai_mentor_addon(token: str) -> dict:
             )
             response.raise_for_status()
             data = response.json()
+
+            # Case 1: bolt-on add-on field is explicitly active
             addon = data.get("aiMentorAddOn") or {}
-            active = bool(addon.get("active", False))
-            expires_at = addon.get("expiresAt")
-            return {"active": active, "expires_at": expires_at}
+            if bool(addon.get("active", False)):
+                logger.info("AI Mentor add-on active via aiMentorAddOn bolt-on")
+                return {"active": True, "expires_at": addon.get("expiresAt")}
+
+            # Case 2: standalone AI Mentor plan subscription (ADVISOR_ONLY / ai-mentor planType)
+            sub_active = bool(data.get("active", False))
+            plan_type = data.get("planType") or ""
+            active_state = data.get("activeState") or ""
+            sku = data.get("sku") or ""
+            if sub_active and (
+                plan_type == "ai-mentor" or "ai-mentor" in active_state.lower() or sku == "ADVISOR_ONLY"
+            ):
+                logger.info(
+                    "AI Mentor active via standalone plan",
+                    plan_type=plan_type,
+                    sku=sku,
+                    active_state=active_state,
+                )
+                return {"active": True, "expires_at": data.get("endDate")}
+
+            logger.info(
+                "AI Mentor add-on not active",
+                addon_active=addon.get("active"),
+                sub_active=sub_active,
+                plan_type=plan_type,
+                sku=sku,
+            )
+            return {"active": False, "expires_at": None}
     except httpx.HTTPStatusError as e:
         logger.warning("HTTP error checking ai_mentor_addon", status_code=e.response.status_code)
         return {"active": False, "expires_at": None}
