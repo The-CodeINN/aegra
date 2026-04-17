@@ -79,10 +79,10 @@ class SchedulerService:
                 id="check_celebrations",
                 replace_existing=True,
             )
-            # Cleanup old notifications — daily
+            # Cleanup old notifications — every 12 h
             self.scheduler.add_job(
                 self.check_cleanup,
-                IntervalTrigger(hours=24),
+                IntervalTrigger(hours=12),
                 id="check_cleanup",
                 replace_existing=True,
             )
@@ -357,19 +357,51 @@ class SchedulerService:
     # Cleanup
     # ------------------------------------------------------------------
     async def check_cleanup(self) -> None:
-        """Cleanup old notifications — 90 day retention per spec §2.6."""
+        """Tiered notification cleanup to prevent DB bloat.
+
+        Retention tiers:
+        - Read or dismissed: 7 days (already actioned by the user)
+        - Delivered (included in email digest): 10 days
+        - Everything else (pending, sent, failed): 10 days
+        """
         try:
             if not db_manager.engine:
                 return
             session_maker = async_sessionmaker(db_manager.engine, expire_on_commit=False)
             async with session_maker() as session:
                 now = datetime.now(UTC)
-                cutoff = now - timedelta(days=90)  # Spec: 90-day retention
+                total_deleted = 0
 
-                stmt = delete(Notification).where(Notification.created_at < cutoff)
+                # 1. Read or dismissed — keep 7 days
+                actioned_cutoff = now - timedelta(days=7)
+                stmt = delete(Notification).where(
+                    and_(
+                        Notification.status.in_(["read", "dismissed"]),
+                        Notification.created_at < actioned_cutoff,
+                    )
+                )
                 result = await session.execute(stmt)
-                if result.rowcount > 0:
-                    logger.info("notification_cleanup", deleted=result.rowcount)
+                total_deleted += result.rowcount
+
+                # 2. Delivered (digest sent) — keep 10 days
+                delivered_cutoff = now - timedelta(days=10)
+                stmt = delete(Notification).where(
+                    and_(
+                        Notification.delivered_at.isnot(None),
+                        Notification.created_at < delivered_cutoff,
+                    )
+                )
+                result = await session.execute(stmt)
+                total_deleted += result.rowcount
+
+                # 3. Everything else (pending, sent, failed) — keep 10 days
+                general_cutoff = now - timedelta(days=10)
+                stmt = delete(Notification).where(Notification.created_at < general_cutoff)
+                result = await session.execute(stmt)
+                total_deleted += result.rowcount
+
+                if total_deleted > 0:
+                    logger.info("notification_cleanup", deleted=total_deleted)
                 await session.commit()
         except Exception as e:
             logger.error("check_cleanup error", error=str(e), exc_info=True)

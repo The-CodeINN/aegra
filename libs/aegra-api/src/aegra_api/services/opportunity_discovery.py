@@ -29,7 +29,7 @@ from aegra_api.core.accountability_orm import (
     Notification,
     UserPreferences,
 )
-from aegra_api.services.opportunity_event_sources import EventbriteSource, RawEventOpportunity
+from aegra_api.services.opportunity_event_sources import EventbriteSource, LumaSource, MeetupSource, RawEventOpportunity
 from aegra_api.services.opportunity_job_sources import (
     JobDiscoveryContext,
     JobSourceRegistry,
@@ -214,7 +214,7 @@ class OpportunityDiscoveryEngine:
     """Discovers relevant events and jobs for a user and persists them."""
 
     def __init__(self) -> None:
-        self._event_source = EventbriteSource()
+        self._event_sources = [EventbriteSource(), MeetupSource(), LumaSource()]
         self._job_registry = JobSourceRegistry(settings.discovery.company_job_boards)
 
     # ------------------------------------------------------------------
@@ -460,19 +460,58 @@ class OpportunityDiscoveryEngine:
         seen_urls: set[str],
         queries_per_category: int = 2,
     ) -> list[dict[str, Any]]:
-        """Discover events via Eventbrite."""
+        """Discover events via all configured event sources (Eventbrite, Meetup, …)."""
         sem = asyncio.Semaphore(2)
+        # Build allowed-location set: full country name + ISO alpha-2 code (lower)
+        # so venue strings like "Albert's Schloss, GB" or "Lagos, NG" can match.
+        readable_locations: set[str] = set()
+        for loc in locations:
+            readable_locations.add(_readable_location(loc).lower())
+            try:
+                results = pycountry.countries.search_fuzzy(loc)
+                if results:
+                    readable_locations.add(results[0].alpha_2.lower())
+            except (LookupError, AttributeError):
+                pass
 
         async def _fetch_one(query: str, location: str, track: str) -> list[dict[str, Any]]:
             async with sem:
-                raw_events: list[RawEventOpportunity] = await self._event_source.fetch(query, location)
+                # Fan out across all event sources and merge results
+                source_batches = await asyncio.gather(
+                    *[src.fetch(query, location) for src in self._event_sources],
+                    return_exceptions=True,
+                )
+                raw_events: list[RawEventOpportunity] = []
+                for batch in source_batches:
+                    if isinstance(batch, list):
+                        raw_events.extend(batch)
                 parsed: list[dict[str, Any]] = []
                 for ev in raw_events:
                     if not ev.url or ev.url in seen_urls:
                         continue
                     seen_urls.add(ev.url)
                     score = _score_text(f"{ev.title} {ev.description}", track)
-                    if score < Decimal("0.50"):
+                    # Lu.ma pre-filters by category slug (tech/ai) so the slug itself
+                    # acts as a relevance signal — give it one keyword match's worth.
+                    if ev.source == "luma" and score <= Decimal("0.50"):
+                        score = Decimal("0.58")
+                    # Require at least one keyword match (base score 0.50 means no match)
+                    elif score <= Decimal("0.50"):
+                        continue
+                    # Location guard: accept online/remote events anywhere;
+                    # physical events must match one of the user's allowed locations
+                    ev_loc = (ev.location or "").lower()
+                    if (
+                        ev_loc
+                        and not any(kw in ev_loc for kw in ("online", "remote", "virtual"))
+                        and not self._job_location_allowed(ev.location, readable_locations)
+                    ):
+                        logger.debug(
+                            "event_location_filtered",
+                            title=ev.title[:60],
+                            event_location=ev.location,
+                            allowed=list(readable_locations),
+                        )
                         continue
                     parsed.append(
                         {
@@ -603,7 +642,8 @@ class OpportunityDiscoveryEngine:
                     best_score = score
                     best_track = track
 
-            if best_score < Decimal("0.50"):
+            # Require at least one keyword match (base score 0.50 means no match)
+            if best_score <= Decimal("0.50"):
                 continue
 
             seen_urls.add(raw.url)
