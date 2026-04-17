@@ -41,10 +41,10 @@ jobs:
           POSTGRES_DB: 'aegra'
         run: uv run --package aegra-api pytest libs/aegra-api/tests/unit libs/aegra-api/tests/integration
 
-  # Deploy to EC2 after tests (even if tests fail)
+  # Deploy to EC2 after tests pass
   deploy:
     needs: test
-    if: always()
+    if: success()
     runs-on: ubuntu-latest
     environment: production
 
@@ -57,7 +57,7 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           script_stop: true
-          command_timeout: 10m
+          command_timeout: 20m
           script: |
             set -e
             cd /opt/ai-service
@@ -84,6 +84,7 @@ jobs:
           port: 22
           script: |
             echo "Deployment failed at $(date)" >> /var/log/aegra-deploy.log
-            # Show recent logs for debugging
+            # Show recent deploy log and container logs for debugging
+            tail -50 /var/log/aegra-deploy.log || true
             cd /opt/ai-service
-            docker compose -f docker-compose.prod.yml logs --tail=50 aegra
+            docker compose -f docker-compose.prod.yml logs --tail=50 aegra || true
