@@ -198,5 +198,13 @@
     "country": "United Arab Emirates",
     "regions": ["UAE", "EMEA"],
     "url": "https://boards.greenhouse.io/careem"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "wave",
+    "label": "Wave Mobile Money",
+    "country": "Senegal",
+    "regions": ["Africa", "EMEA"],
+    "url": "https://boards.greenhouse.io/wavemm1"
   }
 ]
