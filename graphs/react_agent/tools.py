@@ -1198,12 +1198,18 @@ async def read_webpage(url: str) -> dict[str, Any]:
     # LinkedIn pages and returns headline, current role, and experience blurbs.
     if hostname in ("linkedin.com", "www.linkedin.com") or hostname.endswith(".linkedin.com"):
         try:
-            # Extract just the username slug from /in/<username> — quoting the full path
-            # or including the slash kills Brave's index lookup. Plain username works best.
             path_parts = [p for p in parsed.path.strip("/").split("/") if p]
-            # path_parts[0] == "in", path_parts[1] == username (if present)
-            username_slug = path_parts[1] if len(path_parts) >= 2 else path_parts[0] if path_parts else ""
-            query = f"site:linkedin.com {username_slug}" if username_slug else f"site:linkedin.com {cleaned_url}"
+            # /in/<username>   -> profile query
+            # /posts/<id>/...  -> post query
+            # /company/<slug>  -> company page query
+            # anything else    -> join first two path segments
+            if len(path_parts) >= 2 and path_parts[0] in ("in", "posts", "company"):
+                slug = path_parts[1]
+            elif path_parts:
+                slug = " ".join(path_parts[:2])
+            else:
+                slug = ""
+            query = f"site:linkedin.com {slug}" if slug else f"site:linkedin.com {cleaned_url}"
             search_result = await brave_search(query)
             if search_result and not search_result.startswith("Search failed"):
                 return {
@@ -1218,17 +1224,52 @@ async def read_webpage(url: str) -> dict[str, Any]:
             "error": "linkedin_unavailable",
             "message": (
                 "LinkedIn blocks direct access and the Brave Search fallback returned no results. "
-                "Use the self-reported onboarding fields (s2, s3, s5) as the source of truth instead."
+                "Ask the user to paste the post or profile text directly so you can help them."
             ),
             "url": cleaned_url,
         }
 
+    # -----------------------------------------------------------------------
+    # General webpage reading — primary: Jina Reader (r.jina.ai).
+    # Jina renders JavaScript, bypasses many bot-protection layers, and returns
+    # clean markdown. Works for SPAs, news articles, job boards, Twitter/X, etc.
+    # No API key required for basic use (rate-limited to ~20 req/min on free tier).
+    # Fallback: plain httpx GET for static / server-rendered pages.
+    # -----------------------------------------------------------------------
+    jina_url = f"https://r.jina.ai/{cleaned_url}"
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as client:
+            jina_resp = await client.get(
+                jina_url,
+                headers={
+                    "Accept": "text/plain, text/markdown",
+                    "User-Agent": "DeDataHubBot/1.0 (+https://dedatahub.io)",
+                    "X-Return-Format": "markdown",
+                    "X-Remove-Selector": "nav, footer, header, .cookie-banner, #cookie-notice",
+                },
+            )
+            if jina_resp.status_code == 200:
+                content = jina_resp.text.strip()
+                if content and len(content) > 100:
+                    logger.info(f"Jina Reader fetched {cleaned_url} ({len(content)} chars)")
+                    return {
+                        "source": "jina_reader",
+                        "url": cleaned_url,
+                        "content": content[:8000],
+                        "content_length": len(content),
+                        "truncated": len(content) > 8000,
+                    }
+            logger.warning(f"Jina returned {jina_resp.status_code} for {cleaned_url}, falling back to httpx")
+    except Exception as e:
+        logger.warning(f"Jina Reader failed for {cleaned_url}: {e} — falling back to direct fetch")
+
+    # Fallback: plain httpx (best-effort for static / server-rendered pages)
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
             response = await client.get(
                 cleaned_url,
                 headers={
-                    "User-Agent": "DeDataHubBot/1.0 (+https://dedatahub.io)",
+                    "User-Agent": "Mozilla/5.0 (compatible; DeDataHubBot/1.0; +https://dedatahub.io)",
                     "Accept": "text/html,application/xhtml+xml,text/plain",
                 },
             )
@@ -1253,6 +1294,7 @@ async def read_webpage(url: str) -> dict[str, Any]:
             text = re.sub(r"\s+", " ", text).strip()
 
             return {
+                "source": "direct_fetch",
                 "url": str(response.url),
                 "status_code": response.status_code,
                 "content_type": content_type,
@@ -1265,7 +1307,10 @@ async def read_webpage(url: str) -> dict[str, Any]:
         return {
             "error": "http_error",
             "status_code": e.response.status_code,
-            "message": f"Unable to access the page ({e.response.status_code}).",
+            "message": (
+                f"Unable to access the page ({e.response.status_code}). "
+                "The site may require authentication or block automated access."
+            ),
             "url": cleaned_url,
         }
     except httpx.TimeoutException:
