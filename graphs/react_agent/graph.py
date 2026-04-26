@@ -31,6 +31,10 @@ from langgraph.runtime import Runtime
 from langmem import create_manage_memory_tool, create_memory_store_manager, create_search_memory_tool
 from langmem.short_term import SummarizationNode
 
+from aegra_api.services.career_advisor_activation import (
+    FIRST_TIME_ROADMAP_REDIRECT_MESSAGE,
+    is_career_roadmap_trigger,
+)
 from react_agent import prompts as _prompts
 from react_agent.compaction import (
     CompactionTier,
@@ -643,6 +647,16 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     # Use str.replace instead of .format() — the 1000-line prompt contains literal
     # {blocks} in examples/directives; .format() would KeyError on any unknown placeholder.
     static_prompt = runtime.context.system_prompt.replace("{system_time}", datetime.now(tz=UTC).isoformat())
+
+    latest_human_text = _latest_human_text(list(state.messages))
+    if not runtime.context.roadmap_generated and latest_human_text and not is_career_roadmap_trigger(latest_human_text):
+        return {
+            "messages": [AIMessage(content=FIRST_TIME_ROADMAP_REDIRECT_MESSAGE)],
+            "tool_call_counts": dict(state.tool_call_counts),
+            "session_cost": state.session_cost or SessionCost(),
+            "execution_events": list(state.execution_events),
+            "agent_wrote_memory": state.agent_wrote_memory,
+        }
 
     _, tool_policies = _resolve_runtime_tooling(runtime)
     execution_events = list(state.execution_events)

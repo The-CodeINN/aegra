@@ -29,6 +29,7 @@ from aegra_api.core.accountability_orm import (
     Notification,
     UserPreferences,
 )
+from aegra_api.services.advisor_cache import get_cached_learning_track
 from aegra_api.services.opportunity_event_sources import EventbriteSource, LumaSource, MeetupSource, RawEventOpportunity
 from aegra_api.services.opportunity_job_sources import (
     JobDiscoveryContext,
@@ -217,6 +218,11 @@ class OpportunityDiscoveryEngine:
         self._event_sources = [EventbriteSource(), MeetupSource(), LumaSource()]
         self._job_registry = JobSourceRegistry(settings.discovery.company_job_boards)
 
+    @property
+    def job_source_registry(self) -> JobSourceRegistry:
+        """Compatibility alias for tests and callers expecting a public registry."""
+        return self._job_registry
+
     # ------------------------------------------------------------------
     # LMS / profile helpers
     # ------------------------------------------------------------------
@@ -276,32 +282,172 @@ class OpportunityDiscoveryEngine:
                 logger.warning("student_profile_fetch_failed", error=str(e), user_id=user_id)
         return StudentProfile(user_id=user_id)
 
-    async def _get_tracks_from_prefs_or_fallback(
+    async def _get_track_from_prefs(
         self,
         session: AsyncSession,
         user_id: str,
-    ) -> list[str]:
+    ) -> str | None:
         result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
         prefs = result.scalar_one_or_none()
         if prefs and prefs.preferences:
             stored = prefs.preferences
-            tracks = stored.get("tracks", []) or []
-            if not tracks:
-                lt = stored.get("learning_track") or stored.get("track")
-                if lt:
-                    tracks = [lt] if isinstance(lt, str) else list(lt)
-            if tracks:
-                logger.info("discovery_tracks_from_prefs", user_id=user_id, tracks=tracks)
-                return tracks
+            learning_track = stored.get("learning_track") or stored.get("track")
+            if isinstance(learning_track, str) and learning_track.strip():
+                logger.info("discovery_track_from_prefs", user_id=user_id, track=learning_track)
+                return learning_track.strip()
 
-        fallback = list(TRACK_KEYWORDS.keys())
-        logger.warning(
-            "discovery_using_fallback_tracks",
-            user_id=user_id,
-            reason="no LMS enrollments or stored preferences",
-            tracks=fallback,
-        )
-        return fallback
+            tracks = stored.get("tracks", []) or []
+            if isinstance(tracks, list):
+                for track in tracks:
+                    if isinstance(track, str) and track.strip():
+                        logger.info("discovery_track_from_prefs_list", user_id=user_id, track=track)
+                        return track.strip()
+        return None
+
+    def build_event_queries(self, track: str, _location: str | None = None) -> list[str]:
+        """Compatibility wrapper around the internal event-query builder."""
+        return self._build_event_queries(track)
+
+    def _build_job_search_terms(
+        self,
+        tracks: list[str],
+        profile: StudentProfile | None = None,
+        queries_per_category: int = 1,
+    ) -> list[str]:
+        """Build prioritized job search terms from onboarding/profile + track."""
+        search_terms: list[str] = []
+        seen_terms: set[str] = set()
+
+        def _add(term: str | None) -> None:
+            if not isinstance(term, str):
+                return
+            normalized = term.strip()
+            if not normalized:
+                return
+            lowered = normalized.lower()
+            if lowered in seen_terms:
+                return
+            seen_terms.add(lowered)
+            search_terms.append(normalized)
+
+        for track in tracks:
+            _add(_primary_keyword(track))
+
+        def _is_aligned(term: str) -> bool:
+            return any(_score_text(term, track) > Decimal("0.50") for track in tracks)
+
+        if profile and isinstance(profile.target_role, str) and _is_aligned(profile.target_role):
+            _add(profile.target_role)
+        if profile and isinstance(profile.role_title, str) and _is_aligned(profile.role_title):
+            _add(profile.role_title)
+
+        if queries_per_category > 1:
+            for track in tracks:
+                for kw in _keywords_for_track(track)[1:queries_per_category]:
+                    _add(kw)
+
+        return search_terms
+
+    def _match_raw_job(
+        self,
+        raw_job: RawJobOpportunity,
+        tracks: list[str],
+        locations: list[str],
+        profile: StudentProfile | None = None,
+    ) -> dict[str, Any] | None:
+        """Score a raw job against the user's active track and profile."""
+        readable_locations = {_readable_location(loc).lower() for loc in locations} if locations else {"remote"}
+        if not self._job_location_allowed(raw_job.location, readable_locations):
+            return None
+
+        content = f"{raw_job.title} {raw_job.description}"
+        best_score = Decimal("0")
+        best_track = tracks[0] if tracks else ""
+        for track in tracks:
+            score = _score_text(content, track)
+            if score > best_score:
+                best_score = score
+                best_track = track
+
+        if best_score <= Decimal("0.50"):
+            return None
+
+        reason_tags = ["matched_track", "matched_location"]
+        profile_text = content.lower()
+        if profile:
+            if profile.target_role and profile.target_role.lower() in profile_text:
+                reason_tags.append("matched_target_role")
+            if profile.industry and profile.industry.lower() in profile_text:
+                reason_tags.append("matched_industry")
+            if any(skill.lower() in profile_text for skill in profile.confident_skills):
+                reason_tags.append("matched_profile_skills")
+
+        return {
+            "opportunity_type": "job",
+            "title": raw_job.title,
+            "description": raw_job.description,
+            "url": raw_job.url,
+            "location": raw_job.location or (locations[0] if locations else "remote"),
+            "event_date": None,
+            "company": raw_job.company,
+            "salary_range": raw_job.salary_range,
+            "match_score": best_score,
+            "matched_track": best_track,
+            "reason_tags": reason_tags,
+            "_source": raw_job.source,
+            "_query": raw_job.source_query,
+        }
+
+    def _match_raw_event(
+        self,
+        raw_event: RawEventOpportunity,
+        track: str,
+        location: str,
+        profile: StudentProfile | None = None,
+    ) -> dict[str, Any] | None:
+        """Score a raw event against a single active track and profile."""
+        score = _score_text(f"{raw_event.title} {raw_event.description}", track)
+        if raw_event.source == "luma" and score <= Decimal("0.50"):
+            score = Decimal("0.58")
+        elif score <= Decimal("0.50"):
+            return None
+
+        readable_locations = {_readable_location(location).lower()}
+        if (
+            raw_event.location
+            and not any(kw in raw_event.location.lower() for kw in ("online", "remote", "virtual"))
+            and not self._job_location_allowed(raw_event.location, readable_locations)
+        ):
+            return None
+
+        reason_tags = ["matched_track"]
+        profile_text = f"{raw_event.title} {raw_event.description}".lower()
+        if profile:
+            if profile.target_role and profile.target_role.lower() in profile_text:
+                reason_tags.append("matched_target_role")
+            if profile.industry and profile.industry.lower() in profile_text:
+                reason_tags.append("matched_industry")
+            if any(skill.lower() in profile_text for skill in profile.confident_skills):
+                reason_tags.append("matched_profile_skills")
+
+        return {
+            "opportunity_type": "event",
+            "title": raw_event.title,
+            "description": raw_event.description,
+            "url": raw_event.url,
+            "location": raw_event.location or _readable_location(location),
+            "event_date": raw_event.event_date.isoformat() if raw_event.event_date else None,
+            "company": None,
+            "salary_range": None,
+            "match_score": score,
+            "matched_track": track,
+            "reason_tags": reason_tags,
+            "_source": raw_event.source,
+            "_query": self._primary_event_query_for_track(track),
+        }
+
+    def _primary_event_query_for_track(self, track: str) -> str:
+        return _primary_keyword(track)
 
     # ------------------------------------------------------------------
     # Strategy generation
@@ -457,6 +603,7 @@ class OpportunityDiscoveryEngine:
         self,
         tracks: list[str],
         locations: list[str],
+        profile: StudentProfile | None,
         seen_urls: set[str],
         queries_per_category: int = 2,
     ) -> list[dict[str, Any]]:
@@ -577,6 +724,7 @@ class OpportunityDiscoveryEngine:
         self,
         tracks: list[str],
         locations: list[str],
+        profile: StudentProfile | None,
         seen_urls: set[str],
         queries_per_category: int = 2,
     ) -> list[dict[str, Any]]:
@@ -591,14 +739,11 @@ class OpportunityDiscoveryEngine:
         # Lowercase set used for post-filtering
         allowed_set = {loc.lower() for loc in search_locations}
 
-        # Build a combined search-term list from all tracks
-        search_terms: list[str] = []
-        seen_terms: set[str] = set()
-        for track in tracks:
-            for kw in _keywords_for_track(track)[:queries_per_category]:
-                if kw.lower() not in seen_terms:
-                    seen_terms.add(kw.lower())
-                    search_terms.append(kw)
+        search_terms = self._build_job_search_terms(
+            tracks,
+            profile=profile,
+            queries_per_category=queries_per_category,
+        )
 
         # Fetch jobs for every user location independently so both
         # resident_country and work_countries are searched
@@ -618,6 +763,7 @@ class OpportunityDiscoveryEngine:
 
         primary_location = search_locations[0] if search_locations else "remote"
         all_jobs: list[dict[str, Any]] = []
+        source_counts: dict[str, int] = {}
         for raw in all_raw_jobs:
             if not raw.url or raw.url in seen_urls:
                 continue
@@ -646,7 +792,13 @@ class OpportunityDiscoveryEngine:
             if best_score <= Decimal("0.50"):
                 continue
 
+            source_key = raw.source or "unknown"
+            source_count = source_counts.get(source_key, 0)
+            if source_count >= 3:
+                continue
+
             seen_urls.add(raw.url)
+            source_counts[source_key] = source_count + 1
             all_jobs.append(
                 {
                     "opportunity_type": "job",
@@ -684,21 +836,27 @@ class OpportunityDiscoveryEngine:
         auth_token: str = "",
         max_tracks: int = 0,
         queries_per_category: int = 2,
+        opportunity_type: str = "all",
         **_kwargs: Any,
     ) -> list[DiscoveredOpportunity]:
         """Run full discovery pipeline for a single user."""
         profile = await self._get_student_profile(session, user_id, auth_token)
 
-        tracks = _dedupe_tracks(
-            [
-                *([profile.learning_track] if profile.learning_track else []),
-                *(profile.enrolled_tracks or []),
-            ]
-        )
+        effective_track: str | None = None
+        if auth_token and auth_token != "scheduled_job_token":  # nosec B105
+            try:
+                effective_track = await get_cached_learning_track(user_id, auth_token)
+            except Exception as exc:
+                logger.warning("discovery_cached_track_lookup_failed", user_id=user_id, error=str(exc))
+
+        if not effective_track and profile.learning_track:
+            effective_track = profile.learning_track
+        if not effective_track:
+            effective_track = await self._get_track_from_prefs(session, user_id)
+
+        tracks = _dedupe_tracks([effective_track] if effective_track else [])
         if not tracks:
-            tracks = await self._get_tracks_from_prefs_or_fallback(session, user_id)
-        if not tracks:
-            logger.warning("discovery_no_tracks", user_id=user_id)
+            logger.warning("discovery_no_tracks", user_id=user_id, reason="no_active_track_resolved")
             return []
 
         if max_tracks > 0:
@@ -729,10 +887,18 @@ class OpportunityDiscoveryEngine:
         )
         seen_urls: set[str] = {r[0] for r in existing.all() if r[0]}
 
-        event_results, job_results = await asyncio.gather(
-            self._discover_events(tracks, locations, seen_urls, queries_per_category),
-            self._discover_jobs(tracks, locations, seen_urls, queries_per_category),
-        )
+        event_results: list[dict[str, Any]] = []
+        job_results: list[dict[str, Any]] = []
+        if opportunity_type in {"all", "event"}:
+            event_results = await self._discover_events(tracks, locations, profile, seen_urls, queries_per_category)
+        if opportunity_type in {"all", "job"}:
+            job_results = await self._discover_jobs(
+                tracks,
+                locations,
+                profile,
+                seen_urls,
+                queries_per_category,
+            )
 
         all_parsed = await self._generate_strategies_batch(event_results + job_results)
 

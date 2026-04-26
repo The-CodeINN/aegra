@@ -21,6 +21,7 @@ from aegra_api.core.sse import create_end_event, get_sse_headers
 from aegra_api.models import Run, RunCreate, RunStatus, User
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
 from aegra_api.services.advisor_cache import get_cached_advisor
+from aegra_api.services.career_advisor_activation import get_roadmap_generated_flag_for_user
 from aegra_api.services.run_preparation import _prepare_run
 from aegra_api.services.run_waiters import TERMINAL_STATES, encode_output, heartbeat_wait_body
 from aegra_api.services.streaming_service import streaming_service
@@ -101,6 +102,8 @@ async def _enrich_run_context_with_user_data(context: dict[str, Any] | None, use
                 error=str(exc),
             )
             runtime_context["enrolled_course_ids"] = []
+
+    runtime_context["roadmap_generated"] = await get_roadmap_generated_flag_for_user(user.identity)
 
     return runtime_context
 

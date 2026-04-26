@@ -221,7 +221,7 @@ class DiscoverySettings(EnvBase):
     """Opportunity discovery settings."""
 
     OPENAI_API_KEY: str | None = None
-    DISCOVERY_MAX_TRACKS: int = 2
+    DISCOVERY_MAX_TRACKS: int = 1
     DISCOVERY_QUERIES_PER_CATEGORY: int = 2
     DISCOVERY_MAX_MANUAL_SCANS_PER_DAY: int = 4
     DISCOVERY_COMPANY_JOB_BOARDS_FILE: str = "discovery_company_job_board.json"

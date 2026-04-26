@@ -475,6 +475,20 @@ def test_match_raw_event_uses_profile_fields_for_relevance() -> None:
     assert "matched_profile_skills" in matched["reason_tags"]
 
 
+def test_build_job_search_terms_prioritizes_target_role() -> None:
+    engine = OpportunityDiscoveryEngine()
+    profile = StudentProfile(target_role="AI Engineer")
+
+    terms = engine._build_job_search_terms(
+        tracks=["ai-engineering"],
+        profile=profile,
+        queries_per_category=2,
+    )
+
+    assert terms[0].lower() == "ai engineer"
+    assert "artificial intelligence" in terms
+
+
 async def test_discover_jobs_caps_results_per_source(monkeypatch) -> None:
     engine = OpportunityDiscoveryEngine()
 

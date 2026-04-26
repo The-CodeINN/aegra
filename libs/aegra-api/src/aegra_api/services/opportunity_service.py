@@ -27,6 +27,7 @@ class OpportunityService:
         session: AsyncSession,
         user_id: str,
         opportunity_type: str | None = None,
+        matched_track: str | None = None,
         status: str = "new",
         limit: int = 20,
         offset: int = 0,
@@ -36,6 +37,8 @@ class OpportunityService:
 
         if opportunity_type:
             base_filter.append(DiscoveredOpportunity.opportunity_type == opportunity_type)
+        if matched_track:
+            base_filter.append(DiscoveredOpportunity.matched_track == matched_track)
 
         if status == "new":
             base_filter.append(DiscoveredOpportunity.status.in_(["new", "notified"]))
@@ -174,9 +177,11 @@ class OpportunityService:
     # Stats
     # ------------------------------------------------------------------
     @staticmethod
-    async def get_stats(session: AsyncSession, user_id: str) -> dict[str, Any]:
+    async def get_stats(session: AsyncSession, user_id: str, matched_track: str | None = None) -> dict[str, Any]:
         """Return aggregated opportunity stats for the user."""
         base = [DiscoveredOpportunity.user_id == user_id]
+        if matched_track:
+            base.append(DiscoveredOpportunity.matched_track == matched_track)
 
         async def _count(*extra_filters):
             q = select(func.count(DiscoveredOpportunity.id)).where(*base, *extra_filters)

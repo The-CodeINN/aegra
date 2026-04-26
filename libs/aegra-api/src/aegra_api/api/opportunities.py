@@ -24,6 +24,7 @@ from aegra_api.core.accountability_orm import DiscoveredOpportunity, UserPrefere
 from aegra_api.core.auth_deps import get_current_user
 from aegra_api.core.orm import get_session
 from aegra_api.models import User
+from aegra_api.services.advisor_cache import get_cached_learning_track
 from aegra_api.services.opportunity_discovery import opportunity_engine
 from aegra_api.services.opportunity_service import OpportunityService
 from aegra_api.settings import settings
@@ -91,6 +92,7 @@ class DiscoverRequest(BaseModel):
     auth_token: str | None = None
     timezone_name: str | None = None
     timezone_offset_minutes: int | None = None
+    opportunity_type: str | None = None
 
 
 # ── Rate limiting helpers ────────────────────────────────────────────
@@ -216,6 +218,51 @@ async def _record_scan(
     await session.commit()
 
 
+def _get_user_token(user: User, authorization: str | None = None) -> str | None:
+    if authorization:
+        scheme, _, param = authorization.partition(" ")
+        token = param if scheme.lower() == "bearer" else authorization
+        if token:
+            return token
+
+    try:
+        user_dict = user.to_dict()
+    except Exception:
+        return None
+
+    token = user_dict.get("token")
+    return token if isinstance(token, str) and token.strip() else None
+
+
+async def _resolve_current_learning_track(
+    session: AsyncSession,
+    user: User,
+    authorization: str | None = None,
+) -> str | None:
+    token = _get_user_token(user, authorization)
+    if token:
+        track = await get_cached_learning_track(user.identity, token)
+        if track:
+            return track
+
+    result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user.identity))
+    prefs = result.scalar_one_or_none()
+    if not prefs or not prefs.preferences:
+        return None
+
+    preferences = prefs.preferences
+    stored = preferences.get("learning_track") or preferences.get("track")
+    if isinstance(stored, str) and stored.strip():
+        return stored.strip()
+
+    tracks = preferences.get("tracks")
+    if isinstance(tracks, list):
+        for track in tracks:
+            if isinstance(track, str) and track.strip():
+                return track.strip()
+    return None
+
+
 # ── List / Filter ────────────────────────────────────────────────────
 
 
@@ -227,12 +274,15 @@ async def list_opportunities(
     offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
+    authorization: str | None = Header(None),
 ) -> dict[str, Any]:
     """List discovered opportunities."""
+    current_track = await _resolve_current_learning_track(session, user, authorization)
     opportunities, total, has_more = await OpportunityService.list_opportunities(
         session=session,
         user_id=user.identity,
         opportunity_type=opportunity_type,
+        matched_track=current_track,
         status=status,
         limit=limit,
         offset=offset,
@@ -251,9 +301,11 @@ async def list_opportunities(
 async def opportunity_stats(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
+    authorization: str | None = Header(None),
 ) -> dict[str, Any]:
     """Return aggregated counts by type and status."""
-    return await OpportunityService.get_stats(session, user.identity)
+    current_track = await _resolve_current_learning_track(session, user, authorization)
+    return await OpportunityService.get_stats(session, user.identity, matched_track=current_track)
 
 
 # ── Single opportunity ───────────────────────────────────────────────
@@ -355,21 +407,22 @@ async def trigger_discovery(
             detail=f"Daily scan limit reached ({max_scans} per day). Try again tomorrow.",
         )
 
-    token = request.auth_token if request and request.auth_token else None
-
-    if not token and authorization:
-        scheme, _, param = authorization.partition(" ")
-        token = param if scheme.lower() == "bearer" else authorization
+    token = request.auth_token if request and request.auth_token else _get_user_token(user, authorization)
 
     if not token:
         raise HTTPException(status_code=401, detail="Authentication token required for discovery")
+
+    opportunity_type = (request.opportunity_type or "all").strip().lower() if request else "all"
+    if opportunity_type not in {"all", "job", "event"}:
+        raise HTTPException(status_code=422, detail="opportunity_type must be one of: all, job, event")
 
     discovered = await opportunity_engine.discover_for_user(
         session=session,
         user_id=user.identity,
         auth_token=token,
-        max_tracks=2,
+        max_tracks=1,
         queries_per_category=2,
+        opportunity_type=opportunity_type,
     )
 
     # Batch-create all notifications in a single commit

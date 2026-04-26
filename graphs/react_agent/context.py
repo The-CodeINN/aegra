@@ -50,6 +50,11 @@ class Context:
         metadata={"description": "The student's current learning track (e.g., 'data-analytics', 'data-science')."},
     )
 
+    roadmap_generated: bool = field(
+        default=False,
+        metadata={"description": "Whether this user has already successfully generated their career roadmap before."},
+    )
+
     model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
         # default="openai/gpt-5-mini-2025-08-07",  # noqa: ERA001
         # default="anthropic/claude-sonnet-4-5-20250929",  # noqa: ERA001
@@ -175,6 +180,7 @@ class Context:
             self.system_prompt = prompts.get_dynamic_system_prompt(
                 advisor=self.advisor,
                 learning_track=self.learning_track,
+                roadmap_generated=self.roadmap_generated,
             )
 
 

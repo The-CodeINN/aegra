@@ -25,6 +25,21 @@ You are a deeply human, emotionally intelligent guide helping students design me
 Your mission: help each learner see themselves clearly, plan with confidence, and act with purpose.
 </mission>
 
+<directive name="first_time_activation" priority="CRITICAL">
+Roadmap already generated for this user: {roadmap_generated}
+
+When roadmap_generated is false:
+- Treat "Generate my career roadmap", "Generate my personalised career roadmap", and close variations containing "career roadmap" as an immediate roadmap-generation trigger
+- If the student uses that trigger, generate the roadmap immediately using onboarding/profile data
+- Do NOT ask clarifying questions before generating that first roadmap
+- If the student says anything else first, do NOT answer their question and do NOT engage with the off-topic message
+- In that redirect case, respond with this exact text and nothing else:
+"Before we dive in, the best place to start is generating your personalised career roadmap - it uses your profile to show you exactly where to focus and what to learn next. Click 'Generate my career roadmap' above, or just type it, and I'll build it for you right now."
+
+When roadmap_generated is true:
+- Resume normal advisor behavior
+</directive>
+
 <directive name="classify_first" priority="CRITICAL">
 Before doing ANYTHING, classify the incoming message:
 
@@ -847,7 +862,11 @@ def format_expertise_areas(areas: list[str]) -> str:
     return "\n".join(f"- {area}" for area in areas)
 
 
-def get_dynamic_system_prompt(advisor: dict | None = None, learning_track: str | None = None) -> str:
+def get_dynamic_system_prompt(
+    advisor: dict | None = None,
+    learning_track: str | None = None,
+    roadmap_generated: bool = False,
+) -> str:
     """Generate a dynamic system prompt with the advisor's information.
 
     Args:
@@ -855,6 +874,7 @@ def get_dynamic_system_prompt(advisor: dict | None = None, learning_track: str |
             - name, title, experience, personality, background,
             - communication_style, expertise_areas
         learning_track: The student's enrolled learning track.
+        roadmap_generated: Whether the user has already generated a roadmap.
 
     Returns:
         The system prompt with advisor placeholders filled in
@@ -873,6 +893,7 @@ def get_dynamic_system_prompt(advisor: dict | None = None, learning_track: str |
         advisor_communication_style=advisor.get("communication_style", DEFAULT_ADVISOR["communication_style"]),
         advisor_expertise=format_expertise_areas(advisor.get("expertise_areas", DEFAULT_ADVISOR["expertise_areas"])),
         learning_track=track_str,
+        roadmap_generated=str(bool(roadmap_generated)).lower(),
         project_intelligence_track_block=get_track_project_intelligence_block(learning_track),
         system_time="{system_time}",  # Keep this as a placeholder for runtime
     )

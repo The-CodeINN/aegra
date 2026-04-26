@@ -474,7 +474,6 @@ class SchedulerService:
 
     async def _discover_and_notify_user(self, session_maker: async_sessionmaker, user_id: str) -> None:  # type: ignore[type-arg]
         """Run discovery for a single user and create in-app/web-push notifications."""
-        max_tracks = settings.discovery.DISCOVERY_MAX_TRACKS
         queries_per_category = settings.discovery.DISCOVERY_QUERIES_PER_CATEGORY
         try:
             logger.info("discovery_job_user_start", user_id=user_id)
@@ -484,7 +483,7 @@ class SchedulerService:
                     session=session,
                     user_id=user_id,
                     auth_token="",  # nosec B106
-                    max_tracks=max_tracks,
+                    max_tracks=1,
                     queries_per_category=queries_per_category,
                 )
                 logger.info(

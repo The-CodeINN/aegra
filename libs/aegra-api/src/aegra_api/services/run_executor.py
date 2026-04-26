@@ -16,6 +16,11 @@ from aegra_api.core.auth_ctx import with_auth_ctx
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.models.run_job import RunJob
 from aegra_api.services.broker import broker_manager
+from aegra_api.services.career_advisor_activation import (
+    extract_latest_human_text,
+    is_career_roadmap_trigger,
+    mark_roadmap_generated_for_user,
+)
 from aegra_api.services.graph_streaming import stream_graph_events
 from aegra_api.services.langgraph_service import create_run_config, get_langgraph_service
 from aegra_api.services.run_status import finalize_run, update_run_status
@@ -69,6 +74,7 @@ async def execute_run(job: RunJob) -> None:
                 thread_status="idle",
                 output=final_output.data,
             )
+            await _maybe_mark_career_roadmap_generated(job)
 
     except asyncio.CancelledError:
         if run_id in _lease_loss_cancellations:
@@ -240,3 +246,27 @@ async def _signal_run_done(run_id: str) -> None:
         await client.set(done_key, "1", ex=_DONE_KEY_TTL_SECONDS)
     except Exception:
         logger.debug("Redis done-key set failed (non-critical)", run_id=run_id)
+
+
+async def _maybe_mark_career_roadmap_generated(job: RunJob) -> None:
+    """Persist roadmap activation only after a successful roadmap-triggered run."""
+    if not job.user.identity:
+        return
+
+    context = job.execution.context or {}
+    if context.get("roadmap_generated"):
+        return
+
+    latest_human_text = extract_latest_human_text(job.execution.input_data)
+    if not is_career_roadmap_trigger(latest_human_text):
+        return
+
+    try:
+        await mark_roadmap_generated_for_user(job.user.identity)
+    except Exception:
+        logger.warning(
+            "career_roadmap_generated_flag_update_failed",
+            user_id=job.user.identity,
+            run_id=job.identity.run_id,
+            exc_info=True,
+        )
