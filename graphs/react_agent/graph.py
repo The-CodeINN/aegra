@@ -1377,11 +1377,13 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
                     current_notes,
                     _model,
                 )
-                await store.aput(
-                    session_ns,
-                    "session_notes",
-                    {"notes": updated_notes},
-                )
+                session_value: dict[str, Any] = {
+                    "notes": updated_notes,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+                if state.thread_name:
+                    session_value["thread_name"] = state.thread_name
+                await store.aput(session_ns, "session_notes", session_value)
                 logger.debug("Session memory extraction complete — thread=%s", thread_id)
             except Exception:
                 logger.debug("Background session memory extraction failed; continuing.", exc_info=True)
@@ -1436,11 +1438,13 @@ async def update_session_memory(state: State, runtime: Runtime[Context]) -> dict
         )
 
         # Persist to store
-        await store.aput(
-            session_ns,
-            "session_notes",
-            {"notes": updated_notes},
-        )
+        session_value: dict[str, Any] = {
+            "notes": updated_notes,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        if state.thread_name:
+            session_value["thread_name"] = state.thread_name
+        await store.aput(session_ns, "session_notes", session_value)
 
         token_count = count_tokens_approximately(list(state.messages))
         return {

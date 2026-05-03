@@ -15,6 +15,7 @@ from typing import Any
 import structlog
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from aegra_api.core.accountability_orm import (
     ActionItem,
@@ -209,8 +210,11 @@ class AccountabilityService:
         if "push_subscription" in data:
             prefs.push_subscription = data["push_subscription"]
 
-        # Merge into preferences JSONB
-        pref_json = prefs.preferences or {}
+        # Merge into preferences JSONB.
+        # Use dict() to create a new object — reassigning the same dict that SQLAlchemy
+        # loaded as the committed state would not be detected as a change for JSONB columns
+        # that don't use MutableDict, causing the UPDATE to be silently skipped.
+        pref_json = dict(prefs.preferences) if prefs.preferences else {}
         for key in (
             "max_daily",
             "digest_mode",
@@ -233,6 +237,7 @@ class AccountabilityService:
         pref_json.setdefault("job_opportunity_mail_enabled", False)
         pref_json.setdefault("job_opportunity_mail_frequency", "weekly")
         prefs.preferences = pref_json
+        flag_modified(prefs, "preferences")
         prefs.updated_at = datetime.now(UTC)
 
         await session.commit()

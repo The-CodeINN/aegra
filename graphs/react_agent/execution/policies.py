@@ -55,6 +55,7 @@ _PROGRAMMATIC_SAFE_TOOLS = {
     "search_course_content",
     "manage_memory",
     "search_memory",
+    "search_past_conversations",
 }
 
 _POLICY_OVERRIDES: dict[str, ToolPolicy] = {
@@ -166,6 +167,13 @@ _POLICY_OVERRIDES: dict[str, ToolPolicy] = {
         timeout_seconds=10.0,
         max_retries=1,
         output_schema_name="MemorySearchResult",
+    ),
+    "search_past_conversations": ToolPolicy(
+        name="search_past_conversations",
+        timeout_seconds=10.0,
+        max_retries=1,
+        call_limit=5,
+        output_schema_name="ConversationSearchResult",
     ),
 }
 

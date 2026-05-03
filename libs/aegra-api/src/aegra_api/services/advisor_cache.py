@@ -137,7 +137,10 @@ async def check_ai_mentor_addon(token: str) -> dict:
                 headers={"accept": "*/*", "Authorization": f"Bearer {token}"},
             )
             response.raise_for_status()
-            data = response.json()
+            raw = response.json()
+            # LMS may return a list (multiple subscriptions) or a single object.
+            # Mirror the frontend normalisation: Array.isArray(res.data) ? res.data[0] : res.data
+            data: dict = raw[0] if isinstance(raw, list) else raw
 
             # Case 1: bolt-on add-on field is explicitly active
             addon = data.get("aiMentorAddOn") or {}

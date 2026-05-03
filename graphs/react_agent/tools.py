@@ -27,6 +27,7 @@ from langgraph.runtime import get_runtime
 from react_agent.context import Context
 from react_agent.retry import with_retry
 from react_agent.sanitization import validate_resource_id as _validate_id
+from react_agent.session_memory import SESSION_MEMORY_NAMESPACE_SUFFIX
 
 logger = logging.getLogger(__name__)
 
@@ -1193,25 +1194,65 @@ async def read_webpage(url: str) -> dict[str, Any]:
             "url": cleaned_url,
         }
 
-    # LinkedIn enforces HTTP 999 + TLS fingerprinting for direct access.
-    # Use Brave Search to retrieve indexed profile snippets instead — Brave caches
-    # LinkedIn pages and returns headline, current role, and experience blurbs.
+    # LinkedIn blocks direct HTTP access (HTTP 999 + TLS fingerprinting).
+    # Strategy (three tiers, stop at the first that returns real content):
+    #   Tier 1 — Jina Reader: renders JS and bypasses many bot-protection layers;
+    #             works for public profiles that don't require login.
+    #   Tier 2 — Brave Search with exact-URL query: searching the full URL in quotes
+    #             finds cached/indexed snippets far more reliably than site: searches.
+    #   Tier 3 — Brave Search with slug/name query: slug-only as a last attempt.
     if hostname in ("linkedin.com", "www.linkedin.com") or hostname.endswith(".linkedin.com"):
+        path_parts = [p for p in parsed.path.strip("/").split("/") if p]
+        # Extract the identifying slug from the path
+        # /in/<username>   /company/<slug>   /posts/<id>   → use second segment
+        # anything else → use first segment
+        if len(path_parts) >= 2 and path_parts[0] in ("in", "posts", "company"):
+            slug = path_parts[1]
+        elif path_parts:
+            slug = path_parts[0]
+        else:
+            slug = ""
+
+        # Tier 1: Jina Reader — best chance of returning real structured content
+        jina_url = f"https://r.jina.ai/{cleaned_url}"
         try:
-            path_parts = [p for p in parsed.path.strip("/").split("/") if p]
-            # /in/<username>   -> profile query
-            # /posts/<id>/...  -> post query
-            # /company/<slug>  -> company page query
-            # anything else    -> join first two path segments
-            if len(path_parts) >= 2 and path_parts[0] in ("in", "posts", "company"):
-                slug = path_parts[1]
-            elif path_parts:
-                slug = " ".join(path_parts[:2])
-            else:
-                slug = ""
-            query = f"site:linkedin.com {slug}" if slug else f"site:linkedin.com {cleaned_url}"
+            async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as client:
+                jina_resp = await client.get(
+                    jina_url,
+                    headers={
+                        "Accept": "text/plain, text/markdown",
+                        "X-Return-Format": "markdown",
+                        "X-Remove-Selector": "nav, footer, header, .cookie-banner, #cookie-notice",
+                        "User-Agent": "DeDataHubBot/1.0 (+https://dedatahub.io)",
+                    },
+                )
+                if jina_resp.status_code == 200:
+                    content = jina_resp.text.strip()
+                    # Real profiles are substantial; login redirect pages are short
+                    # and contain "sign in" / "join" near the top.
+                    is_login_wall = len(content) < 800 or any(
+                        phrase in content[:400].lower()
+                        for phrase in ("sign in", "join now", "join linkedin", "log in to")
+                    )
+                    if content and not is_login_wall:
+                        logger.info(f"Jina Reader fetched LinkedIn profile ({len(content)} chars)")
+                        return {
+                            "source": "jina_reader",
+                            "url": cleaned_url,
+                            "content": content[:8000],
+                            "content_length": len(content),
+                            "truncated": len(content) > 8000,
+                        }
+        except Exception as e:
+            logger.warning(f"Jina Reader failed for LinkedIn URL {cleaned_url}: {e}")
+
+        # Tier 2: Brave Search — exact URL in quotes (finds cached/federated results)
+        # "site:linkedin.com" is heavily de-indexed; the full URL query works much better.
+        try:
+            query = f'"{cleaned_url}"'
             search_result = await brave_search(query)
             if search_result and not search_result.startswith("Search failed"):
+                logger.info(f"Brave Search (exact URL) returned LinkedIn content for {cleaned_url}")
                 return {
                     "source": "brave_search_linkedin",
                     "url": cleaned_url,
@@ -1219,12 +1260,30 @@ async def read_webpage(url: str) -> dict[str, Any]:
                     "content": search_result,
                 }
         except Exception as e:
-            logger.warning(f"Brave Search fallback for LinkedIn failed: {e}")
+            logger.warning(f"Brave Search (exact URL) failed for LinkedIn {cleaned_url}: {e}")
+
+        # Tier 3: Brave Search — slug-based query as final attempt
+        if slug:
+            try:
+                query = f"{slug} linkedin profile"
+                search_result = await brave_search(query)
+                if search_result and not search_result.startswith("Search failed"):
+                    logger.info(f"Brave Search (slug) returned LinkedIn content for {slug}")
+                    return {
+                        "source": "brave_search_linkedin",
+                        "url": cleaned_url,
+                        "note": "LinkedIn blocks direct access; content retrieved via Brave Search index.",
+                        "content": search_result,
+                    }
+            except Exception as e:
+                logger.warning(f"Brave Search (slug) failed for LinkedIn {cleaned_url}: {e}")
+
         return {
             "error": "linkedin_unavailable",
             "message": (
-                "LinkedIn blocks direct access and the Brave Search fallback returned no results. "
-                "Ask the user to paste the post or profile text directly so you can help them."
+                "LinkedIn blocks automated access and all retrieval methods failed for this profile. "
+                "Ask the student to paste their LinkedIn 'About' section, work experience, "
+                "and key skills directly into the chat so you can give personalised advice based on their actual background."
             ),
             "url": cleaned_url,
         }
@@ -1472,6 +1531,67 @@ async def review_project_submission(
         return {"error": "Unexpected error", "message": str(e)}
 
 
+async def search_past_conversations(query: str, limit: int = 5) -> dict[str, Any]:
+    """Search through past conversation histories to recall relevant discussions.
+
+    Use this when the student references something from a previous session that is
+    not captured in long-term memories (search_memory). This searches the detailed
+    session notes kept for every prior conversation thread.
+
+    When to use:
+    - Student says "last time we talked about..." or "you helped me with X before"
+    - You need continuity from a prior session to resume a project or plan
+    - search_memory() returns nothing but the student insists the topic was discussed
+    - Checking whether a specific project, skill, or goal came up in earlier sessions
+
+    Args:
+        query: Natural language description of what you are looking for.
+        limit: Number of past threads to retrieve (1-10, default 5).
+    """
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+    store = runtime.store
+
+    if not user_id or not store:
+        return {"found": 0, "message": "Conversation history not available.", "results": []}
+
+    limit = min(max(1, limit), 10)
+
+    try:
+        results = await store.asearch(
+            (user_id, SESSION_MEMORY_NAMESPACE_SUFFIX),
+            query=query,
+            limit=limit,
+        )
+
+        if not results:
+            return {
+                "found": 0,
+                "message": "No relevant past conversations found.",
+                "results": [],
+            }
+
+        formatted: list[dict[str, Any]] = []
+        for item in results:
+            thread_id = item.namespace[-1] if len(item.namespace) >= 3 else "unknown"
+            notes = item.value.get("notes", "")
+            thread_name = item.value.get("thread_name")
+            updated_at = item.value.get("updated_at")
+
+            entry: dict[str, Any] = {"thread_id": thread_id, "notes": notes}
+            if thread_name:
+                entry["thread_name"] = thread_name
+            if updated_at:
+                entry["last_updated"] = updated_at
+            formatted.append(entry)
+
+        return {"found": len(formatted), "query": query, "results": formatted}
+
+    except Exception as e:
+        logger.error("Failed to search past conversations: %s", e, exc_info=True)
+        return {"error": "Search failed", "message": str(e), "results": []}
+
+
 # Build tools list dynamically based on availability
 TOOLS: list[Callable[..., Any]] = [
     # search,
@@ -1489,6 +1609,7 @@ TOOLS: list[Callable[..., Any]] = [
     get_subscription_state,
     get_portfolio_projects,
     review_project_submission,
+    search_past_conversations,
 ]
 
 # Add course search tool if a backend is available
