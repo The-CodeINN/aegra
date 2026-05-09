@@ -691,29 +691,12 @@ class NotificationEngine:
         if category == "opportunity":
             return
 
-        # Only send emails to users with an active AI Mentor subscription
+        # Only send emails to users with an active AI Mentor subscription.
+        # The ai_mentor_addon_active flag is authoritative; the cached expiry
+        # date is NOT re-checked because renewed subscriptions don't update it.
         if not user_prefs.get("ai_mentor_addon_active", False):
             logger.debug("email_skipped_no_ai_subscription", user_id=user_id, category=category)
             return
-
-        addon_expires_raw = user_prefs.get("ai_mentor_addon_expires_at")
-        if addon_expires_raw:
-            try:
-                from datetime import UTC, datetime
-
-                addon_expires = datetime.fromisoformat(addon_expires_raw)
-                if addon_expires.tzinfo is None:
-                    addon_expires = addon_expires.replace(tzinfo=UTC)
-                if datetime.now(UTC) >= addon_expires:
-                    logger.debug(
-                        "email_skipped_ai_subscription_expired",
-                        user_id=user_id,
-                        category=category,
-                        expired_at=addon_expires_raw,
-                    )
-                    return
-            except ValueError:
-                pass
 
         if not user_prefs.get("email_enabled", True):
             return

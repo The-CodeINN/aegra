@@ -637,24 +637,14 @@ class SchedulerService:
                         if not pref_json.get("job_opportunity_mail_enabled", False):
                             continue
 
-                        # Require active AI Mentor add-on (cached at preference-save time)
+                        # Require active AI Mentor add-on.
+                        # The ai_mentor_addon_active flag is set to True at preference-save
+                        # time (PUT /preferences enforces subscription check). The expiry
+                        # date is NOT re-checked here because it is a stale cached value —
+                        # renewed subscriptions don't update the cached date, causing all
+                        # users to be incorrectly blocked once the original expiry passes.
                         if not pref_json.get("ai_mentor_addon_active", False):
                             continue
-                        addon_expires_raw = pref_json.get("ai_mentor_addon_expires_at")
-                        if addon_expires_raw:
-                            try:
-                                addon_expires = datetime.fromisoformat(addon_expires_raw)
-                                if addon_expires.tzinfo is None:
-                                    addon_expires = addon_expires.replace(tzinfo=UTC)
-                                if now >= addon_expires:
-                                    logger.info(
-                                        "daily_digest_skipped_addon_expired",
-                                        user_id=prefs.user_id,
-                                        expired_at=addon_expires_raw,
-                                    )
-                                    continue
-                            except ValueError:
-                                pass
 
                         frequency = pref_json.get("job_opportunity_mail_frequency", "weekly")
                         if frequency not in {"daily", "weekly"}:
