@@ -151,6 +151,14 @@ _LEAK_PATTERNS: list[str] = [
     r"Type A.*Type B",
     r"NEVER do these:",
     r"the Abena Standard",
+    # Tool-calling / operational directive paraphrases
+    r"maximis[ez] parallel tool",
+    r"no dependencies between them",
+    r"dispatch all.{0,30}simultaneously",
+    r"(all|multiple).{0,20}tool calls?.{0,20}(simultaneously|parallel|at once)",
+    r"must be done in.{0,30}parallel",
+    r"avoid duplicate extractions?",
+    r"single parallel.{0,20}tool",
     # Generic meta-disclosure phrases
     r"\bmy (system |)prompt (is|says|includes|states|contains)\b",
     r"\b(my|the) (system |)instructions? (are|say|include|state|contain)\b",

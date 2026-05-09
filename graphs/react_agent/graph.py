@@ -50,7 +50,7 @@ from react_agent.guardrails import (
     LEAK_SAFE_RESPONSE,
     screen_input_for_injection,
     screen_output_for_hallucination,
-    screen_output_for_leak,
+    screen_output_for_leak,  # also used to validate session notes
 )
 from react_agent.memory import DEFAULT_MEMORY_NAMESPACE, MAX_MEMORIES_PER_USER, MEMORY_SCHEMAS, memory_freshness_note
 from react_agent.message_utils import (
@@ -98,6 +98,17 @@ _FALLBACK_MODELS: dict[str, str] = {
 # Max output token recovery: retry count when model hits max_tokens stop reason.
 _MAX_OUTPUT_RECOVERY_RETRIES = 3
 
+# LangChain/LangMem formatting artifacts that can bleed into model responses.
+# These patterns appear when the model echoes the conversation-format injected
+# by LangMem's get_conversation() (used internally by SummarizationNode and
+# create_memory_store_manager).  We strip them defensively before storing the
+# response in state so they can never pollute session notes or future turns.
+_LANGCHAIN_MSG_HEADER_RE = re.compile(
+    r"={20,}\s+\w[\w\s]*Message[\w\s]*=*\s*\n?",
+    re.IGNORECASE,
+)
+_SESSION_UUID_TAG_RE = re.compile(r"</?session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}>")
+
 
 class _StringContentModel:
     """Thin wrapper around a chat model that normalises `.content` to a plain string.
@@ -144,6 +155,19 @@ def _truncate_for_embedding(text: str) -> str:
     if len(text) <= _COHERE_MAX_CHARS:
         return text
     return text[:_COHERE_MAX_CHARS]
+
+
+def _strip_lc_artifacts(text: str) -> str:
+    """Strip LangChain/LangMem formatting artifacts from a model response.
+
+    Removes LangChain ``msg.pretty_repr()`` headers (e.g.
+    ``=== Ai Message ===``) and LangMem session XML tags
+    (e.g. ``</session_b0e5d31c-...>``) that can bleed into the model's
+    output when these patterns appear in the summarized context window.
+    """
+    cleaned = _LANGCHAIN_MSG_HEADER_RE.sub("", text)
+    cleaned = _SESSION_UUID_TAG_RE.sub("", cleaned)
+    return cleaned.strip()
 
 
 def _normalize_messages_for_memory(messages: list[AnyMessage]) -> list[AnyMessage]:
@@ -490,7 +514,14 @@ async def _load_session_notes_into_state(result: dict[str, Any], runtime: Runtim
         if existing:
             notes = existing[0].value.get("notes", "")
             if notes:
-                result["session_notes"] = notes
+                notes = _strip_lc_artifacts(notes)
+                # Discard notes that contain leaked system-prompt / operational
+                # directive content — these pollute the agent's context and cause
+                # the model to echo instructions back to the user.
+                if screen_output_for_leak(notes):
+                    logger.warning("Discarding session notes — leak patterns detected; notes will regenerate next turn")
+                else:
+                    result["session_notes"] = notes
     except Exception:
         logger.debug("Failed to load session notes from store.", exc_info=True)
 
@@ -990,6 +1021,20 @@ conversation and greet the student without time references.
     if isinstance(response.content, list):
         response = AIMessage(
             content=get_message_text(response),
+            id=response.id,
+            tool_calls=getattr(response, "tool_calls", []),
+            response_metadata=getattr(response, "response_metadata", {}),
+        )
+
+    # Strip LangChain/LangMem formatting artifacts (=== Ai Message === headers,
+    # </session_UUID> XML tags) that bleed in when the summarization context
+    # window contains LangMem-formatted conversation text.
+    _raw_text = get_message_text(response)
+    _cleaned_text = _strip_lc_artifacts(_raw_text)
+    if _cleaned_text != _raw_text:
+        logger.warning("Stripped LangChain/LangMem artifacts from model response (turn contained formatting bleed)")
+        response = AIMessage(
+            content=_cleaned_text,
             id=response.id,
             tool_calls=getattr(response, "tool_calls", []),
             response_metadata=getattr(response, "response_metadata", {}),

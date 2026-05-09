@@ -360,9 +360,8 @@ class SchedulerService:
         """Tiered notification cleanup to prevent DB bloat.
 
         Retention tiers:
-        - Read or dismissed: 7 days (already actioned by the user)
-        - Delivered (included in email digest): 10 days
-        - Everything else (pending, sent, failed): 10 days
+        - Expired (expires_at in the past): 1 hour grace period after expiry
+        - Everything else (all statuses): 3 days
         """
         try:
             if not db_manager.engine:
@@ -372,30 +371,19 @@ class SchedulerService:
                 now = datetime.now(UTC)
                 total_deleted = 0
 
-                # 1. Read or dismissed — keep 7 days
-                actioned_cutoff = now - timedelta(days=7)
+                # 1. Expired notifications — delete 1 hour after their expiry time
+                expired_cutoff = now - timedelta(hours=1)
                 stmt = delete(Notification).where(
                     and_(
-                        Notification.status.in_(["read", "dismissed"]),
-                        Notification.created_at < actioned_cutoff,
+                        Notification.expires_at.isnot(None),
+                        Notification.expires_at < expired_cutoff,
                     )
                 )
                 result = await session.execute(stmt)
                 total_deleted += result.rowcount
 
-                # 2. Delivered (digest sent) — keep 10 days
-                delivered_cutoff = now - timedelta(days=10)
-                stmt = delete(Notification).where(
-                    and_(
-                        Notification.delivered_at.isnot(None),
-                        Notification.created_at < delivered_cutoff,
-                    )
-                )
-                result = await session.execute(stmt)
-                total_deleted += result.rowcount
-
-                # 3. Everything else (pending, sent, failed) — keep 10 days
-                general_cutoff = now - timedelta(days=10)
+                # 2. Everything else — keep 3 days regardless of status
+                general_cutoff = now - timedelta(days=3)
                 stmt = delete(Notification).where(Notification.created_at < general_cutoff)
                 result = await session.execute(stmt)
                 total_deleted += result.rowcount
