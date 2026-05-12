@@ -35,6 +35,7 @@ from aegra_api.core.accountability_orm import (
     UserPreferences,
 )
 from aegra_api.core.database import db_manager
+from aegra_api.data.career_advisors import get_advisor_by_track, get_default_advisor
 from aegra_api.services.email_service import build_digest_email, resolve_student_contact, send_email
 from aegra_api.services.notification_engine import notification_engine
 from aegra_api.services.opportunity_discovery import opportunity_engine
@@ -692,10 +693,17 @@ class SchedulerService:
                             logger.warning("daily_digest_skipped_missing_email", user_id=prefs.user_id)
                             continue
 
+                        track = pref_json.get("learning_track") or pref_json.get("track") or ""
+                        advisor = get_advisor_by_track(track.strip()) if track.strip() else get_default_advisor()
+                        if not advisor:
+                            advisor = get_default_advisor()
+                        advisor_first_name = advisor["name"].split()[0]
+
                         subject, html_body, text_body = build_digest_email(
                             student_name=student_name,
                             items=digest_items,
                             cadence=frequency,
+                            advisor_persona=advisor_first_name,
                         )
                         sent = await send_email(
                             to_email=student_email,
