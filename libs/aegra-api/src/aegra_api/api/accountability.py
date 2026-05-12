@@ -15,7 +15,6 @@ have been moved to the WebSocket endpoint at /ws/notifications.
 from datetime import datetime
 from typing import Any
 
-import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,10 +23,9 @@ from aegra_api.core.auth_deps import get_current_user
 from aegra_api.core.orm import get_session
 from aegra_api.models import User
 from aegra_api.services.accountability_service import AccountabilityService
-from aegra_api.services.advisor_cache import check_ai_mentor_addon, get_cached_learning_track
+from aegra_api.services.advisor_cache import check_ai_mentor_addon
 
 router = APIRouter(tags=["Accountability"])
-logger = structlog.getLogger(__name__)
 
 
 # ── Pydantic models ──────────────────────────────────────────────────
@@ -172,17 +170,6 @@ async def update_preferences(
         data["user_email"] = user.email
     if user.display_name:
         data["user_name"] = user.display_name
-
-    # Resolve and persist the learning track so the scheduler can read it
-    # without a user token (background jobs have no auth context).
-    token_for_track = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    if token_for_track:
-        try:
-            resolved_track = await get_cached_learning_track(user.identity, token_for_track)
-            if resolved_track:
-                data["learning_track"] = resolved_track
-        except Exception as exc:
-            logger.warning("preferences_track_resolve_failed", user_id=user.identity, error=str(exc))
     prefs = await AccountabilityService.upsert_preferences(session, user.identity, data)
     pref_data = prefs.preferences or {}
     pref_data.setdefault("job_opportunity_mail_enabled", False)

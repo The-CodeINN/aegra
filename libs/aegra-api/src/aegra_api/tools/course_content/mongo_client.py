@@ -518,6 +518,24 @@ class CourseContentMongoClient:
             "updatedAt": doc.get("updatedAt"),
         }
 
+    def get_learning_track(self, user_id: str) -> str | None:
+        """Return the user's active learning track directly from the LMS database.
+
+        Used by background jobs (scheduler) that have no user JWT token.
+        Queries the subscriptions collection, which is the same source of
+        truth used by the LMS subscription API endpoint.
+
+        Args:
+            user_id: The user's unique identifier.
+
+        Returns:
+            The track slug (e.g. ``"ai-engineering"``) or ``None`` if not found.
+        """
+        sub = self.get_subscription_state(user_id)
+        if sub and isinstance(sub.get("track"), str) and sub["track"].strip():
+            return sub["track"].strip()
+        return None
+
 
 _mongo_course_client: CourseContentMongoClient | None = None
 

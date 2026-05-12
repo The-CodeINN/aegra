@@ -40,6 +40,7 @@ from aegra_api.services.email_service import build_digest_email, resolve_student
 from aegra_api.services.notification_engine import notification_engine
 from aegra_api.services.opportunity_discovery import opportunity_engine
 from aegra_api.settings import settings
+from aegra_api.tools.course_content.mongo_client import get_course_content_mongo_client
 
 logger = structlog.getLogger(__name__)
 
@@ -693,8 +694,11 @@ class SchedulerService:
                             logger.warning("daily_digest_skipped_missing_email", user_id=prefs.user_id)
                             continue
 
-                        track = pref_json.get("learning_track") or pref_json.get("track") or ""
-                        advisor = get_advisor_by_track(track.strip()) if track.strip() else get_default_advisor()
+                        track = await asyncio.to_thread(
+                            get_course_content_mongo_client().get_learning_track,
+                            prefs.user_id,
+                        )
+                        advisor = get_advisor_by_track(track) if track else get_default_advisor()
                         if not advisor:
                             advisor = get_default_advisor()
                         advisor_first_name = advisor["name"].split()[0]
