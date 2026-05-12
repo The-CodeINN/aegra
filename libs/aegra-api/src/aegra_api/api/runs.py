@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aegra_api.core.accountability_orm import UserPreferences
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
 from aegra_api.core.auth_handlers import build_auth_context, handle_event
@@ -56,6 +57,25 @@ def _get_user_token(user: User | None) -> str | None:
     return token if isinstance(token, str) and token.strip() else None
 
 
+async def _persist_learning_track(user_id: str, learning_track: str) -> None:
+    """Write the resolved learning track into UserPreferences so background jobs can read it."""
+    try:
+        maker = _get_session_maker()
+        async with maker() as session:
+            result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
+            prefs = result.scalar_one_or_none()
+            if prefs is None:
+                return
+            pref_json = dict(prefs.preferences or {})
+            if pref_json.get("learning_track") == learning_track:
+                return
+            pref_json["learning_track"] = learning_track
+            prefs.preferences = pref_json
+            await session.commit()
+    except Exception as exc:
+        logger.warning("persist_learning_track_failed", user_id=user_id, error=str(exc))
+
+
 async def _enrich_run_context_with_user_data(context: dict[str, Any] | None, user: User | None) -> dict[str, Any]:
     """Inject user-scoped runtime data and always resolve the advisor server-side.
 
@@ -82,6 +102,7 @@ async def _enrich_run_context_with_user_data(context: dict[str, Any] | None, use
         runtime_context["advisor"] = advisor
         if learning_track:
             runtime_context["learning_track"] = learning_track
+            asyncio.create_task(_persist_learning_track(user.identity, learning_track))
         else:
             # Server found no track — remove any client-supplied value to prevent
             # a mismatch between the advisor persona and the track scope directive.
