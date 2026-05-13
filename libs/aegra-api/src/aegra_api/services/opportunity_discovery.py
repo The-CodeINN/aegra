@@ -38,6 +38,7 @@ from aegra_api.services.opportunity_job_sources import (
 )
 from aegra_api.services.student_profile import StudentProfile, fetch_student_profile
 from aegra_api.settings import settings
+from aegra_api.tools.course_content.mongo_client import get_course_content_mongo_client
 
 logger = structlog.get_logger(__name__)
 
@@ -853,6 +854,16 @@ class OpportunityDiscoveryEngine:
             effective_track = profile.learning_track
         if not effective_track:
             effective_track = await self._get_track_from_prefs(session, user_id)
+        if not effective_track:
+            try:
+                effective_track = await asyncio.to_thread(
+                    get_course_content_mongo_client().get_learning_track,
+                    user_id,
+                )
+                if effective_track:
+                    logger.info("discovery_track_from_mongo", user_id=user_id, track=effective_track)
+            except Exception as exc:
+                logger.warning("discovery_mongo_track_lookup_failed", user_id=user_id, error=str(exc))
 
         tracks = _dedupe_tracks([effective_track] if effective_track else [])
         if not tracks:
