@@ -518,7 +518,14 @@ class LumaSource:
         if self._is_online(event):
             return "online"
         geo = event.get("geo_address_info") or {}
-        return str(geo.get("city_state") or geo.get("city") or "").strip()
+        city_part = str(geo.get("city_state") or geo.get("city") or "").strip()
+        # Include the ISO country code so the caller's location guard can match
+        # against it reliably (city-only strings like "London" cannot be matched
+        # against country names like "Nigeria" or "United Kingdom").
+        country_code = str(geo.get("country_code") or "").strip()
+        if city_part and country_code and country_code.upper() not in city_part.upper():
+            return f"{city_part}, {country_code.upper()}"
+        return city_part or country_code
 
     async def _fetch_page(
         self,

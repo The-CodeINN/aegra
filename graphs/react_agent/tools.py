@@ -1592,6 +1592,76 @@ async def search_past_conversations(query: str, limit: int = 5) -> dict[str, Any
         return {"error": "Search failed", "message": str(e), "results": []}
 
 
+async def get_thread_summary_by_title(title: str) -> dict[str, Any]:
+    """Look up the summary/notes for a past conversation thread by its title.
+
+    Use this when the student references a specific named conversation, e.g.
+    "the chat called 'Personalised Career Roadmap Development'" or
+    "read the thread titled 'My Data Engineering Plan'".
+
+    This performs a case-insensitive substring match against stored thread names
+    and returns the session notes (a structured summary of what was discussed).
+
+    Args:
+        title: The thread title or a partial title to search for.
+    """
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+    store = runtime.store
+
+    if not user_id or not store:
+        return {"found": 0, "message": "Conversation history not available.", "results": []}
+
+    title_lower = title.lower().strip()
+
+    try:
+        all_items = await store.asearch(
+            (user_id, SESSION_MEMORY_NAMESPACE_SUFFIX),
+            limit=200,
+        )
+    except Exception as e:
+        logger.error("Failed to list session notes: %s", e, exc_info=True)
+        return {"error": "Lookup failed", "message": str(e), "results": []}
+
+    matches: list[dict[str, Any]] = []
+    all_titles: list[str] = []
+
+    for item in all_items:
+        thread_name: str = item.value.get("thread_name", "")
+        if thread_name:
+            all_titles.append(thread_name)
+        if thread_name and title_lower in thread_name.lower():
+            thread_id = item.namespace[-1] if len(item.namespace) >= 3 else "unknown"
+            entry: dict[str, Any] = {
+                "thread_id": thread_id,
+                "thread_name": thread_name,
+                "notes": item.value.get("notes", ""),
+            }
+            updated_at = item.value.get("updated_at")
+            if updated_at:
+                entry["last_updated"] = updated_at
+            matches.append(entry)
+
+    if matches:
+        return {"found": len(matches), "query": title, "results": matches}
+
+    # No exact substring match — return known thread titles so the agent
+    # can inform the student which threads are available.
+    if all_titles:
+        return {
+            "found": 0,
+            "message": f"No thread with a title containing '{title}' was found.",
+            "available_thread_titles": all_titles[:20],
+            "results": [],
+        }
+
+    return {
+        "found": 0,
+        "message": "No past conversation threads with saved summaries were found.",
+        "results": [],
+    }
+
+
 # Build tools list dynamically based on availability
 TOOLS: list[Callable[..., Any]] = [
     # search,
@@ -1610,6 +1680,7 @@ TOOLS: list[Callable[..., Any]] = [
     get_portfolio_projects,
     review_project_submission,
     search_past_conversations,
+    get_thread_summary_by_title,
 ]
 
 # Add course search tool if a backend is available

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -715,11 +716,24 @@ class OpportunityDiscoveryEngine:
         return "UK"
 
     def _job_location_allowed(self, job_location: str, readable_locations: set[str]) -> bool:
-        """Return True if the job location matches one of the user's allowed locations or is remote."""
+        """Return True if the job location matches one of the user's allowed locations or is remote.
+
+        Short ISO-2 codes (e.g. "ng", "gb") use word-boundary matching to prevent
+        false positives where e.g. Nigeria's code "ng" appears inside "England" or
+        "United Kingdom" as a bare substring and incorrectly lets UK events through.
+        """
         loc_lower = job_location.lower().strip()
         if not loc_lower or "remote" in loc_lower or "hybrid" in loc_lower:
             return True
-        return any(allowed in loc_lower or loc_lower in allowed for allowed in readable_locations)
+        for allowed in readable_locations:
+            if len(allowed) <= 2:
+                # Word-boundary check: "ng" must not be buried inside another word
+                if re.search(r"(?<![a-z])" + re.escape(allowed) + r"(?![a-z])", loc_lower):
+                    return True
+            else:
+                if allowed in loc_lower or loc_lower in allowed:
+                    return True
+        return False
 
     async def _discover_jobs(
         self,
