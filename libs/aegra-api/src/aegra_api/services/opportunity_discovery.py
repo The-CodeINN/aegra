@@ -865,6 +865,25 @@ class OpportunityDiscoveryEngine:
             except Exception as exc:
                 logger.warning("discovery_mongo_track_lookup_failed", user_id=user_id, error=str(exc))
 
+        # Enrich profile with Mongo onboarding data when running without a user token
+        # (scheduler path has no JWT so fetch_student_profile returns an empty profile).
+        if not auth_token or auth_token == "scheduled_job_token":  # nosec B105
+            try:
+                mongo_profile = await asyncio.to_thread(
+                    get_course_content_mongo_client().get_user_onboarding_data,
+                    user_id,
+                )
+                if mongo_profile:
+                    if not profile.resident_country and mongo_profile.get("resident_country"):
+                        profile.resident_country = mongo_profile["resident_country"]
+                    if not profile.work_countries and mongo_profile.get("work_countries"):
+                        profile.work_countries = list(mongo_profile["work_countries"])
+                    if not profile.target_role and mongo_profile.get("target_role"):
+                        profile.target_role = mongo_profile["target_role"]
+                    logger.info("discovery_profile_enriched_from_mongo", user_id=user_id)
+            except Exception as exc:
+                logger.warning("discovery_mongo_profile_lookup_failed", user_id=user_id, error=str(exc))
+
         tracks = _dedupe_tracks([effective_track] if effective_track else [])
         if not tracks:
             logger.warning("discovery_no_tracks", user_id=user_id, reason="no_active_track_resolved")

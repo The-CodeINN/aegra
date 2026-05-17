@@ -12,9 +12,11 @@ Note: Notification listing and mutation endpoints (mark read, dismiss, etc.)
 have been moved to the WebSocket endpoint at /ws/notifications.
 """
 
+import asyncio
 from datetime import datetime
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,7 +26,9 @@ from aegra_api.core.orm import get_session
 from aegra_api.models import User
 from aegra_api.services.accountability_service import AccountabilityService
 from aegra_api.services.advisor_cache import check_ai_mentor_addon
+from aegra_api.tools.course_content.mongo_client import get_course_content_mongo_client
 
+logger = structlog.get_logger(__name__)
 router = APIRouter(tags=["Accountability"])
 
 
@@ -105,6 +109,40 @@ async def update_action_item(
 # ── Preferences ──────────────────────────────────────────────────────
 
 
+async def _auto_enable_job_mail_if_addon_active(
+    session: AsyncSession,
+    user: User,
+    pref_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Check Mongo for an active AI Mentor add-on and auto-enable job mail if found.
+
+    Called only when ``ai_mentor_addon_active`` has not yet been cached in the
+    preferences row, so the Mongo round-trip happens at most once per user.
+    Returns the (possibly updated) ``pref_data`` dict.
+    """
+    try:
+        sub = await asyncio.to_thread(
+            get_course_content_mongo_client().get_subscription_state,
+            user.identity,
+        )
+        addon = (sub or {}).get("aiMentorAddOn") or {}
+        if addon.get("active", False):
+            pref_data = dict(pref_data)
+            pref_data["ai_mentor_addon_active"] = True
+            pref_data["job_opportunity_mail_enabled"] = True
+            await AccountabilityService.upsert_preferences(
+                session,
+                user.identity,
+                {
+                    "ai_mentor_addon_active": True,
+                    "job_opportunity_mail_enabled": True,
+                },
+            )
+    except Exception as exc:
+        logger.warning("auto_enable_job_mail_failed", user_id=user.identity, error=str(exc))
+    return pref_data
+
+
 @router.get("/preferences")
 async def get_preferences(
     session: AsyncSession = Depends(get_session),
@@ -112,18 +150,22 @@ async def get_preferences(
 ) -> dict[str, Any]:
     prefs = await AccountabilityService.get_preferences(session, user.identity)
     if not prefs:
+        pref_data: dict[str, Any] = {
+            "job_opportunity_mail_enabled": False,
+            "job_opportunity_mail_frequency": "weekly",
+        }
+        pref_data = await _auto_enable_job_mail_if_addon_active(session, user, pref_data)
         return {
             "user_id": user.identity,
             "notifications_enabled": True,
             "location": None,
-            "preferences": {
-                "job_opportunity_mail_enabled": False,
-                "job_opportunity_mail_frequency": "weekly",
-            },
+            "preferences": pref_data,
         }
-    pref_data = prefs.preferences or {}
-    pref_data.setdefault("job_opportunity_mail_enabled", False)
+    pref_data = dict(prefs.preferences) if prefs.preferences else {}
     pref_data.setdefault("job_opportunity_mail_frequency", "weekly")
+    if not pref_data.get("ai_mentor_addon_active"):
+        pref_data = await _auto_enable_job_mail_if_addon_active(session, user, pref_data)
+    pref_data.setdefault("job_opportunity_mail_enabled", False)
     return {
         "user_id": prefs.user_id,
         "notifications_enabled": prefs.notifications_enabled,

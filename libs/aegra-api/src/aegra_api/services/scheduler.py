@@ -23,9 +23,11 @@ from datetime import UTC, datetime, timedelta
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[import-untyped]
 from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
+from apscheduler.triggers.date import DateTrigger  # type: ignore[import-untyped]
 from apscheduler.triggers.interval import IntervalTrigger  # type: ignore[import-untyped]
 from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.orm.attributes import flag_modified
 
 from aegra_api.core.accountability_orm import (
     ActionItem,
@@ -57,6 +59,25 @@ def _parse_digest_timestamp(raw_value: str | None) -> datetime | None:
 class SchedulerService:
     def __init__(self) -> None:
         self.scheduler = AsyncIOScheduler()
+
+    @staticmethod
+    async def _resolve_advisor_first_name(user_id: str) -> str:
+        """Return the advisor first name for a user based on their subscription track.
+
+        Falls back to the default advisor (Alexandra) if the track cannot be resolved.
+        """
+        try:
+            track = await asyncio.to_thread(
+                get_course_content_mongo_client().get_learning_track,
+                user_id,
+            )
+            if track:
+                advisor = get_advisor_by_track(track)
+                if advisor:
+                    return advisor["name"].split()[0]
+        except Exception as exc:
+            logger.warning("advisor_name_resolve_failed", user_id=user_id, error=str(exc))
+        return get_default_advisor()["name"].split()[0]
 
     def start(self) -> None:
         if not self.scheduler.running:
@@ -130,6 +151,13 @@ class SchedulerService:
                 id="check_struggles",
                 replace_existing=True,
             )
+            # One-shot backfill: enable Jobs email for all paid users on startup
+            self.scheduler.add_job(
+                self.backfill_job_opportunity_opt_in,
+                DateTrigger(run_date=datetime.now(UTC)),
+                id="backfill_job_opportunity_opt_in",
+                replace_existing=True,
+            )
 
             self.scheduler.start()
             logger.info("Scheduler started with all accountability jobs")
@@ -137,6 +165,56 @@ class SchedulerService:
     def shutdown(self) -> None:
         if self.scheduler.running:
             self.scheduler.shutdown()
+
+    # ------------------------------------------------------------------
+    # One-shot startup backfill
+    # ------------------------------------------------------------------
+    async def backfill_job_opportunity_opt_in(self) -> None:
+        """Enable Jobs & Opportunity email for existing paid users who haven't opted in.
+
+        Runs once on startup. For every UserPreferences row where
+        ``job_opportunity_mail_enabled`` is not True, checks the LMS Mongo
+        subscriptions collection. If the user has an active AI Mentor add-on,
+        both ``ai_mentor_addon_active`` and ``job_opportunity_mail_enabled`` are
+        set to True so they receive job digests without any manual action.
+        """
+        try:
+            if not db_manager.engine:
+                return
+            session_maker = async_sessionmaker(db_manager.engine, expire_on_commit=False)
+            async with session_maker() as session:
+                result = await session.execute(select(UserPreferences))
+                all_prefs = result.scalars().all()
+
+                updated = 0
+                for prefs in all_prefs:
+                    pref_json = prefs.preferences or {}
+                    if pref_json.get("job_opportunity_mail_enabled", False):
+                        continue
+                    try:
+                        sub = await asyncio.to_thread(
+                            get_course_content_mongo_client().get_subscription_state,
+                            prefs.user_id,
+                        )
+                        if not sub:
+                            continue
+                        addon = sub.get("aiMentorAddOn") or {}
+                        if not addon.get("active", False):
+                            continue
+                        new_pref_json = dict(pref_json)
+                        new_pref_json["ai_mentor_addon_active"] = True
+                        new_pref_json["job_opportunity_mail_enabled"] = True
+                        prefs.preferences = new_pref_json
+                        flag_modified(prefs, "preferences")
+                        updated += 1
+                    except Exception as exc:
+                        logger.warning("backfill_opt_in_user_failed", user_id=prefs.user_id, error=str(exc))
+
+                if updated > 0:
+                    await session.commit()
+                logger.info("backfill_job_opportunity_opt_in_complete", users_updated=updated)
+        except Exception as exc:
+            logger.error("backfill_job_opportunity_opt_in_failed", error=str(exc), exc_info=True)
 
     # ------------------------------------------------------------------
     # Deadline reminders
@@ -278,6 +356,7 @@ class SchedulerService:
                         continue
 
                     content = content_tpl.format(days=days_inactive)
+                    advisor_name = await self._resolve_advisor_first_name(activity.user_id)
 
                     await notification_engine.create_notification(
                         session=session,
@@ -286,6 +365,7 @@ class SchedulerService:
                         content=content,
                         category="inactivity",
                         priority=priority,
+                        persona=advisor_name,
                         action_buttons=[
                             {
                                 "action": "resume",
@@ -583,6 +663,7 @@ class SchedulerService:
 
                 for user_id in user_ids:
                     try:
+                        advisor_name = await self._resolve_advisor_first_name(user_id)
                         await notification_engine.create_notification(
                             session=session,
                             user_id=user_id,
@@ -590,6 +671,7 @@ class SchedulerService:
                             content=msg["content"],
                             category="motivation",
                             priority="low",
+                            persona=advisor_name,
                             action_buttons=[
                                 {
                                     "action": "chat",
@@ -772,6 +854,7 @@ class SchedulerService:
                         if exists.scalars().first():
                             continue
 
+                        advisor_name = await self._resolve_advisor_first_name(user_id)
                         await notification_engine.create_notification(
                             session=session,
                             user_id=user_id,
@@ -779,6 +862,7 @@ class SchedulerService:
                             content=struggle["content"],
                             category=struggle["category"],
                             priority=struggle["priority"],
+                            persona=advisor_name,
                             action_buttons=[
                                 {
                                     "action": "chat",

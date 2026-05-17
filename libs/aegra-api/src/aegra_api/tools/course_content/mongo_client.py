@@ -518,6 +518,44 @@ class CourseContentMongoClient:
             "updatedAt": doc.get("updatedAt"),
         }
 
+    def get_user_onboarding_data(self, user_id: str) -> dict[str, Any] | None:
+        """Return onboarding location and goal data directly from the LMS database.
+
+        Reads the ``aimentoronboardings`` collection which backs the
+        ``/api/v1/ai-mentor/onboarding/me`` LMS endpoint. Used by background
+        scheduler jobs that have no user JWT token.
+
+        Returns a dict with ``resident_country``, ``work_countries``, and
+        ``target_role``, or ``None`` if no completed onboarding data is found.
+        """
+        user_key = self._to_object_id_or_str(user_id)
+        doc = self.db["aimentoronboardings"].find_one(
+            {"user": user_key},
+            {"onboarding.s2": 1, "onboarding.s4": 1},
+        )
+        if not isinstance(doc, dict):
+            return None
+        onboarding = self._safe_dict(doc.get("onboarding"))
+        s2 = self._safe_dict(onboarding.get("s2"))
+        s4 = self._safe_dict(onboarding.get("s4"))
+        resident_country: str | None = None
+        work_countries: list[str] = []
+        target_role: str | None = None
+        if s2.get("completed"):
+            resident_country = self._pick_text(s2, "residentCountry")
+            work_country = s2.get("workCountry")
+            if isinstance(work_country, list):
+                work_countries = [c for c in work_country if isinstance(c, str) and c.strip()]
+        if s4.get("completed"):
+            target_role = self._pick_text(s4, "targetRole")
+        if not resident_country and not work_countries and not target_role:
+            return None
+        return {
+            "resident_country": resident_country,
+            "work_countries": work_countries,
+            "target_role": target_role,
+        }
+
     def get_learning_track(self, user_id: str) -> str | None:
         """Return the user's active learning track directly from the LMS database.
 
