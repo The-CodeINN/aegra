@@ -152,7 +152,13 @@ def _readable_location(raw: str) -> str:
     return stripped
 
 
-def _normalise_track(track: str) -> str:
+def _normalise_track(track: str | None) -> str | None:
+    """Normalise a track to kebab-lowercase (e.g. 'AI Engineering' → 'ai-engineering').
+
+    Returns None for empty/None input so callers can safely use ``if track`` guards.
+    """
+    if not track or not track.strip():
+        return None
     return track.lower().strip().replace(" ", "-")
 
 
@@ -971,7 +977,10 @@ class OpportunityDiscoveryEngine:
                 location=parsed["location"],
                 company=parsed.get("company"),
                 salary_range=parsed.get("salary_range"),
-                matched_track=parsed["matched_track"],
+                # Normalise to kebab-lowercase so the format is consistent
+                # regardless of whether it came from the LMS API, MongoDB or
+                # user preferences (e.g. "Data Analytics" → "data-analytics").
+                matched_track=_normalise_track(parsed["matched_track"]),
                 match_score=parsed["match_score"],
                 expires_at=datetime.now(UTC) + timedelta(days=expires_days),
                 metadata_json=meta,

@@ -25,8 +25,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[impo
 from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
 from apscheduler.triggers.date import DateTrigger  # type: ignore[import-untyped]
 from apscheduler.triggers.interval import IntervalTrigger  # type: ignore[import-untyped]
-from sqlalchemy import and_, delete, or_, select, update
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
 from aegra_api.core.accountability_orm import (
@@ -61,23 +61,34 @@ class SchedulerService:
         self.scheduler = AsyncIOScheduler()
 
     @staticmethod
-    async def _resolve_advisor_first_name(user_id: str) -> str:
-        """Return the advisor first name for a user based on their subscription track.
+    async def _resolve_advisor_for_user(user_id: str) -> tuple[str, str]:
+        """Return (advisor_first_name, normalised_track) for a user.
 
-        Falls back to the default advisor (Alexandra) if the track cannot be resolved.
+        Track is resolved from MongoDB and normalised to kebab-lowercase so that
+        values like "AI Engineering", "ai engineering", or "ai-engineering" all map
+        to the correct advisor entry in ADVISORS_BY_TRACK.
+
+        Falls back to ("Alexandra", "") when the track cannot be resolved.
         """
         try:
-            track = await asyncio.to_thread(
+            raw_track = await asyncio.to_thread(
                 get_course_content_mongo_client().get_learning_track,
                 user_id,
             )
-            if track:
-                advisor = get_advisor_by_track(track)
+            if raw_track:
+                normalised = raw_track.lower().strip().replace(" ", "-")
+                advisor = get_advisor_by_track(normalised)
                 if advisor:
-                    return advisor["name"].split()[0]
+                    return advisor["name"].split()[0], normalised
         except Exception as exc:
-            logger.warning("advisor_name_resolve_failed", user_id=user_id, error=str(exc))
-        return get_default_advisor()["name"].split()[0]
+            logger.warning("advisor_resolve_failed", user_id=user_id, error=str(exc))
+        return get_default_advisor()["name"].split()[0], ""
+
+    @staticmethod
+    async def _resolve_advisor_first_name(user_id: str) -> str:
+        """Convenience wrapper — returns only the advisor first name."""
+        name, _ = await SchedulerService._resolve_advisor_for_user(user_id)
+        return name
 
     def start(self) -> None:
         if not self.scheduler.running:
@@ -596,7 +607,14 @@ class SchedulerService:
             logger.error("discovery_failed_for_user", user_id=user_id, error=str(e), exc_info=True)
 
     async def run_discovery_job(self) -> None:
-        """Periodic opportunity discovery for all active users, run concurrently."""
+        """Periodic opportunity discovery for all active users, run concurrently.
+
+        We query the union of UserActivityTracking and UserPreferences so that
+        newly-onboarded users (who have preferences but have not yet triggered any
+        activity-tracking events) are always included in the daily discovery run.
+        Without this, the daily_refresh deletes their stale opportunities but never
+        re-discovers new ones, leaving their job/event boards empty.
+        """
         logger.info("discovery_job_started")
         try:
             if not db_manager.engine:
@@ -604,12 +622,14 @@ class SchedulerService:
                 return
             session_maker = async_sessionmaker(db_manager.engine, expire_on_commit=False)
             async with session_maker() as session:
-                result = await session.execute(select(UserActivityTracking.user_id))
-                user_ids = list(result.scalars().all())
+                activity_result = await session.execute(select(UserActivityTracking.user_id))
+                prefs_result = await session.execute(select(UserPreferences.user_id))
+                # Union both sources — de-duplicate with a set
+                user_ids = list({*activity_result.scalars().all(), *prefs_result.scalars().all()})
 
             logger.info("discovery_job_users_found", count=len(user_ids))
             if not user_ids:
-                logger.warning("discovery_job_no_users", reason="user_activity_tracking table is empty")
+                logger.warning("discovery_job_no_users", reason="no users in activity_tracking or user_preferences")
                 return
 
             semaphore = asyncio.Semaphore(self._DISCOVERY_CONCURRENCY)
@@ -626,27 +646,156 @@ class SchedulerService:
     # ------------------------------------------------------------------
     # Motivational nudges [§2.4.3]
     # ------------------------------------------------------------------
-    MOTIVATIONAL_MESSAGES = [
-        {
-            "title": "🌟 Monday Motivation",
-            "content": "New week, new opportunities! What's one thing you'll accomplish this week toward your career goal?",
-        },
-        {
-            "title": "💪 Midweek Momentum",
-            "content": "You're halfway through the week! Keep going — every small step counts toward your career transformation.",
-        },
-        {
-            "title": "🎯 Friday Focus",
-            "content": "End the week strong! Take 15 minutes to review your progress and celebrate what you've accomplished.",
-        },
-        {
-            "title": "📚 Sunday Strategy",
-            "content": "Tomorrow starts a new week. Take a moment to plan your priorities and set yourself up for success!",
-        },
-    ]
+
+    async def _build_student_context(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        advisor_name: str,
+        track: str,
+    ) -> dict:
+        """Fetch per-user metrics from the DB and return a context dict.
+
+        Used to generate personalised email content that references each
+        student's actual streak, task counts, and career goal rather than
+        sending the same generic message to everyone.
+        """
+        now = datetime.now(UTC)
+        week_ago = now - timedelta(days=7)
+        context: dict = {
+            "learning_track": track,
+            "advisor_name": advisor_name,
+            "current_streak": 0,
+            "tasks_completed_this_week": 0,
+            "overdue_tasks": 0,
+            "pending_tasks": 0,
+            "first_name": "",
+            "primary_goal": "",
+            # Course progress fields — populated from MongoDB enrollment data
+            "enrolled_course": "",
+            "course_progress_pct": 0,
+            "total_completed_lessons": 0,
+            "total_watched_hours": 0.0,
+            "last_active_in_course": "",
+        }
+
+        try:
+            # ── Student name (from cached preferences) ───────────────
+            prefs_result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user_id))
+            prefs = prefs_result.scalar_one_or_none()
+            if prefs and prefs.preferences:
+                pref_json = prefs.preferences
+                raw_name = pref_json.get("user_name", "")
+                context["first_name"] = raw_name.split()[0] if raw_name else ""
+
+            # ── Streak & activity ─────────────────────────────────────
+            activity_result = await session.execute(
+                select(UserActivityTracking).where(UserActivityTracking.user_id == user_id)
+            )
+            activity = activity_result.scalar_one_or_none()
+            if activity:
+                context["current_streak"] = activity.current_streak or 0
+
+            # ── Task counts ───────────────────────────────────────────
+            completed_result = await session.execute(
+                select(func.count(ActionItem.id)).where(
+                    and_(
+                        ActionItem.user_id == user_id,
+                        ActionItem.status == "completed",
+                        ActionItem.updated_at >= week_ago,
+                    )
+                )
+            )
+            context["tasks_completed_this_week"] = completed_result.scalar() or 0
+
+            overdue_result = await session.execute(
+                select(func.count(ActionItem.id)).where(
+                    and_(
+                        ActionItem.user_id == user_id,
+                        ActionItem.status.in_(["pending", "in_progress"]),
+                        ActionItem.due_date < now,
+                    )
+                )
+            )
+            context["overdue_tasks"] = overdue_result.scalar() or 0
+
+            pending_result = await session.execute(
+                select(func.count(ActionItem.id)).where(
+                    and_(
+                        ActionItem.user_id == user_id,
+                        ActionItem.status.in_(["pending", "in_progress"]),
+                        or_(ActionItem.due_date >= now, ActionItem.due_date.is_(None)),
+                    )
+                )
+            )
+            context["pending_tasks"] = pending_result.scalar() or 0
+
+            # ── Onboarding goal (best-effort from Mongo) ──────────────
+            try:
+                onboarding = await asyncio.to_thread(
+                    get_course_content_mongo_client().get_user_onboarding_data,
+                    user_id,
+                )
+                if onboarding:
+                    context["primary_goal"] = onboarding.get("target_role", "") or ""
+            except Exception:  # nosec B110 — best-effort Mongo read; failure is non-fatal
+                pass
+
+            # ── Course enrollment & progress (best-effort from Mongo) ──
+            try:
+                enrollment_data = await asyncio.to_thread(
+                    get_course_content_mongo_client().get_enrollment_overview,
+                    user_id,
+                )
+                enrollments = (enrollment_data or {}).get("enrollments", [])
+                if enrollments:
+                    # Primary course = first active enrollment returned
+                    primary = enrollments[0]
+                    course_info = primary.get("course") or {}
+                    context["enrolled_course"] = course_info.get("title") or ""
+                    context["course_progress_pct"] = int(primary.get("overallProgress") or 0)
+
+                    # Aggregate across all enrollments
+                    context["total_completed_lessons"] = sum(
+                        int(e.get("totalCompletedLessons") or 0) for e in enrollments
+                    )
+                    context["total_watched_hours"] = round(
+                        sum(float(e.get("totalWatchedHours") or 0) for e in enrollments), 1
+                    )
+
+                    # Most recently active enrollment date
+                    most_recent = max(
+                        (e for e in enrollments if e.get("updatedAt")),
+                        key=lambda e: e["updatedAt"],
+                        default=None,
+                    )
+                    if most_recent and most_recent.get("updatedAt"):
+                        updated = most_recent["updatedAt"]
+                        if hasattr(updated, "strftime"):
+                            context["last_active_in_course"] = updated.strftime("%b %d")
+                        else:
+                            # ISO string — trim to date portion
+                            context["last_active_in_course"] = str(updated)[:10]
+            except Exception:  # nosec B110 — best-effort Mongo read; failure is non-fatal
+                pass
+
+        except Exception as exc:
+            logger.warning("student_context_build_failed", user_id=user_id, error=str(exc))
+
+        return context
 
     async def send_motivational_nudges(self) -> None:
-        """Send motivational nudges on Mon/Wed/Fri/Sun per spec §2.4.3."""
+        """Send personalised motivational nudges on Mon/Wed/Fri/Sun per spec §2.4.3.
+
+        Unlike the previous implementation that sent identical copy to every user,
+        this version:
+        1. Resolves the *correct* advisor for each user's learning track.
+        2. Fetches that user's real metrics (streak, tasks done, overdue count).
+        3. Uses an LLM to generate a unique message that references those numbers.
+
+        The email body is generated separately from the short in-app notification so
+        that each student receives content genuinely written for them.
+        """
         try:
             if not db_manager.engine:
                 return
@@ -655,37 +804,53 @@ class SchedulerService:
                 result = await session.execute(select(UserActivityTracking.user_id))
                 user_ids = result.scalars().all()
 
-                # Pick message based on day of week
-                dow = datetime.now(UTC).weekday()  # 0=Mon, 6=Sun
-                day_map = {0: 0, 2: 1, 4: 2, 6: 3}  # Mon=0, Wed=1, Fri=2, Sun=3
-                msg_idx = day_map.get(dow, 0)
-                msg = self.MOTIVATIONAL_MESSAGES[msg_idx]
-
+                sent = 0
                 for user_id in user_ids:
                     try:
-                        advisor_name = await self._resolve_advisor_first_name(user_id)
+                        advisor_name, track = await self._resolve_advisor_for_user(user_id)
+                        student_ctx = await self._build_student_context(session, user_id, advisor_name, track)
+
+                        # Generate personalised title + email body via LLM
+                        email_title, email_body = await notification_engine.generate_personalized_motivational_content(
+                            persona_name=advisor_name,
+                            student_context=student_ctx,
+                        )
+
+                        # Short in-app notification — a single sentence drawn from the context
+                        streak = student_ctx["current_streak"]
+                        overdue = student_ctx["overdue_tasks"]
+                        if streak > 0:
+                            short_content = f"You're on a {streak}-day streak — keep it going! 🔥"
+                        elif overdue:
+                            short_content = f"You have {overdue} overdue task{'s' if overdue != 1 else ''}. Let's clear the backlog together."
+                        else:
+                            short_content = "Check in with your advisor to keep your career journey on track."
+
                         await notification_engine.create_notification(
                             session=session,
                             user_id=user_id,
-                            title=msg["title"],
-                            content=msg["content"],
+                            title=email_title,
+                            content=short_content,
                             category="motivation",
                             priority="low",
-                            persona=advisor_name,
+                            persona=None,  # body already personalised — skip LLM rewrite
                             action_buttons=[
                                 {
                                     "action": "chat",
-                                    "title": "Chat with Advisor",
+                                    "title": f"Chat with {advisor_name}",
                                     "url": "/dashboard/ai-career-advisor",
                                 },
                             ],
                             check_frequency=True,
+                            student_context=student_ctx,
+                            email_body_override=email_body,  # rich personalised body for email
                         )
+                        sent += 1
                     except Exception as e:
                         logger.warning("motivational_nudge_failed", user_id=user_id, error=str(e))
 
                 await session.commit()
-                logger.info("motivational_nudges_sent", user_count=len(user_ids))
+                logger.info("motivational_nudges_sent", user_count=len(user_ids), emails_attempted=sent)
         except Exception as e:
             logger.error("send_motivational_nudges error", error=str(e), exc_info=True)
 

@@ -234,6 +234,17 @@ def _get_user_token(user: User, authorization: str | None = None) -> str | None:
     return token if isinstance(token, str) and token.strip() else None
 
 
+def _normalise_track(track: str | None) -> str | None:
+    """Normalise a track to kebab-lowercase so it matches stored values.
+
+    Stored tracks are normalised at discovery time (e.g. 'Data Analytics' → 'data-analytics').
+    We apply the same normalisation here before filtering so the comparison always succeeds.
+    """
+    if not track or not track.strip():
+        return None
+    return track.lower().strip().replace(" ", "-")
+
+
 async def _resolve_current_learning_track(
     session: AsyncSession,
     user: User,
@@ -243,7 +254,7 @@ async def _resolve_current_learning_track(
     if token:
         track = await get_cached_learning_track(user.identity, token)
         if track:
-            return track
+            return _normalise_track(track)
 
     result = await session.execute(select(UserPreferences).where(UserPreferences.user_id == user.identity))
     prefs = result.scalar_one_or_none()
@@ -253,13 +264,13 @@ async def _resolve_current_learning_track(
     preferences = prefs.preferences
     stored = preferences.get("learning_track") or preferences.get("track")
     if isinstance(stored, str) and stored.strip():
-        return stored.strip()
+        return _normalise_track(stored)
 
     tracks = preferences.get("tracks")
     if isinstance(tracks, list):
         for track in tracks:
             if isinstance(track, str) and track.strip():
-                return track.strip()
+                return _normalise_track(track)
     return None
 
 

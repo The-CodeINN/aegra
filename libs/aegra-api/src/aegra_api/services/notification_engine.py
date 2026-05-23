@@ -548,6 +548,134 @@ class NotificationEngine:
         }
 
     # ------------------------------------------------------------------
+    # Personalised email content generation [§2.7]
+    # ------------------------------------------------------------------
+    async def generate_personalized_motivational_content(
+        self,
+        persona_name: str,
+        student_context: dict[str, Any],
+    ) -> tuple[str, str]:
+        """Generate a personalised motivational email (title, body) using student data.
+
+        Unlike ``generate_persona_message`` — which rewrites a fixed base string — this
+        method produces an *original* message whose content is entirely driven by the
+        individual student's actual metrics: streak, tasks completed/overdue, track, and
+        career goal.  Each student receives a unique email; no two are the same.
+
+        Returns:
+            (title, body) — both plain-text strings ready for the email template.
+        """
+        persona = ADVISOR_PERSONAS.get(persona_name, ADVISOR_PERSONAS[DEFAULT_PERSONA])
+        first_name = student_context.get("first_name") or "there"
+        track = student_context.get("learning_track") or "your track"
+        streak = student_context.get("current_streak", 0)
+        tasks_done = student_context.get("tasks_completed_this_week", 0)
+        overdue = student_context.get("overdue_tasks", 0)
+        pending = student_context.get("pending_tasks", 0)
+        goal = student_context.get("primary_goal") or ""
+        # Course progress fields from MongoDB enrollment data
+        enrolled_course = student_context.get("enrolled_course") or ""
+        course_progress_pct = student_context.get("course_progress_pct", 0)
+        total_completed_lessons = student_context.get("total_completed_lessons", 0)
+        total_watched_hours = student_context.get("total_watched_hours", 0.0)
+        last_active_in_course = student_context.get("last_active_in_course") or ""
+
+        day_name = datetime.now(UTC).strftime("%A")
+
+        try:
+            from langchain_aws import ChatBedrockConverse
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            llm = ChatBedrockConverse(
+                model="eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+                region_name=settings.aws.AWS_REGION_NAME,
+                temperature=0.7,
+                max_tokens=400,
+            )
+
+            data_summary = (
+                f"Student first name: {first_name}\n"
+                f"Learning track: {track}\n"
+                f"Streak: {streak} day{'s' if streak != 1 else ''}\n"
+                f"Tasks completed this week: {tasks_done}\n"
+                f"Overdue tasks: {overdue}\n"
+                f"Pending tasks: {pending}\n"
+            )
+            if goal:
+                data_summary += f"Career goal / target role: {goal}\n"
+            if enrolled_course:
+                data_summary += f"Enrolled course: {enrolled_course}\n"
+            if course_progress_pct:
+                data_summary += f"Course progress: {course_progress_pct}% complete\n"
+            if total_completed_lessons:
+                data_summary += f"Total lessons completed: {total_completed_lessons}\n"
+            if total_watched_hours:
+                data_summary += f"Total hours watched: {total_watched_hours}h\n"
+            if last_active_in_course:
+                data_summary += f"Last active in course: {last_active_in_course}\n"
+
+            resp = await llm.ainvoke(
+                [
+                    SystemMessage(
+                        content=(
+                            f"You are {persona_name}, a career advisor at DeDataHub.\n"
+                            f"Personality: {persona['style']}.\n"
+                            f"Tone: {persona['tone']}.\n"
+                            f"Use these emojis sparingly (1–2 max): {persona['emoji']}.\n\n"
+                            "Write a short, PERSONALISED career check-in message for the student below. "
+                            "Use THEIR specific data — streak, tasks completed, overdue count, course name, "
+                            "progress percentage, lessons completed, and hours watched — to make the message "
+                            "feel genuinely written for them, not a generic template. "
+                            "If they have a streak, celebrate it. "
+                            "If they've made real course progress, mention the actual percentage or lessons. "
+                            "If they have overdue tasks, gently acknowledge it and suggest one concrete small step. "
+                            "If they have a career goal, tie their current progress back to that goal. "
+                            "If they're doing well, challenge them toward the next milestone. "
+                            "Keep it to 3–5 sentences. "
+                            "Do NOT include a greeting (e.g. 'Hi Name') or a sign-off — those are added separately. "
+                            "Reply with the message body ONLY."
+                        )
+                    ),
+                    HumanMessage(content=data_summary),
+                ]
+            )
+            body = resp.content.strip()
+        except Exception as e:
+            logger.warning("personalized_email_generation_failed", persona=persona_name, error=str(e))
+            # Graceful fallback — still references real numbers, no generic filler
+            if streak > 0:
+                body = (
+                    f"You're on a {streak}-day streak on your {track} journey — "
+                    "that kind of consistency compounds into real career results. "
+                )
+            else:
+                body = f"Your {track} journey is waiting for you — today is a great day to pick it back up. "
+            if enrolled_course and course_progress_pct:
+                body += (
+                    f"You're {course_progress_pct}% through {enrolled_course} "
+                    f"with {total_completed_lessons} lesson{'s' if total_completed_lessons != 1 else ''} done"
+                )
+                if total_watched_hours:
+                    body += f" and {total_watched_hours}h watched"
+                body += " — the finish line is closer than it feels. "
+            if overdue:
+                body += (
+                    f"You have {overdue} overdue task{'s' if overdue != 1 else ''} — "
+                    "tackling even one today would be a win. "
+                )
+            elif tasks_done:
+                body += (
+                    f"You completed {tasks_done} task{'s' if tasks_done != 1 else ''} this week — "
+                    "keep the momentum going."
+                )
+            if goal:
+                body += f" Every step you take brings you closer to becoming a {goal}."
+            body += f"\n{persona['sign_off']}"
+
+        title = f"{day_name} update from {persona_name}"
+        return title, body
+
+    # ------------------------------------------------------------------
     # Create notification (core helper) [§3.1]
     # ------------------------------------------------------------------
     async def create_notification(
@@ -564,7 +692,16 @@ class NotificationEngine:
         expires_at: datetime | None = None,
         check_frequency: bool = True,
         student_context: dict[str, Any] | None = None,
+        email_body_override: str | None = None,
     ) -> Notification | None:
+        """``email_body_override`` lets callers supply a pre-generated, longer email body.
+
+        When set it is used exclusively for the email channel; the in-app / push
+        notification still shows ``content`` (potentially rewritten by
+        ``generate_persona_message``).  This avoids double LLM calls when the
+        personalised email body was already generated before ``create_notification``
+        was called.
+        """
         """Create a notification with frequency checks, persona rewriting, and multi-channel delivery.
 
         Per spec §3.1, delivers via:
@@ -663,6 +800,7 @@ class NotificationEngine:
                 action_buttons=action_buttons,
                 persona=persona or DEFAULT_PERSONA,
                 student_context=student_context,
+                email_body_override=email_body_override,
             )
         except Exception as email_err:
             logger.debug("email_attempt_failed", error=str(email_err))
@@ -679,8 +817,14 @@ class NotificationEngine:
         action_buttons: list[dict] | None = None,
         persona: str = "Alexandra",
         student_context: dict[str, Any] | None = None,
+        email_body_override: str | None = None,
     ) -> None:
-        """Send email version of notification if user has email enabled."""
+        """Send email version of notification if user has email enabled.
+
+        ``email_body_override`` — when provided, replaces ``content`` in the email
+        template.  Use this to send a longer, richer message in the email without
+        changing the short in-app notification text.
+        """
         from aegra_api.services.email_service import build_notification_email, send_email
 
         # Check if email is enabled for this user
@@ -725,10 +869,13 @@ class NotificationEngine:
             return
 
         subject = f"[DeDataHub] {title}"
+        # Use pre-generated personalised body when available; otherwise use
+        # the standard in-app content (which may have been persona-rewritten).
+        email_content = email_body_override if email_body_override else content
         html_body, text_body = build_notification_email(
             student_name=student_name,
             title=title,
-            content=content,
+            content=email_content,
             action_buttons=action_buttons,
             advisor_persona=persona,
             category=category,

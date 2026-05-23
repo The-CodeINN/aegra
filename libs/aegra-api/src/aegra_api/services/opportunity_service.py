@@ -23,6 +23,17 @@ class OpportunityService:
     # Listing / querying
     # ------------------------------------------------------------------
     @staticmethod
+    def _normalise_track(track: str | None) -> str | None:
+        """Normalise a track string to kebab-lowercase (e.g. 'Data Analytics' → 'data-analytics').
+
+        Keeps the stored format consistent with what is written during discovery so
+        that the filter comparison never fails due to casing or space/hyphen differences.
+        """
+        if not track or not track.strip():
+            return None
+        return track.lower().strip().replace(" ", "-")
+
+    @staticmethod
     async def list_opportunities(
         session: AsyncSession,
         user_id: str,
@@ -37,8 +48,11 @@ class OpportunityService:
 
         if opportunity_type:
             base_filter.append(DiscoveredOpportunity.opportunity_type == opportunity_type)
-        if matched_track:
-            base_filter.append(DiscoveredOpportunity.matched_track == matched_track)
+        # Normalise the track to the same kebab-lowercase format used when storing
+        # (avoids empty results when LMS returns "Data Analytics" but DB has "data-analytics")
+        normalised_track = OpportunityService._normalise_track(matched_track)
+        if normalised_track:
+            base_filter.append(DiscoveredOpportunity.matched_track == normalised_track)
 
         if status == "new":
             base_filter.append(DiscoveredOpportunity.status.in_(["new", "notified"]))
@@ -180,8 +194,9 @@ class OpportunityService:
     async def get_stats(session: AsyncSession, user_id: str, matched_track: str | None = None) -> dict[str, Any]:
         """Return aggregated opportunity stats for the user."""
         base = [DiscoveredOpportunity.user_id == user_id]
-        if matched_track:
-            base.append(DiscoveredOpportunity.matched_track == matched_track)
+        normalised_track = OpportunityService._normalise_track(matched_track)
+        if normalised_track:
+            base.append(DiscoveredOpportunity.matched_track == normalised_track)
 
         async def _count(*extra_filters):
             q = select(func.count(DiscoveredOpportunity.id)).where(*base, *extra_filters)
