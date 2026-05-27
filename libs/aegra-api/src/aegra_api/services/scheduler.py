@@ -65,17 +65,17 @@ class SchedulerService:
     async def _resolve_advisor_for_user(user_id: str) -> tuple[str, str]:
         """Return (advisor_first_name, normalised_track) for a user.
 
-        Track is resolved from MongoDB and normalised to kebab-lowercase so that
-        values like "AI Engineering", "ai engineering", or "ai-engineering" all map
-        to the correct advisor entry in ADVISORS_BY_TRACK.
+        Resolution order:
+        1. subscriptions.track via get_learning_track (covers data-analytics users)
+        2. s_track section in aimentoronboardings via get_user_onboarding_data
+           (covers ai-mentor plan users whose subscription.track is null but whose
+           onboarding clearly records which path they chose, e.g. aiEngineering)
 
         Falls back to ("Alexandra", "") when the track cannot be resolved.
         """
+        mongo_client = get_course_content_mongo_client()
         try:
-            raw_track = await asyncio.to_thread(
-                get_course_content_mongo_client().get_learning_track,
-                user_id,
-            )
+            raw_track = await asyncio.to_thread(mongo_client.get_learning_track, user_id)
             if raw_track:
                 normalised = raw_track.lower().strip().replace(" ", "-")
                 advisor = get_advisor_by_track(normalised)
@@ -83,6 +83,24 @@ class SchedulerService:
                     return advisor["name"].split()[0], normalised
         except Exception as exc:
             logger.warning("advisor_resolve_failed", user_id=user_id, error=str(exc))
+
+        # Fallback: read active_track from onboarding s_track section
+        try:
+            onboarding = await asyncio.to_thread(mongo_client.get_user_onboarding_data, user_id)
+            if onboarding and onboarding.get("active_track"):
+                normalised = onboarding["active_track"]
+                advisor = get_advisor_by_track(normalised)
+                if advisor:
+                    logger.info(
+                        "advisor_resolved_from_s_track",
+                        user_id=user_id,
+                        track=normalised,
+                        advisor=advisor["name"],
+                    )
+                    return advisor["name"].split()[0], normalised
+        except Exception as exc:
+            logger.warning("advisor_s_track_resolve_failed", user_id=user_id, error=str(exc))
+
         return get_default_advisor()["name"].split()[0], ""
 
     @staticmethod
