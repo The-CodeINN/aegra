@@ -18,6 +18,7 @@ Features:
 """
 
 import asyncio
+import re
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -686,7 +687,28 @@ class SchedulerService:
             if prefs and prefs.preferences:
                 pref_json = prefs.preferences
                 raw_name = pref_json.get("user_name", "")
+                # Detect the "User <hex_id>" placeholder stored when the JWT
+                # profile has no real name — treat as missing so we fall through
+                # to the resolve_student_contact() lookup below.
+                if raw_name and re.match(r"^User\s+[0-9a-f]{10,}$", raw_name, re.IGNORECASE):
+                    raw_name = ""
                 context["first_name"] = raw_name.split()[0] if raw_name else ""
+                stored_email = pref_json.get("user_email")
+                if stored_email:
+                    context["email"] = stored_email
+
+            # ── Real name fallback via admin API ──────────────────────
+            if not context["first_name"]:
+                try:
+                    from aegra_api.services.email_service import resolve_student_contact
+
+                    contact = await resolve_student_contact(user_id)
+                    if contact.get("first_name"):
+                        context["first_name"] = contact["first_name"]
+                    if not context.get("email") and contact.get("email"):
+                        context["email"] = contact["email"]
+                except Exception:  # nosec B110
+                    pass
 
             # ── Streak & activity ─────────────────────────────────────
             activity_result = await session.execute(

@@ -341,12 +341,18 @@ class OpportunityDiscoveryEngine:
         for track in tracks:
             _add(_primary_keyword(track))
 
-        def _is_aligned(term: str) -> bool:
-            return any(_score_text(term, track) > Decimal("0.50") for track in tracks)
-
-        if profile and isinstance(profile.target_role, str) and _is_aligned(profile.target_role):
+        # Always include the user's explicitly stated target role and current
+        # role title as search terms — these are their own stated goals and
+        # should never be gated behind a keyword-alignment score.  The previous
+        # _is_aligned() guard used score > 0.50, but _score_text() starts at
+        # exactly 0.50, so a target_role like "Data Product Manager" on the
+        # ai-engineering track always scored exactly 0.50 and was silently
+        # dropped, meaning the user never saw jobs matching what they actually
+        # want.  Result-level scoring (matched_target_role tag) still filters
+        # out irrelevant hits at display time.
+        if profile and isinstance(profile.target_role, str) and profile.target_role.strip():
             _add(profile.target_role)
-        if profile and isinstance(profile.role_title, str) and _is_aligned(profile.role_title):
+        if profile and isinstance(profile.role_title, str) and profile.role_title.strip():
             _add(profile.role_title)
 
         if queries_per_category > 1:
@@ -363,22 +369,34 @@ class OpportunityDiscoveryEngine:
         locations: list[str],
         profile: StudentProfile | None = None,
     ) -> dict[str, Any] | None:
-        """Score a raw job against the user's active track and profile."""
+        """Accept a raw job returned by the search API and compute a display score.
+
+        We trust the job board's full-text search to return relevant results for
+        the queries we built (track keywords + user's target_role).  The old
+        keyword-scoring hard-filter (score <= 0.50 → drop) was silently dropping
+        all results whose title/description didn't contain our small list of track
+        keywords — for example a "Data Product Manager" job fetched because the
+        user's target_role is "Data Product Manager" would score exactly 0.50
+        (no ai-engineering keywords in the text) and get discarded.
+
+        Now we only filter on location; scoring is kept purely for display/sorting.
+        A base score of 0.60 is assigned to every location-matched result so the
+        frontend always has a non-zero value to sort on, with bonus points for
+        explicit keyword hits.
+        """
         readable_locations = {_readable_location(loc).lower() for loc in locations} if locations else {"remote"}
         if not self._job_location_allowed(raw_job.location, readable_locations):
             return None
 
         content = f"{raw_job.title} {raw_job.description}"
-        best_score = Decimal("0")
+        # Compute informational score (not used as a filter gate).
+        best_score = Decimal("0.60")  # baseline for any location-matched result
         best_track = tracks[0] if tracks else ""
         for track in tracks:
             score = _score_text(content, track)
             if score > best_score:
                 best_score = score
                 best_track = track
-
-        if best_score <= Decimal("0.50"):
-            return None
 
         reason_tags = ["matched_track", "matched_location"]
         profile_text = content.lower()
@@ -413,12 +431,16 @@ class OpportunityDiscoveryEngine:
         location: str,
         profile: StudentProfile | None = None,
     ) -> dict[str, Any] | None:
-        """Score a raw event against a single active track and profile."""
+        """Accept a raw event returned by the search API and compute a display score.
+
+        Same philosophy as _match_raw_job: trust the event source's full-text
+        search.  The old hard-filter (score <= 0.50 → drop) was discarding events
+        that didn't contain our narrow list of track keywords even though the API
+        found them relevant.  Score is now informational only; base = 0.60.
+        """
         score = _score_text(f"{raw_event.title} {raw_event.description}", track)
-        if raw_event.source == "luma" and score <= Decimal("0.50"):
-            score = Decimal("0.58")
-        elif score <= Decimal("0.50"):
-            return None
+        if score <= Decimal("0.60"):
+            score = Decimal("0.60")  # baseline — not a filter gate
 
         readable_locations = {_readable_location(location).lower()}
         if (
@@ -900,6 +922,18 @@ class OpportunityDiscoveryEngine:
                         profile.work_countries = list(mongo_profile["work_countries"])
                     if not profile.target_role and mongo_profile.get("target_role"):
                         profile.target_role = mongo_profile["target_role"]
+                    # Use the s_track-derived track as a final fallback when all
+                    # other resolution paths (LMS API, subscription, prefs) return
+                    # nothing.  This covers users on the ai-mentor plan whose
+                    # subscription.track is null but whose onboarding s_track section
+                    # clearly indicates which path they chose.
+                    if not effective_track and mongo_profile.get("active_track"):
+                        effective_track = mongo_profile["active_track"]
+                        logger.info(
+                            "discovery_track_from_s_track",
+                            user_id=user_id,
+                            track=effective_track,
+                        )
                     logger.info("discovery_profile_enriched_from_mongo", user_id=user_id)
             except Exception as exc:
                 logger.warning("discovery_mongo_profile_lookup_failed", user_id=user_id, error=str(exc))

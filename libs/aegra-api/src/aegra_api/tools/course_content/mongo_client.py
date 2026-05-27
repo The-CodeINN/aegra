@@ -518,42 +518,73 @@ class CourseContentMongoClient:
             "updatedAt": doc.get("updatedAt"),
         }
 
+    # Map from ``s_track`` section keys to normalised track slugs.
+    _S_TRACK_TO_SLUG: dict[str, str] = {
+        "aiEngineering": "ai-engineering",
+        "dataScience": "data-science",
+        "dataEngineering": "data-engineering",
+        "analytics": "data-analytics",
+    }
+
     def get_user_onboarding_data(self, user_id: str) -> dict[str, Any] | None:
-        """Return onboarding location and goal data directly from the LMS database.
+        """Return onboarding location, goal and track data from the LMS database.
 
-        Reads the ``aimentoronboardings`` collection which backs the
-        ``/api/v1/ai-mentor/onboarding/me`` LMS endpoint. Used by background
-        scheduler jobs that have no user JWT token.
+        Reads the ``aimentoronboardings`` collection. The document stores
+        onboarding steps as **top-level** fields (``s2``, ``s4``, ``s_track``),
+        NOT nested under an ``onboarding`` key.
 
-        Returns a dict with ``resident_country``, ``work_countries``, and
-        ``target_role``, or ``None`` if no completed onboarding data is found.
+        Returns a dict with:
+          ``resident_country``, ``work_countries``, ``target_role``,
+          ``active_track`` (kebab slug derived from the ``s_track`` section
+          the user actually filled in during onboarding), or ``None`` if no
+          useful data is found.
         """
         user_key = self._to_object_id_or_str(user_id)
+        # Fields are at the document root — NOT nested under "onboarding"
         doc = self.db["aimentoronboardings"].find_one(
             {"user": user_key},
-            {"onboarding.s2": 1, "onboarding.s4": 1},
+            {"s2": 1, "s4": 1, "s_track": 1},
         )
         if not isinstance(doc, dict):
             return None
-        onboarding = self._safe_dict(doc.get("onboarding"))
-        s2 = self._safe_dict(onboarding.get("s2"))
-        s4 = self._safe_dict(onboarding.get("s4"))
+
+        s2 = self._safe_dict(doc.get("s2"))
+        s4 = self._safe_dict(doc.get("s4"))
+        s_track = self._safe_dict(doc.get("s_track"))
+
         resident_country: str | None = None
         work_countries: list[str] = []
         target_role: str | None = None
-        if s2.get("completed"):
+        active_track: str | None = None
+
+        # s2 — location and current role (no "completed" guard: read whatever is there)
+        if s2:
             resident_country = self._pick_text(s2, "residentCountry")
             work_country = s2.get("workCountry")
             if isinstance(work_country, list):
                 work_countries = [c for c in work_country if isinstance(c, str) and c.strip()]
-        if s4.get("completed"):
+
+        # s4 — career goal / target role
+        if s4:
             target_role = self._pick_text(s4, "targetRole")
-        if not resident_country and not work_countries and not target_role:
+
+        # s_track — which learning path the user configured during onboarding.
+        # The first section with at least one non-empty list field is the active track.
+        if s_track:
+            for section_key, track_slug in self._S_TRACK_TO_SLUG.items():
+                section = self._safe_dict(s_track.get(section_key))
+                if any(isinstance(v, list) and v for k, v in section.items() if k != "completed"):
+                    active_track = track_slug
+                    break
+
+        if not resident_country and not work_countries and not target_role and not active_track:
             return None
+
         return {
             "resident_country": resident_country,
             "work_countries": work_countries,
             "target_role": target_role,
+            "active_track": active_track,  # kebab slug from s_track, e.g. "ai-engineering"
         }
 
     def get_learning_track(self, user_id: str) -> str | None:
