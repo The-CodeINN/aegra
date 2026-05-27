@@ -99,6 +99,27 @@ TRACK_KEYWORDS: dict[str, list[str]] = {
 # Small utilities
 # ---------------------------------------------------------------------------
 
+# Country aliases: maps common short forms / subdivisions to the canonical pycountry name.
+# Used by _job_location_allowed so that job locations like "London, England, UK" or
+# "Lagos, NG" are accepted for users whose readable location is "United Kingdom" / "Nigeria".
+_COUNTRY_ALIASES: dict[str, set[str]] = {
+    "united kingdom": {"uk", "england", "scotland", "wales", "northern ireland", "great britain", "gb"},
+    "united states": {"usa", "us", "united states of america"},
+    "nigeria": {"ng", "ngr"},
+    "ghana": {"gh", "gha"},
+    "south africa": {"rsa", "za", "south africa"},
+    "united arab emirates": {"uae", "dubai", "abu dhabi"},
+    "kenya": {"ke", "nbi"},
+    "singapore": {"sg", "sgp"},
+    "australia": {"au", "aus"},
+    "canada": {"ca", "can"},
+    "germany": {"de", "deu"},
+    "france": {"fr", "fra"},
+    "netherlands": {"nl", "nld"},
+    "ireland": {"ie", "irl"},
+    "new zealand": {"nz", "nzl"},
+}
+
 # Indeed expects specific country strings; map ISO alpha-2 → jobspy/Indeed string
 _INDEED_ALPHA2_MAP: dict[str, str] = {
     "GB": "UK",
@@ -746,21 +767,38 @@ class OpportunityDiscoveryEngine:
     def _job_location_allowed(self, job_location: str, readable_locations: set[str]) -> bool:
         """Return True if the job location matches one of the user's allowed locations or is remote.
 
-        Short ISO-2 codes (e.g. "ng", "gb") use word-boundary matching to prevent
-        false positives where e.g. Nigeria's code "ng" appears inside "England" or
-        "United Kingdom" as a bare substring and incorrectly lets UK events through.
+        Handles:
+        - Remote / hybrid jobs (always allowed)
+        - Direct substring match ("United Kingdom" in "London, United Kingdom")
+        - Comma-part matching: each segment of "London, England, UK" is checked
+          individually so short aliases like "UK" or ISO codes like "GB" are caught
+        - _COUNTRY_ALIASES: "UK", "England", "GB" etc. all resolve to "United Kingdom"
+        - ISO alpha-2 word-boundary check for short codes to prevent false positives
+          (e.g. "NG" in "England" must not match Nigeria)
         """
         loc_lower = job_location.lower().strip()
         if not loc_lower or "remote" in loc_lower or "hybrid" in loc_lower:
             return True
+
+        # Split compound location (e.g. "London, England, UK") into parts for granular matching
+        loc_parts = {p.strip() for p in loc_lower.split(",") if p.strip()}
+
         for allowed in readable_locations:
-            if len(allowed) <= 2:
-                # Word-boundary check: "ng" must not be buried inside another word
-                if re.search(r"(?<![a-z])" + re.escape(allowed) + r"(?![a-z])", loc_lower):
-                    return True
-            else:
-                if allowed in loc_lower or loc_lower in allowed:
-                    return True
+            # Build the full set of accepted tokens for this allowed location
+            accepted = {allowed} | _COUNTRY_ALIASES.get(allowed, set())
+
+            for token in accepted:
+                if len(token) <= 2:
+                    # Word-boundary regex to prevent "ng" matching inside "England"
+                    pattern = r"(?<![a-z])" + re.escape(token) + r"(?![a-z])"
+                    if re.search(pattern, loc_lower):
+                        return True
+                else:
+                    # Full-string or part-level substring match
+                    if token in loc_lower or loc_lower in token:
+                        return True
+                    if any(token in part or part in token for part in loc_parts):
+                        return True
         return False
 
     async def _discover_jobs(
@@ -821,8 +859,10 @@ class OpportunityDiscoveryEngine:
                 )
                 continue
 
-            # Match against all tracks, pick the best-scoring one
-            best_score = Decimal("0")
+            # Compute informational score (not a filter gate — see _match_raw_job).
+            # Trusting the job board's search relevance; base score 0.60 for all
+            # location-matched results so the frontend has a value to sort on.
+            best_score = Decimal("0.60")
             best_track = tracks[0] if tracks else ""
             content = f"{raw.title} {raw.description}"
             for track in tracks:
@@ -831,13 +871,12 @@ class OpportunityDiscoveryEngine:
                     best_score = score
                     best_track = track
 
-            # Require at least one keyword match (base score 0.50 means no match)
-            if best_score <= Decimal("0.50"):
-                continue
-
+            # Cap per source to avoid flooding the board with results from one provider,
+            # but allow enough variety (raised from 3 → 10 so LinkedIn/Indeed contribute
+            # meaningfully alongside SmartRecruiters and Workable).
             source_key = raw.source or "unknown"
             source_count = source_counts.get(source_key, 0)
-            if source_count >= 3:
+            if source_count >= 10:
                 continue
 
             seen_urls.add(raw.url)
