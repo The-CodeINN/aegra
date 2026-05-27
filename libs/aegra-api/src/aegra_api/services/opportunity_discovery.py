@@ -74,9 +74,13 @@ TRACK_KEYWORDS: dict[str, list[str]] = {
     "ai-engineering": [
         "AI engineer",
         "artificial intelligence",
+        "machine learning",
+        "ML engineer",
         "LLM",
         "deep learning",
         "ML Ops",
+        "generative AI",
+        "NLP",
     ],
     "business-intelligence": [
         "business intelligence",
@@ -238,6 +242,27 @@ def _score_text(text: str, track: str) -> Decimal:
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
+
+
+def _query_matches_title(source_query: str, job_title: str) -> bool:
+    """Return True when the search query that fetched this job substantially
+    matches the job title, so that target-role searches ("Data Product Manager")
+    survive the relevance gate even when the title contains none of our narrow
+    track keywords.
+
+    Rule: ≥ 60 % of the meaningful words (> 3 chars) from the query appear in
+    the job title.  This keeps "Product Manager — AI Work Apps" for a
+    "Data Product Manager" search while filtering completely unrelated results
+    like "National Account Manager" returned for an "AI engineer" search.
+    """
+    if not source_query or not job_title:
+        return False
+    title_lower = job_title.lower()
+    query_words = [w for w in source_query.lower().split() if len(w) > 3]
+    if not query_words:
+        return False
+    matches = sum(1 for w in query_words if w in title_lower)
+    return matches / len(query_words) >= 0.6
 
 
 class OpportunityDiscoveryEngine:
@@ -859,21 +884,34 @@ class OpportunityDiscoveryEngine:
                 )
                 continue
 
-            # Compute informational score (not a filter gate — see _match_raw_job).
-            # Trusting the job board's search relevance; base score 0.60 for all
-            # location-matched results so the frontend has a value to sort on.
-            best_score = Decimal("0.60")
-            best_track = tracks[0] if tracks else ""
+            # Relevance gate: keep the job if it either
+            # (a) contains track keywords (score > 0.50), OR
+            # (b) the search query that retrieved it substantially matches the job title,
+            #     so that target-role searches ("Data Product Manager") survive even when
+            #     the job title doesn't contain our narrow track keyword list.
             content = f"{raw.title} {raw.description}"
+            best_score = Decimal("0.50")
+            best_track = tracks[0] if tracks else ""
             for track in tracks:
                 score = _score_text(content, track)
                 if score > best_score:
                     best_score = score
                     best_track = track
 
-            # Cap per source to avoid flooding the board with results from one provider,
-            # but allow enough variety (raised from 3 → 10 so LinkedIn/Indeed contribute
-            # meaningfully alongside SmartRecruiters and Workable).
+            query_relevant = _query_matches_title(raw.source_query or "", raw.title)
+            if best_score <= Decimal("0.50") and not query_relevant:
+                logger.debug(
+                    "job_relevance_filtered",
+                    title=raw.title[:60],
+                    query=raw.source_query,
+                )
+                continue
+
+            # Use 0.60 as the display floor so the frontend always has a non-zero score
+            if best_score <= Decimal("0.50"):
+                best_score = Decimal("0.60")
+
+            # Cap per source to avoid flooding the board from one provider (10 per source)
             source_key = raw.source or "unknown"
             source_count = source_counts.get(source_key, 0)
             if source_count >= 10:
@@ -1061,14 +1099,18 @@ class OpportunityDiscoveryEngine:
             session.add(opp)
             discovered.append(opp)
 
+        # Count by type BEFORE commit so we don't trigger lazy-loads on expired objects
+        event_count = sum(1 for p in all_parsed if p.get("opportunity_type") == "event")
+        job_count = sum(1 for p in all_parsed if p.get("opportunity_type") == "job")
+
         await session.commit()
 
         logger.info(
             "opportunities_discovered",
             user_id=user_id,
             total=len(discovered),
-            events=len([o for o in discovered if o.opportunity_type == "event"]),
-            jobs=len([o for o in discovered if o.opportunity_type == "job"]),
+            events=event_count,
+            jobs=job_count,
         )
         return discovered
 
