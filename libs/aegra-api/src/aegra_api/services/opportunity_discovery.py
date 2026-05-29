@@ -876,6 +876,24 @@ class OpportunityDiscoveryEngine:
             except Exception as exc:
                 logger.warning("job_registry_fetch_failed", location=loc, error=repr(exc))
 
+        # When a target role is set, also run a dedicated remote search for that
+        # role term. Target roles like "Data Product Manager" are predominantly
+        # posted as remote and won't show up in country-specific searches.
+        if role_term:
+            role_search_terms = [t for t in search_terms if t.strip().lower() == role_term]
+            if role_search_terms:
+                remote_ctx = JobDiscoveryContext(
+                    search_terms=role_search_terms,
+                    primary_location="remote",
+                    indeed_country=self._indeed_country(search_locations),
+                    max_search_terms=1,
+                )
+                try:
+                    remote_batch = await self._job_registry.fetch_all(remote_ctx)
+                    all_raw_jobs.extend(remote_batch)
+                except Exception as exc:
+                    logger.warning("job_registry_remote_role_fetch_failed", role=role_term, error=repr(exc))
+
         primary_location = search_locations[0] if search_locations else "remote"
         all_jobs: list[dict[str, Any]] = []
 
@@ -891,7 +909,13 @@ class OpportunityDiscoveryEngine:
             if not raw.url or raw.url in seen_urls:
                 continue
 
-            if not self._job_location_allowed(raw.location, allowed_set):
+            # Determine bucket first so location filtering can be skipped for
+            # role jobs. The user explicitly stated this target role, so we show
+            # those jobs globally — they may be open to relocation or remote work
+            # in markets where that role is common (e.g. US/UK for DPM roles).
+            is_role_job = role_term and (raw.source_query or "").strip().lower() == role_term
+
+            if not is_role_job and not self._job_location_allowed(raw.location, allowed_set):
                 logger.debug(
                     "job_location_filtered",
                     title=raw.title[:60],
@@ -922,9 +946,6 @@ class OpportunityDiscoveryEngine:
 
             if best_score <= Decimal("0.50"):
                 best_score = Decimal("0.60")
-
-            # Route to the correct bucket based on which search term fetched this job.
-            is_role_job = role_term and (raw.source_query or "").strip().lower() == role_term
             if is_role_job:
                 if role_count >= role_cap:
                     continue
