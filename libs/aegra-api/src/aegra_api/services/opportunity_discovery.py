@@ -250,15 +250,15 @@ def _query_matches_title(source_query: str, job_title: str) -> bool:
     survive the relevance gate even when the title contains none of our narrow
     track keywords.
 
-    Rule: ≥ 60 % of the meaningful words (> 3 chars) from the query appear in
-    the job title.  This keeps "Product Manager — AI Work Apps" for a
-    "Data Product Manager" search while filtering completely unrelated results
-    like "National Account Manager" returned for an "AI engineer" search.
+    Rule: ≥ 60 % of the meaningful words (> 1 char) from the query appear in
+    the job title.  Using > 1 (not > 3) ensures short but meaningful acronyms
+    like "AI", "ML", "BI" are included — without them "AI engineer" reduces to
+    only ["engineer"] and falsely matches "Tier 1 IT Engineer".
     """
     if not source_query or not job_title:
         return False
     title_lower = job_title.lower()
-    query_words = [w for w in source_query.lower().split() if len(w) > 3]
+    query_words = [w for w in source_query.lower().split() if len(w) > 1]
     if not query_words:
         return False
     matches = sum(1 for w in query_words if w in title_lower)
@@ -836,14 +836,20 @@ class OpportunityDiscoveryEngine:
     ) -> list[dict[str, Any]]:
         """Discover jobs via the board-based JobSourceRegistry.
 
-        Runs a separate fetch for EACH user location (resident_country and
-        work_countries) so that no profile location is skipped, then
-        post-filters results to strictly keep only jobs matching one of the
-        user's locations (or remote/hybrid).
+        Results are split into two buckets of 5 each:
+        - Track bucket  — jobs found via track keywords (e.g. "AI engineer")
+        - Role bucket   — jobs found via the user's target role (e.g. "Data Product Manager")
+
+        Both search terms are always fetched across every user location.
+        When no target_role is set the full 10-job budget goes to the track bucket.
         """
         search_locations = [_readable_location(loc) for loc in locations] if locations else ["remote"]
-        # Lowercase set used for post-filtering
         allowed_set = {loc.lower() for loc in search_locations}
+
+        # Identify the target-role term so we can route results to the right bucket.
+        role_term: str = ""
+        if profile and isinstance(profile.target_role, str) and profile.target_role.strip():
+            role_term = profile.target_role.strip().lower()
 
         search_terms = self._build_job_search_terms(
             tracks,
@@ -851,15 +857,18 @@ class OpportunityDiscoveryEngine:
             queries_per_category=queries_per_category,
         )
 
-        # Fetch jobs for every user location independently so both
-        # resident_country and work_countries are searched
+        # Always run at least 2 search terms (track + role) when a target role is set,
+        # regardless of the queries_per_category setting.
+        max_terms = max(2, queries_per_category) if role_term else queries_per_category
+
+        # Fetch jobs for every user location so all work_countries are covered.
         all_raw_jobs: list[RawJobOpportunity] = []
         for loc in search_locations:
             context = JobDiscoveryContext(
                 search_terms=search_terms,
                 primary_location=loc,
                 indeed_country=self._indeed_country([loc]),
-                max_search_terms=queries_per_category,
+                max_search_terms=max_terms,
             )
             try:
                 batch = await self._job_registry.fetch_all(context)
@@ -869,12 +878,19 @@ class OpportunityDiscoveryEngine:
 
         primary_location = search_locations[0] if search_locations else "remote"
         all_jobs: list[dict[str, Any]] = []
-        source_counts: dict[str, int] = {}
+
+        # Bucket caps: 5 track jobs + 5 role jobs = 10 per run.
+        # If no target role, allow up to 10 track jobs.
+        per_bucket = 5
+        track_count = 0
+        role_count = 0
+        track_cap = per_bucket if role_term else per_bucket * 2
+        role_cap = per_bucket if role_term else 0
+
         for raw in all_raw_jobs:
             if not raw.url or raw.url in seen_urls:
                 continue
 
-            # Strict location guard — only keep jobs from the user's own locations or remote
             if not self._job_location_allowed(raw.location, allowed_set):
                 logger.debug(
                     "job_location_filtered",
@@ -884,11 +900,8 @@ class OpportunityDiscoveryEngine:
                 )
                 continue
 
-            # Relevance gate: keep the job if it either
-            # (a) contains track keywords (score > 0.50), OR
-            # (b) the search query that retrieved it substantially matches the job title,
-            #     so that target-role searches ("Data Product Manager") survive even when
-            #     the job title doesn't contain our narrow track keyword list.
+            # Relevance gate: keep if track keywords appear OR the search query
+            # substantially matches the job title.
             content = f"{raw.title} {raw.description}"
             best_score = Decimal("0.50")
             best_track = tracks[0] if tracks else ""
@@ -907,18 +920,21 @@ class OpportunityDiscoveryEngine:
                 )
                 continue
 
-            # Use 0.60 as the display floor so the frontend always has a non-zero score
             if best_score <= Decimal("0.50"):
                 best_score = Decimal("0.60")
 
-            # Cap per source to avoid flooding the board from one provider (10 per source)
-            source_key = raw.source or "unknown"
-            source_count = source_counts.get(source_key, 0)
-            if source_count >= 10:
-                continue
+            # Route to the correct bucket based on which search term fetched this job.
+            is_role_job = role_term and (raw.source_query or "").strip().lower() == role_term
+            if is_role_job:
+                if role_count >= role_cap:
+                    continue
+                role_count += 1
+            else:
+                if track_count >= track_cap:
+                    continue
+                track_count += 1
 
             seen_urls.add(raw.url)
-            source_counts[source_key] = source_count + 1
             all_jobs.append(
                 {
                     "opportunity_type": "job",
@@ -940,6 +956,8 @@ class OpportunityDiscoveryEngine:
         logger.info(
             "job_discovery_complete",
             total=len(all_jobs),
+            track_jobs=track_count,
+            role_jobs=role_count,
             tracks=tracks,
             locations=search_locations,
         )
