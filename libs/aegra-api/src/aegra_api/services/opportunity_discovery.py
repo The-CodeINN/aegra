@@ -103,6 +103,131 @@ TRACK_KEYWORDS: dict[str, list[str]] = {
 # Small utilities
 # ---------------------------------------------------------------------------
 
+# US state abbreviations used to detect "City, ST" formatted job locations
+# (e.g. "New York, NY", "San Francisco, CA") from the remote role search.
+_US_STATE_CODES: frozenset[str] = frozenset(
+    {
+        "al",
+        "ak",
+        "az",
+        "ar",
+        "ca",
+        "co",
+        "ct",
+        "de",
+        "fl",
+        "ga",
+        "hi",
+        "id",
+        "il",
+        "in",
+        "ia",
+        "ks",
+        "ky",
+        "la",
+        "me",
+        "md",
+        "ma",
+        "mi",
+        "mn",
+        "ms",
+        "mo",
+        "mt",
+        "ne",
+        "nv",
+        "nh",
+        "nj",
+        "nm",
+        "ny",
+        "nc",
+        "nd",
+        "oh",
+        "ok",
+        "or",
+        "pa",
+        "ri",
+        "sc",
+        "sd",
+        "tn",
+        "tx",
+        "ut",
+        "vt",
+        "va",
+        "wa",
+        "wv",
+        "wi",
+        "wy",
+        "dc",
+    }
+)
+
+
+_US_STATE_NAMES: frozenset[str] = frozenset(
+    {
+        "alabama",
+        "alaska",
+        "arizona",
+        "arkansas",
+        "california",
+        "colorado",
+        "connecticut",
+        "delaware",
+        "florida",
+        "georgia",
+        "hawaii",
+        "idaho",
+        "illinois",
+        "indiana",
+        "iowa",
+        "kansas",
+        "kentucky",
+        "louisiana",
+        "maine",
+        "maryland",
+        "massachusetts",
+        "michigan",
+        "minnesota",
+        "mississippi",
+        "missouri",
+        "montana",
+        "nebraska",
+        "nevada",
+        "new hampshire",
+        "new jersey",
+        "new mexico",
+        "new york",
+        "north carolina",
+        "north dakota",
+        "ohio",
+        "oklahoma",
+        "oregon",
+        "pennsylvania",
+        "rhode island",
+        "south carolina",
+        "south dakota",
+        "tennessee",
+        "texas",
+        "utah",
+        "vermont",
+        "virginia",
+        "washington",
+        "west virginia",
+        "wisconsin",
+        "wyoming",
+    }
+)
+
+
+def _is_us_location(loc: str) -> bool:
+    """Return True when the location string refers to a US city/state."""
+    lower = loc.lower()
+    if "united states" in lower or "usa" in lower:
+        return True
+    # Detect "City, ST" format (e.g. "New York, NY") or "City, StateName"
+    parts = [p.strip() for p in lower.split(",")]
+    return any(p in _US_STATE_CODES or p in _US_STATE_NAMES for p in parts)
+
+
 # Country aliases: maps common short forms / subdivisions to the canonical pycountry name.
 # Used by _job_location_allowed so that job locations like "London, England, UK" or
 # "Lagos, NG" are accepted for users whose readable location is "United Kingdom" / "Nigeria".
@@ -263,6 +388,28 @@ def _query_matches_title(source_query: str, job_title: str) -> bool:
         return False
     matches = sum(1 for w in query_words if w in title_lower)
     return matches / len(query_words) >= 0.6
+
+
+def _role_matches_title(role_term: str, job_title: str) -> bool:
+    """Stricter relevance check used for the role bucket.
+
+    Requires the last two meaningful words of the role term to both appear in
+    the job title.  This prevents generic word overlaps from admitting unrelated
+    jobs — e.g. for "Data Product Manager", the words "product" + "manager"
+    must both be present, so "Data Scientist — Data & Analytics Products" (no
+    "manager") and "Senior Cost Manager — Data Center" (no "product") are
+    excluded while "Product Manager", "Senior Product Manager", and
+    "Data Product Manager" all pass.
+    """
+    if not role_term or not job_title:
+        return False
+    words = [w for w in role_term.lower().split() if len(w) > 1]
+    if not words:
+        return False
+    # Use the last two words as the core anchor; fall back to all words if < 2
+    anchor = words[-2:] if len(words) >= 2 else words
+    title_lower = job_title.lower()
+    return all(w in title_lower for w in anchor)
 
 
 class OpportunityDiscoveryEngine:
@@ -877,8 +1024,12 @@ class OpportunityDiscoveryEngine:
                 logger.warning("job_registry_fetch_failed", location=loc, error=repr(exc))
 
         # When a target role is set, also run a dedicated remote search for that
-        # role term. Target roles like "Data Product Manager" are predominantly
-        # posted as remote and won't show up in country-specific searches.
+        # role term. These results bypass location filtering (handled below) because
+        # roles like "Data Product Manager" are predominantly posted in markets like
+        # the US where they are absent from country-specific searches for NG/GH.
+        # For users in well-represented markets (US/UK) the country-specific results
+        # will already fill the role bucket before these are needed.
+        remote_role_urls: set[str] = set()
         if role_term:
             role_search_terms = [t for t in search_terms if t.strip().lower() == role_term]
             if role_search_terms:
@@ -890,6 +1041,9 @@ class OpportunityDiscoveryEngine:
                 )
                 try:
                     remote_batch = await self._job_registry.fetch_all(remote_ctx)
+                    for job in remote_batch:
+                        if job.url:
+                            remote_role_urls.add(job.url)
                     all_raw_jobs.extend(remote_batch)
                 except Exception as exc:
                     logger.warning("job_registry_remote_role_fetch_failed", role=role_term, error=repr(exc))
@@ -909,13 +1063,25 @@ class OpportunityDiscoveryEngine:
             if not raw.url or raw.url in seen_urls:
                 continue
 
-            # Determine bucket first so location filtering can be skipped for
-            # role jobs. The user explicitly stated this target role, so we show
-            # those jobs globally — they may be open to relocation or remote work
-            # in markets where that role is common (e.g. US/UK for DPM roles).
             is_role_job = role_term and (raw.source_query or "").strip().lower() == role_term
 
-            if not is_role_job and not self._job_location_allowed(raw.location, allowed_set):
+            # Location filter: always applied to track jobs.
+            # For role jobs from the dedicated remote search we also allow jobs
+            # from major English-speaking PM hiring markets (US, Canada,
+            # Australia, Ireland) so that users in NG/GH — where PM roles are
+            # rare — can still see realistic target-role listings. Jobs from
+            # unrelated markets (India, Southeast Asia, etc.) are still excluded.
+            is_remote_role = is_role_job and raw.url in remote_role_urls
+            location_ok = self._job_location_allowed(raw.location, allowed_set)
+            if not location_ok and is_remote_role:
+                loc_lower = (raw.location or "").lower()
+                location_ok = (
+                    not loc_lower
+                    or any(kw in loc_lower for kw in ("remote", "hybrid", "worldwide", "anywhere"))
+                    or _is_us_location(raw.location or "")
+                    or any(kw in loc_lower for kw in ("canada", "australia", "ireland"))
+                )
+            if not location_ok:
                 logger.debug(
                     "job_location_filtered",
                     title=raw.title[:60],
@@ -926,6 +1092,10 @@ class OpportunityDiscoveryEngine:
 
             # Relevance gate: keep if track keywords appear OR the search query
             # substantially matches the job title.
+            # Role jobs use a stricter anchor check (last 2 words of the role
+            # term must both appear) to prevent generic word overlaps from
+            # admitting unrelated jobs like "Data Scientist" for a
+            # "Data Product Manager" query.
             content = f"{raw.title} {raw.description}"
             best_score = Decimal("0.50")
             best_track = tracks[0] if tracks else ""
@@ -935,7 +1105,11 @@ class OpportunityDiscoveryEngine:
                     best_score = score
                     best_track = track
 
-            query_relevant = _query_matches_title(raw.source_query or "", raw.title)
+            if is_role_job:
+                query_relevant = _role_matches_title(role_term, raw.title)
+            else:
+                query_relevant = _query_matches_title(raw.source_query or "", raw.title)
+
             if best_score <= Decimal("0.50") and not query_relevant:
                 logger.debug(
                     "job_relevance_filtered",
