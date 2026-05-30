@@ -363,6 +363,7 @@ class WorkableSource(JobSource):
                 )
                 continue
 
+            term_count = 0
             for job in payload.get("jobs", []):
                 posted_at = _first_posted_at(job.get("updated"), job.get("created"))
                 if not _is_recent_job(posted_at, context.max_job_age_days):
@@ -396,10 +397,11 @@ class WorkableSource(JobSource):
                     )
                 )
 
-                if len(jobs) >= context.max_results_per_source:
-                    return jobs[: context.max_results_per_source]
+                term_count += 1
+                if term_count >= context.results_per_source:
+                    break
 
-        return jobs[: context.max_results_per_source]
+        return jobs
 
 
 class ConfiguredBoardSource(JobSource, ABC):
@@ -815,6 +817,7 @@ class SmartRecruitersSource(JobSource):
                 )
                 continue
 
+            term_count = 0
             for job in payload.get("content", []):
                 loc = job.get("location") or {}
                 is_remote = bool(loc.get("remote"))
@@ -863,10 +866,13 @@ class SmartRecruitersSource(JobSource):
                     )
                 )
 
-                if len(jobs) >= context.max_results_per_source:
-                    return jobs[: context.max_results_per_source]
+                term_count += 1
+                # Per-term cap: each search term gets its own result budget so later
+                # terms (role, anchor) are not crowded out by the first track term.
+                if term_count >= context.results_per_source:
+                    break
 
-        return jobs[: context.max_results_per_source]
+        return jobs
 
 
 class JobSourceRegistry:
@@ -903,30 +909,54 @@ class JobSourceRegistry:
 
         return bool(location_tokens & metadata_tokens)
 
-    def build_sources(self, context: JobDiscoveryContext | None = None) -> list[JobSource]:
-        sources: list[JobSource] = [
+    # Location-aware sources: search by keyword + location.
+    # Run once per user country so each country's job market is queried.
+    _LOCATION_SOURCE_FACTORIES: list = []  # populated below
+
+    def build_location_sources(self) -> list[JobSource]:
+        """Return sources that accept a location parameter (Indeed, LinkedIn, etc.)."""
+        return [
             JobSpySource("linkedin"),
             JobSpySource("indeed"),
             WorkableSource(),
             SmartRecruitersSource(),
         ]
-        provider_map: dict[str, type[ConfiguredBoardSource]] = {
-            "greenhouse": GreenhouseSource,
-            "lever": LeverSource,
-            "ashby": AshbySource,
-            "rippling": RipplingSource,
-        }
 
+    _BOARD_PROVIDERS: dict[str, type[ConfiguredBoardSource]] = {
+        "greenhouse": GreenhouseSource,
+        "lever": LeverSource,
+        "ashby": AshbySource,
+        "rippling": RipplingSource,
+    }
+
+    def build_board_sources(self) -> list[JobSource]:
+        """Return company-board sources (Greenhouse, Ashby, Lever, Rippling).
+
+        These boards return ALL open positions for a specific company regardless
+        of location or search term.  They should be fetched ONCE per discovery
+        run (not once per user country) since repeated fetches return identical
+        data.  Location filtering is applied downstream in _discover_jobs.
+        """
+        sources: list[JobSource] = []
         for config in self._board_configs:
-            if context is not None and not self._config_matches_location(config, context.primary_location):
-                continue
-
-            provider_cls = provider_map.get(config.provider)
+            provider_cls = self._BOARD_PROVIDERS.get(config.provider)
             if not provider_cls:
                 logger.warning("unknown_job_board_provider", provider=config.provider)
                 continue
             sources.append(provider_cls(config))
+        return sources
 
+    def build_sources(self, context: JobDiscoveryContext | None = None) -> list[JobSource]:
+        """Build the full source list (location-aware + boards).  Used by fetch_all."""
+        sources: list[JobSource] = self.build_location_sources()
+        for config in self._board_configs:
+            if context is not None and not self._config_matches_location(config, context.primary_location):
+                continue
+            provider_cls = self._BOARD_PROVIDERS.get(config.provider)
+            if not provider_cls:
+                logger.warning("unknown_job_board_provider", provider=config.provider)
+                continue
+            sources.append(provider_cls(config))
         return sources
 
     async def fetch_all(self, context: JobDiscoveryContext) -> list[RawJobOpportunity]:

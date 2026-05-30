@@ -33,6 +33,7 @@ from aegra_api.core.accountability_orm import (
 from aegra_api.services.advisor_cache import get_cached_learning_track
 from aegra_api.services.opportunity_event_sources import EventbriteSource, LumaSource, MeetupSource, RawEventOpportunity
 from aegra_api.services.opportunity_job_sources import (
+    DEFAULT_MAX_RESULTS_PER_SOURCE,
     JobDiscoveryContext,
     JobSourceRegistry,
     RawJobOpportunity,
@@ -247,6 +248,71 @@ _COUNTRY_ALIASES: dict[str, set[str]] = {
     "netherlands": {"nl", "nld"},
     "ireland": {"ie", "irl"},
     "new zealand": {"nz", "nzl"},
+}
+
+# Maps bare city names (lowercase) to their canonical country name.
+# Job boards often post locations as plain city names ("London", "Lagos")
+# without any country suffix, causing _job_location_allowed to miss them.
+_MAJOR_CITIES: dict[str, str] = {
+    # United Kingdom
+    "london": "united kingdom",
+    "manchester": "united kingdom",
+    "birmingham": "united kingdom",
+    "leeds": "united kingdom",
+    "glasgow": "united kingdom",
+    "edinburgh": "united kingdom",
+    "bristol": "united kingdom",
+    "liverpool": "united kingdom",
+    "sheffield": "united kingdom",
+    "cambridge": "united kingdom",
+    "oxford": "united kingdom",
+    "cardiff": "united kingdom",
+    "belfast": "united kingdom",
+    "nottingham": "united kingdom",
+    # Nigeria
+    "lagos": "nigeria",
+    "abuja": "nigeria",
+    "port harcourt": "nigeria",
+    "ibadan": "nigeria",
+    "kano": "nigeria",
+    # Ghana
+    "accra": "ghana",
+    "kumasi": "ghana",
+    # Kenya
+    "nairobi": "kenya",
+    "mombasa": "kenya",
+    # South Africa
+    "johannesburg": "south africa",
+    "cape town": "south africa",
+    "durban": "south africa",
+    "pretoria": "south africa",
+    # Germany
+    "berlin": "germany",
+    "munich": "germany",
+    "hamburg": "germany",
+    "frankfurt": "germany",
+    "cologne": "germany",
+    # France
+    "paris": "france",
+    # Netherlands
+    "amsterdam": "netherlands",
+    # Ireland
+    "dublin": "ireland",
+    # Australia
+    "sydney": "australia",
+    "melbourne": "australia",
+    "brisbane": "australia",
+    "perth": "australia",
+    # Canada
+    "toronto": "canada",
+    "vancouver": "canada",
+    "montreal": "canada",
+    "calgary": "canada",
+    # UAE
+    "dubai": "united arab emirates",
+    "abu dhabi": "united arab emirates",
+    # Singapore (city = country)
+    "singapore": "singapore",
 }
 
 # Indeed expects specific country strings; map ISO alpha-2 → jobspy/Indeed string
@@ -545,6 +611,13 @@ class OpportunityDiscoveryEngine:
         # out irrelevant hits at display time.
         if profile and isinstance(profile.target_role, str) and profile.target_role.strip():
             _add(profile.target_role)
+            # For 3-word roles, also add the 2-word anchor so country-specific
+            # boards (Indeed, SmartRecruiters) surface broader results.
+            # E.g. "Data Product Manager" → also search "Product Manager" to
+            # find UK PM listings that don't use the full DPM title.
+            _role_words = [w for w in profile.target_role.split() if len(w) > 1]
+            if len(_role_words) >= 3:
+                _add(" ".join(_role_words[-2:]).title())
         if profile and isinstance(profile.role_title, str) and profile.role_title.strip():
             _add(profile.role_title)
 
@@ -844,70 +917,100 @@ class OpportunityDiscoveryEngine:
             except (LookupError, AttributeError):
                 pass
 
-        async def _fetch_one(query: str, location: str, track: str) -> list[dict[str, Any]]:
+        # Separate sources: Luma ignores location (global slug-only API) so fetch
+        # it once per query; Meetup and Eventbrite are location-aware.
+        global_sources = [s for s in self._event_sources if s.name == "luma"]
+        location_sources = [s for s in self._event_sources if s.name != "luma"]
+
+        def _parse_raw(
+            raw_events: list[RawEventOpportunity],
+            track: str,
+            fallback_location: str,
+        ) -> list[dict[str, Any]]:
+            parsed: list[dict[str, Any]] = []
+            for ev in raw_events:
+                if not ev.url or ev.url in seen_urls:
+                    continue
+                seen_urls.add(ev.url)
+                score = _score_text(f"{ev.title} {ev.description}", track)
+                # Lu.ma pre-filters by category slug (tech/ai) so the slug itself
+                # acts as a relevance signal — give it one keyword match's worth.
+                if ev.source == "luma" and score <= Decimal("0.50"):
+                    score = Decimal("0.58")
+                # Require at least one keyword match (base score 0.50 means no match)
+                elif score <= Decimal("0.50"):
+                    continue
+                # Location guard: accept online/remote events anywhere;
+                # physical events must match one of the user's allowed locations
+                ev_loc = (ev.location or "").lower()
+                if (
+                    ev_loc
+                    and not any(kw in ev_loc for kw in ("online", "remote", "virtual"))
+                    and not self._job_location_allowed(ev.location, readable_locations)
+                ):
+                    logger.debug(
+                        "event_location_filtered",
+                        title=ev.title[:60],
+                        event_location=ev.location,
+                        allowed=list(readable_locations),
+                    )
+                    continue
+                parsed.append(
+                    {
+                        "opportunity_type": "event",
+                        "title": ev.title,
+                        "description": ev.description,
+                        "url": ev.url,
+                        "location": ev.location or _readable_location(fallback_location),
+                        "event_date": ev.event_date.isoformat() if ev.event_date else None,
+                        "company": None,
+                        "salary_range": None,
+                        "match_score": score,
+                        "matched_track": track,
+                        "reason_tags": ["matched_track"],
+                        "_source": ev.source,
+                        "_query": ev.source_query,
+                    }
+                )
+            return parsed
+
+        async def _fetch_global(query: str, track: str) -> list[dict[str, Any]]:
+            """Fetch from location-agnostic sources (Luma) — called once per query."""
             async with sem:
-                # Fan out across all event sources and merge results
-                source_batches = await asyncio.gather(
-                    *[src.fetch(query, location) for src in self._event_sources],
+                batches = await asyncio.gather(
+                    *[src.fetch(query, "remote") for src in global_sources],
                     return_exceptions=True,
                 )
-                raw_events: list[RawEventOpportunity] = []
-                for batch in source_batches:
-                    if isinstance(batch, list):
-                        raw_events.extend(batch)
-                parsed: list[dict[str, Any]] = []
-                for ev in raw_events:
-                    if not ev.url or ev.url in seen_urls:
-                        continue
-                    seen_urls.add(ev.url)
-                    score = _score_text(f"{ev.title} {ev.description}", track)
-                    # Lu.ma pre-filters by category slug (tech/ai) so the slug itself
-                    # acts as a relevance signal — give it one keyword match's worth.
-                    if ev.source == "luma" and score <= Decimal("0.50"):
-                        score = Decimal("0.58")
-                    # Require at least one keyword match (base score 0.50 means no match)
-                    elif score <= Decimal("0.50"):
-                        continue
-                    # Location guard: accept online/remote events anywhere;
-                    # physical events must match one of the user's allowed locations
-                    ev_loc = (ev.location or "").lower()
-                    if (
-                        ev_loc
-                        and not any(kw in ev_loc for kw in ("online", "remote", "virtual"))
-                        and not self._job_location_allowed(ev.location, readable_locations)
-                    ):
-                        logger.debug(
-                            "event_location_filtered",
-                            title=ev.title[:60],
-                            event_location=ev.location,
-                            allowed=list(readable_locations),
-                        )
-                        continue
-                    parsed.append(
-                        {
-                            "opportunity_type": "event",
-                            "title": ev.title,
-                            "description": ev.description,
-                            "url": ev.url,
-                            "location": ev.location or _readable_location(location),
-                            "event_date": ev.event_date.isoformat() if ev.event_date else None,
-                            "company": None,
-                            "salary_range": None,
-                            "match_score": score,
-                            "matched_track": track,
-                            "reason_tags": ["matched_track"],
-                            "_source": ev.source,
-                            "_query": query,
-                        }
-                    )
-                return parsed
+                raw: list[RawEventOpportunity] = []
+                for b in batches:
+                    if isinstance(b, list):
+                        raw.extend(b)
+                return _parse_raw(raw, track, "remote")
+
+        async def _fetch_located(query: str, location: str, track: str) -> list[dict[str, Any]]:
+            """Fetch from location-aware sources (Meetup, Eventbrite) — once per location."""
+            async with sem:
+                batches = await asyncio.gather(
+                    *[src.fetch(query, location) for src in location_sources],
+                    return_exceptions=True,
+                )
+                raw: list[RawEventOpportunity] = []
+                for b in batches:
+                    if isinstance(b, list):
+                        raw.extend(b)
+                return _parse_raw(raw, track, location)
 
         tasks = []
         for track in tracks:
             queries = self._build_event_queries(track)
+            capped = queries[:queries_per_category]
+            # Global sources: one task per query (not per location)
+            for q in capped:
+                tasks.append(_fetch_global(q, track))
+            # Location-aware sources: one task per (location, query)
             for loc in locations:
-                for q in queries[:queries_per_category]:
-                    tasks.append(_fetch_one(q, loc, track))
+                for q in capped:
+                    tasks.append(_fetch_located(q, loc, track))
 
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
         events: list[dict[str, Any]] = []
@@ -969,8 +1072,22 @@ class OpportunityDiscoveryEngine:
                     # Full-string or part-level substring match
                     if token in loc_lower or loc_lower in token:
                         return True
-                    if any(token in part or part in token for part in loc_parts):
-                        return True
+                    for part in loc_parts:
+                        if token in part:
+                            return True
+                        # Guard: don't let short ISO codes (2-char) match as
+                        # substrings of longer tokens.  "ng" (Nigeria) must not
+                        # match "united ki**ng**dom" via `part in token`.
+                        if len(part) > 2 and part in token:
+                            return True
+
+        # City-level fallback: job boards often post bare city names ("London",
+        # "Lagos") without a country suffix. Map known cities → country and check.
+        for part in loc_parts:
+            city_country = _MAJOR_CITIES.get(part)
+            if city_country and city_country in readable_locations:
+                return True
+
         return False
 
     async def _discover_jobs(
@@ -995,8 +1112,12 @@ class OpportunityDiscoveryEngine:
 
         # Identify the target-role term so we can route results to the right bucket.
         role_term: str = ""
+        role_anchor: str = ""  # simplified 2-word form, e.g. "product manager"
         if profile and isinstance(profile.target_role, str) and profile.target_role.strip():
             role_term = profile.target_role.strip().lower()
+            _rw = [w for w in role_term.split() if len(w) > 1]
+            if len(_rw) >= 3:
+                role_anchor = " ".join(_rw[-2:])
 
         search_terms = self._build_job_search_terms(
             tracks,
@@ -1004,31 +1125,70 @@ class OpportunityDiscoveryEngine:
             queries_per_category=queries_per_category,
         )
 
-        # Always run at least 2 search terms (track + role) when a target role is set,
-        # regardless of the queries_per_category setting.
-        max_terms = max(2, queries_per_category) if role_term else queries_per_category
+        # Always include: 1 track term + full role term + anchor (if any).
+        # queries_per_category may add more track keywords on top of that.
+        role_terms_count = (1 if role_term else 0) + (1 if role_anchor else 0)
+        max_terms = max(1 + role_terms_count, queries_per_category) if role_term else queries_per_category
 
-        # Fetch jobs for every user location so all work_countries are covered.
+        # Two-phase fetch strategy:
+        #
+        # Phase 1 — Location-aware sources (Indeed, LinkedIn, SmartRecruiters, Workable)
+        # Run once per user country so each market is queried with location context.
+        # Each search term gets its own result budget (results_per_source per term)
+        # so the role and anchor terms are never crowded out by track results.
+        #
+        # Phase 2 — Company boards (Greenhouse, Ashby, Lever, Rippling)
+        # Fetched ONCE (not per country) because these boards return company-global
+        # job listings regardless of the requested location.  Re-fetching per country
+        # wastes API calls and returns identical data.  Location filtering is applied
+        # downstream by _job_location_allowed.
         all_raw_jobs: list[RawJobOpportunity] = []
+        loc_ctx_kwargs = {
+            "search_terms": search_terms,
+            "max_search_terms": max_terms,
+            # Per-term budget: each term gets results_per_source slots so later
+            # terms (role, anchor) are not crowded out by the first track term.
+            "max_results_per_source": DEFAULT_MAX_RESULTS_PER_SOURCE * max_terms,
+        }
+
+        location_sources = self._job_registry.build_location_sources()
         for loc in search_locations:
-            context = JobDiscoveryContext(
-                search_terms=search_terms,
+            loc_ctx = JobDiscoveryContext(
                 primary_location=loc,
                 indeed_country=self._indeed_country([loc]),
-                max_search_terms=max_terms,
+                **loc_ctx_kwargs,  # type: ignore[arg-type]
             )
-            try:
-                batch = await self._job_registry.fetch_all(context)
-                all_raw_jobs.extend(batch)
-            except Exception as exc:
-                logger.warning("job_registry_fetch_failed", location=loc, error=repr(exc))
+            loc_results = await asyncio.gather(
+                *(src.fetch(loc_ctx) for src in location_sources),
+                return_exceptions=True,
+            )
+            for src, result in zip(location_sources, loc_results, strict=False):
+                if isinstance(result, list):
+                    all_raw_jobs.extend(result)
+                elif isinstance(result, Exception):
+                    logger.warning("location_source_failed", source=src.name, location=loc, error=repr(result))
 
-        # When a target role is set, also run a dedicated remote search for that
-        # role term. These results bypass location filtering (handled below) because
-        # roles like "Data Product Manager" are predominantly posted in markets like
-        # the US where they are absent from country-specific searches for NG/GH.
-        # For users in well-represented markets (US/UK) the country-specific results
-        # will already fill the role bucket before these are needed.
+        # Company boards — fetch once, filter by all user locations downstream.
+        board_ctx = JobDiscoveryContext(
+            primary_location=search_locations[0] if search_locations else "remote",
+            indeed_country=self._indeed_country(search_locations),
+            **loc_ctx_kwargs,  # type: ignore[arg-type]
+        )
+        board_sources = self._job_registry.build_board_sources()
+        board_results = await asyncio.gather(
+            *(src.fetch(board_ctx) for src in board_sources),
+            return_exceptions=True,
+        )
+        for src, result in zip(board_sources, board_results, strict=False):
+            if isinstance(result, list):
+                all_raw_jobs.extend(result)
+            elif isinstance(result, Exception):
+                logger.warning("board_source_failed", source=src.name, error=repr(result))
+
+        # Dedicated remote search for the role term.
+        # Fills the role bucket when country-specific sources return nothing for
+        # the target role (e.g. "Data Product Manager" in NG/GH markets).
+        # Only remote/hybrid-tagged jobs are allowed through from this batch.
         remote_role_urls: set[str] = set()
         if role_term:
             role_search_terms = [t for t in search_terms if t.strip().lower() == role_term]
@@ -1039,14 +1199,18 @@ class OpportunityDiscoveryEngine:
                     indeed_country=self._indeed_country(search_locations),
                     max_search_terms=1,
                 )
-                try:
-                    remote_batch = await self._job_registry.fetch_all(remote_ctx)
-                    for job in remote_batch:
-                        if job.url:
-                            remote_role_urls.add(job.url)
-                    all_raw_jobs.extend(remote_batch)
-                except Exception as exc:
-                    logger.warning("job_registry_remote_role_fetch_failed", role=role_term, error=repr(exc))
+                remote_results = await asyncio.gather(
+                    *(src.fetch(remote_ctx) for src in location_sources),
+                    return_exceptions=True,
+                )
+                for src, result in zip(location_sources, remote_results, strict=False):
+                    if isinstance(result, list):
+                        for job in result:
+                            if job.url:
+                                remote_role_urls.add(job.url)
+                        all_raw_jobs.extend(result)
+                    elif isinstance(result, Exception):
+                        logger.warning("remote_role_source_failed", source=src.name, role=role_term, error=repr(result))
 
         primary_location = search_locations[0] if search_locations else "remote"
         all_jobs: list[dict[str, Any]] = []
@@ -1063,7 +1227,18 @@ class OpportunityDiscoveryEngine:
             if not raw.url or raw.url in seen_urls:
                 continue
 
-            is_role_job = role_term and (raw.source_query or "").strip().lower() == role_term
+            _sq = (raw.source_query or "").strip().lower()
+            is_role_job = bool(
+                role_term
+                and (
+                    _sq in {role_term, role_anchor}
+                    # Company boards (Greenhouse/Ashby/Lever) don't set source_query.
+                    # Route their jobs to the role bucket when the title matches the
+                    # role anchor, so London PM listings from Monzo/Revolut etc. reach
+                    # the role bucket instead of being dropped at the relevance gate.
+                    or (not _sq and _role_matches_title(role_term, raw.title))
+                )
+            )
 
             # Location filter: always applied to track jobs.
             # For role jobs from the dedicated remote search we also allow jobs
@@ -1074,12 +1249,15 @@ class OpportunityDiscoveryEngine:
             is_remote_role = is_role_job and raw.url in remote_role_urls
             location_ok = self._job_location_allowed(raw.location, allowed_set)
             if not location_ok and is_remote_role:
+                # For the dedicated remote-role batch, only pass through jobs that
+                # are explicitly remote/hybrid/worldwide — never city-specific jobs
+                # from unrelated markets (US, India, etc.).  Country-specific results
+                # for the user's own markets (NG/GH/GB) already go through the normal
+                # filter above; this bypass is a last-resort fill for truly remote
+                # listings when nothing exists in the user's home markets.
                 loc_lower = (raw.location or "").lower()
-                location_ok = (
-                    not loc_lower
-                    or any(kw in loc_lower for kw in ("remote", "hybrid", "worldwide", "anywhere"))
-                    or _is_us_location(raw.location or "")
-                    or any(kw in loc_lower for kw in ("canada", "australia", "ireland"))
+                location_ok = not loc_lower or any(
+                    kw in loc_lower for kw in ("remote", "hybrid", "worldwide", "anywhere")
                 )
             if not location_ok:
                 logger.debug(
