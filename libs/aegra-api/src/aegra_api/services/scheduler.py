@@ -180,12 +180,16 @@ class SchedulerService:
     async def backfill_job_opportunity_opt_in(self) -> None:
         """Enable Jobs & Opportunity email for existing paid users who haven't opted in.
 
-        Runs once on startup. For every UserPreferences row where
-        ``job_opportunity_mail_enabled`` is not True, checks the LMS Mongo
-        subscriptions collection. If the user has an active AI Mentor add-on,
-        both ``ai_mentor_addon_active`` and ``job_opportunity_mail_enabled`` are
-        set to True so they receive job digests without any manual action.
+        Runs once on startup. For every UserPreferences row:
+        - If ``job_opportunity_mail_enabled`` is not True: checks the LMS Mongo
+          subscriptions and sets ``ai_mentor_addon_active`` + ``job_opportunity_mail_enabled``
+          for users with an active AI Mentor add-on.
+        - For all AI Mentor addon users missing ``user_email``: resolves and caches
+          the email address from the LMS so notification sends don't need a live
+          LMS lookup every time.
         """
+        from aegra_api.services.email_service import resolve_student_contact
+
         try:
             if not db_manager.engine:
                 return
@@ -195,32 +199,53 @@ class SchedulerService:
                 all_prefs = result.scalars().all()
 
                 updated = 0
+                email_cached = 0
                 for prefs in all_prefs:
                     pref_json = prefs.preferences or {}
-                    if pref_json.get("job_opportunity_mail_enabled", False):
-                        continue
-                    try:
-                        sub = await asyncio.to_thread(
-                            get_course_content_mongo_client().get_subscription_state,
-                            prefs.user_id,
-                        )
-                        if not sub:
-                            continue
-                        addon = sub.get("aiMentorAddOn") or {}
-                        if not addon.get("active", False):
-                            continue
-                        new_pref_json = dict(pref_json)
-                        new_pref_json["ai_mentor_addon_active"] = True
-                        new_pref_json["job_opportunity_mail_enabled"] = True
+                    new_pref_json = dict(pref_json)
+                    changed = False
+
+                    # ── Opt-in pass: enable job mail for AI Mentor users ──────
+                    if not pref_json.get("job_opportunity_mail_enabled", False):
+                        try:
+                            sub = await asyncio.to_thread(
+                                get_course_content_mongo_client().get_subscription_state,
+                                prefs.user_id,
+                            )
+                            if sub:
+                                addon = sub.get("aiMentorAddOn") or {}
+                                if addon.get("active", False):
+                                    new_pref_json["ai_mentor_addon_active"] = True
+                                    new_pref_json["job_opportunity_mail_enabled"] = True
+                                    changed = True
+                                    updated += 1
+                        except Exception as exc:
+                            logger.warning("backfill_opt_in_user_failed", user_id=prefs.user_id, error=str(exc))
+
+                    # ── Email cache pass: store user_email for AI Mentor users ─
+                    if new_pref_json.get("ai_mentor_addon_active") and not new_pref_json.get("user_email"):
+                        try:
+                            contact = await resolve_student_contact(prefs.user_id)
+                            if contact.get("email"):
+                                new_pref_json["user_email"] = contact["email"]
+                                if contact.get("first_name") and not new_pref_json.get("user_name"):
+                                    new_pref_json["user_name"] = contact["first_name"]
+                                changed = True
+                                email_cached += 1
+                        except Exception as exc:
+                            logger.warning("backfill_email_cache_failed", user_id=prefs.user_id, error=str(exc))
+
+                    if changed:
                         prefs.preferences = new_pref_json
                         flag_modified(prefs, "preferences")
-                        updated += 1
-                    except Exception as exc:
-                        logger.warning("backfill_opt_in_user_failed", user_id=prefs.user_id, error=str(exc))
 
-                if updated > 0:
+                if updated > 0 or email_cached > 0:
                     await session.commit()
-                logger.info("backfill_job_opportunity_opt_in_complete", users_updated=updated)
+                logger.info(
+                    "backfill_job_opportunity_opt_in_complete",
+                    users_updated=updated,
+                    emails_cached=email_cached,
+                )
         except Exception as exc:
             logger.error("backfill_job_opportunity_opt_in_failed", error=str(exc), exc_info=True)
 
