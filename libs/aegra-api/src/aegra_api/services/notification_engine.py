@@ -144,7 +144,9 @@ class NotificationEngine:
         if in_quiet and priority != "urgent":
             return False
 
-        # Check daily cap
+        # Check daily cap — opportunity notifications are bulk-created by the
+        # discovery job and must not consume slots for engagement notifications
+        # (inactivity, celebration, motivation).
         max_daily = user_prefs.get("max_daily", MAX_DAILY_NOTIFICATIONS)
         today_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         count_result = await session.execute(
@@ -152,6 +154,7 @@ class NotificationEngine:
                 and_(
                     Notification.user_id == user_id,
                     Notification.created_at >= today_start,
+                    Notification.category != "opportunity",
                 )
             )
         )
@@ -159,10 +162,16 @@ class NotificationEngine:
         if today_count >= max_daily and priority not in ("urgent", "critical"):
             return False
 
-        # Cool-down check
+        # Cool-down check — exclude opportunity notifications so bulk discovery
+        # jobs don't reset the cool-down window for engagement notifications.
         last_result = await session.execute(
             select(Notification.created_at)
-            .where(Notification.user_id == user_id)
+            .where(
+                and_(
+                    Notification.user_id == user_id,
+                    Notification.category != "opportunity",
+                )
+            )
             .order_by(Notification.created_at.desc())
             .limit(1)
         )

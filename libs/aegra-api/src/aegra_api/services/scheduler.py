@@ -366,7 +366,7 @@ class SchedulerService:
                     content = content_tpl.format(days=days_inactive)
                     advisor_name = await self._resolve_advisor_first_name(activity.user_id)
 
-                    await notification_engine.create_notification(
+                    sent = await notification_engine.create_notification(
                         session=session,
                         user_id=activity.user_id,
                         title=title,
@@ -388,12 +388,13 @@ class SchedulerService:
                         ],
                         check_frequency=True,
                     )
-                    logger.info(
-                        "inactivity_notification",
-                        user_id=activity.user_id,
-                        days=days_inactive,
-                        tier=tier,
-                    )
+                    if sent:
+                        logger.info(
+                            "inactivity_notification",
+                            user_id=activity.user_id,
+                            days=days_inactive,
+                            tier=tier,
+                        )
 
                 await session.commit()
         except Exception as e:
