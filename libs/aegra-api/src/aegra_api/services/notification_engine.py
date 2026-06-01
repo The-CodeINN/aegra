@@ -20,6 +20,7 @@ Responsibilities
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -877,6 +878,27 @@ class NotificationEngine:
             logger.debug("email_skipped_no_address", user_id=user_id, category=category)
             return
 
+        # Resolve the actual advisor name for this user (based on learning track)
+        # instead of using the default "Alexandra" or whatever was passed in.
+        # This ensures emails always show the correct advisor persona.
+        try:
+            from aegra_api.data import get_advisor_by_track, get_default_advisor
+            from aegra_api.services.course_content import get_course_content_mongo_client
+
+            advisor_first_name = DEFAULT_PERSONA
+            mongo_client = get_course_content_mongo_client()
+            raw_track = await asyncio.to_thread(mongo_client.get_learning_track, user_id)
+            if raw_track:
+                normalised = raw_track.lower().strip().replace(" ", "-")
+                advisor = get_advisor_by_track(normalised)
+                if advisor:
+                    advisor_first_name = advisor["name"].split()[0]
+            else:
+                advisor_first_name = get_default_advisor()["name"].split()[0]
+        except Exception as exc:
+            logger.debug("advisor_resolve_failed_in_email", user_id=user_id, error=str(exc))
+            advisor_first_name = DEFAULT_PERSONA
+
         subject = f"[DeDataHub] {title}"
         # Use pre-generated personalised body when available; otherwise use
         # the standard in-app content (which may have been persona-rewritten).
@@ -886,7 +908,7 @@ class NotificationEngine:
             title=title,
             content=email_content,
             action_buttons=action_buttons,
-            advisor_persona=persona,
+            advisor_persona=advisor_first_name,
             category=category,
         )
 
