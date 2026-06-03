@@ -222,16 +222,23 @@ class SchedulerService:
                         except Exception as exc:
                             logger.warning("backfill_opt_in_user_failed", user_id=prefs.user_id, error=str(exc))
 
-                    # ── Email cache pass: store user_email for AI Mentor users ─
-                    if new_pref_json.get("ai_mentor_addon_active") and not new_pref_json.get("user_email"):
+                    # ── Email cache pass: store user_email / fix placeholder names ─
+                    _stored_name = new_pref_json.get("user_name", "")
+                    _name_is_placeholder = _stored_name.startswith("User ") and len(_stored_name) > 5
+                    _needs_email = new_pref_json.get("ai_mentor_addon_active") and not new_pref_json.get("user_email")
+                    _needs_name = new_pref_json.get("ai_mentor_addon_active") and (
+                        not _stored_name or _name_is_placeholder
+                    )
+                    if _needs_email or _needs_name:
                         try:
                             contact = await resolve_student_contact(prefs.user_id)
                             if contact.get("email"):
                                 new_pref_json["user_email"] = contact["email"]
-                                if contact.get("first_name") and not new_pref_json.get("user_name"):
-                                    new_pref_json["user_name"] = contact["first_name"]
                                 changed = True
                                 email_cached += 1
+                            if contact.get("first_name") and _needs_name:
+                                new_pref_json["user_name"] = contact["first_name"]
+                                changed = True
                         except Exception as exc:
                             logger.warning("backfill_email_cache_failed", user_id=prefs.user_id, error=str(exc))
 
@@ -973,14 +980,17 @@ class SchedulerService:
                                 }
                             )
 
-                        # Prefer email stored locally in preferences (set on every
-                        # preferences PUT via auth context) before hitting the LMS.
                         student_email = pref_json.get("user_email")
                         student_name = pref_json.get("user_name", "")
-                        if not student_email:
+                        # Resolve from LMS when email is missing OR stored name is a
+                        # placeholder ("User <id>") set by an older backfill pass.
+                        _name_is_placeholder = student_name.startswith("User ") and len(student_name) > 5
+                        if not student_email or not student_name or _name_is_placeholder:
                             student_contact = await resolve_student_contact(prefs.user_id)
-                            student_email = student_contact.get("email")
-                            student_name = student_contact.get("first_name", student_name)
+                            if student_contact.get("email"):
+                                student_email = student_contact["email"]
+                            if student_contact.get("first_name"):
+                                student_name = student_contact["first_name"]
                         if not student_email:
                             logger.warning("daily_digest_skipped_missing_email", user_id=prefs.user_id)
                             continue
