@@ -45,6 +45,9 @@ from aegra_api.services.opportunity_discovery import opportunity_engine
 from aegra_api.settings import settings
 from aegra_api.tools.course_content.mongo_client import get_course_content_mongo_client
 
+# weekly_checkin_service is imported lazily inside the job method to avoid
+# a circular import: weekly_checkin → cron_service → langgraph_service.
+
 logger = structlog.getLogger(__name__)
 
 
@@ -167,6 +170,17 @@ class SchedulerService:
                 replace_existing=True,
             )
 
+            # Provision weekly advisor check-in crons for any user who
+            # doesn't have one yet. Runs once on startup then daily so
+            # newly signed-up users are picked up automatically.
+            self.scheduler.add_job(
+                self.provision_weekly_checkins,
+                IntervalTrigger(hours=24),
+                id="provision_weekly_checkins",
+                replace_existing=True,
+                next_run_time=datetime.now(UTC),
+            )
+
             self.scheduler.start()
             logger.info("Scheduler started with all accountability jobs")
 
@@ -255,6 +269,30 @@ class SchedulerService:
                 )
         except Exception as exc:
             logger.error("backfill_job_opportunity_opt_in_failed", error=str(exc), exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Weekly advisor check-in provisioning
+    # ------------------------------------------------------------------
+    async def provision_weekly_checkins(self) -> None:
+        """Ensure every active user has a thread-bound weekly check-in cron.
+
+        Runs on startup and every 24 h so newly signed-up users are picked
+        up automatically without requiring a server restart.
+        """
+        from aegra_api.services.langgraph_service import get_langgraph_service
+        from aegra_api.services.weekly_checkin_service import weekly_checkin_service
+
+        try:
+            if not db_manager.engine:
+                return
+            session_maker = async_sessionmaker(db_manager.engine, expire_on_commit=False)
+            async with session_maker() as session:
+                await weekly_checkin_service.provision_all_pending(
+                    session=session,
+                    langgraph_service=get_langgraph_service(),
+                )
+        except Exception as exc:
+            logger.error("provision_weekly_checkins_failed", error=str(exc), exc_info=True)
 
     # ------------------------------------------------------------------
     # Deadline reminders

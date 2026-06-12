@@ -554,6 +554,8 @@ class CourseContentMongoClient:
 
         resident_country: str | None = None
         work_countries: list[str] = []
+        resident_cities: list[str] = []
+        work_cities: list[str] = []
         target_role: str | None = None
         active_track: str | None = None
 
@@ -563,6 +565,12 @@ class CourseContentMongoClient:
             work_country = s2.get("workCountry")
             if isinstance(work_country, list):
                 work_countries = [c for c in work_country if isinstance(c, str) and c.strip()]
+            resident_city = s2.get("residentCity")
+            if isinstance(resident_city, list):
+                resident_cities = [c for c in resident_city if isinstance(c, str) and c.strip()]
+            work_city = s2.get("workCity")
+            if isinstance(work_city, list):
+                work_cities = [c for c in work_city if isinstance(c, str) and c.strip()]
 
         # s4 — career goal / target role
         if s4:
@@ -583,6 +591,8 @@ class CourseContentMongoClient:
         return {
             "resident_country": resident_country,
             "work_countries": work_countries,
+            "resident_cities": resident_cities,
+            "work_cities": work_cities,
             "target_role": target_role,
             "active_track": active_track,  # kebab slug from s_track, e.g. "ai-engineering"
         }

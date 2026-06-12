@@ -315,6 +315,28 @@ _MAJOR_CITIES: dict[str, str] = {
     "singapore": "singapore",
 }
 
+# ---------------------------------------------------------------------------
+# Waterfall tier scoring — non-overlapping bands so match_score sort = tier order
+# ---------------------------------------------------------------------------
+
+# Tier 1 (exact role + state) scores [0.90, 1.00]
+# Tier 2 (exact role + country) scores [0.75, 0.89]
+# Tier 3 (adjacent + state) scores [0.60, 0.74]
+# Tier 4 (adjacent + country) scores [0.45, 0.59]
+_TIER_BASE_SCORE: dict[int, Decimal] = {
+    1: Decimal("0.90"),
+    2: Decimal("0.75"),
+    3: Decimal("0.60"),
+    4: Decimal("0.45"),
+}
+_TIER_SCORE_CAP: dict[int, Decimal] = {
+    1: Decimal("1.00"),
+    2: Decimal("0.89"),
+    3: Decimal("0.74"),
+    4: Decimal("0.59"),
+}
+_PER_TIER_CAP = 5  # max results stored per tier per discovery run
+
 # Indeed expects specific country strings; map ISO alpha-2 → jobspy/Indeed string
 _INDEED_ALPHA2_MAP: dict[str, str] = {
     "GB": "UK",
@@ -535,6 +557,72 @@ class OpportunityDiscoveryEngine:
                 profile.resident_country,
             ]
         )
+
+    def get_profile_states(self, profile: StudentProfile | None) -> list[str]:
+        """Return deduped city/state names from onboarding (Tier 1 & 3 locations)."""
+        if not profile:
+            return []
+        return _dedupe_locations([*(profile.resident_cities or []), *(profile.work_cities or [])])
+
+    def _job_location_state_allowed(self, job_location: str, state_names: set[str]) -> bool:
+        """Return True if job location contains one of the user's city/state names, or is remote."""
+        if not state_names:
+            return False
+        loc_lower = (job_location or "").lower().strip()
+        if not loc_lower or "remote" in loc_lower or "hybrid" in loc_lower:
+            return True
+        for state in state_names:
+            state_lower = state.lower()
+            if state_lower in loc_lower or loc_lower in state_lower:
+                return True
+        return False
+
+    async def _classify_track_adjacent_batch(self, job_titles: list[str], track: str) -> set[int]:
+        """Use LLM to identify which job titles are adjacent to the user's track.
+
+        Returns a set of indices into job_titles. Falls back to keyword matching on error.
+        """
+        if not job_titles:
+            return set()
+        try:
+            from langchain_aws import ChatBedrockConverse
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            llm = ChatBedrockConverse(
+                model="eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+                region_name=settings.aws.AWS_REGION_NAME,
+                temperature=0,
+                max_tokens=200,
+            )
+            numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(job_titles))
+            messages = [
+                SystemMessage(
+                    content=(
+                        "You are a career advisor. Determine which job titles are relevant or adjacent "
+                        "to someone studying the given learning track. "
+                        "Reply ONLY with a JSON array of index numbers, e.g. [0, 2, 4]."
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f"Learning track: {track}\n\nJob titles:\n{numbered}\n\n"
+                        "Return a JSON array of indices for adjacent/relevant titles. "
+                        "Include roles that share skills, tools, or career paths with this track."
+                    )
+                ),
+            ]
+            resp = await llm.ainvoke(messages)
+            text = resp.content.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return {int(i) for i in parsed if isinstance(i, int) and 0 <= i < len(job_titles)}
+        except Exception as exc:
+            logger.warning("track_adjacency_classification_failed", error=str(exc), track=track)
+        # Keyword fallback when LLM fails
+        keywords = _keywords_for_track(track)
+        return {i for i, t in enumerate(job_titles) if any(kw.lower() in t.lower() for kw in keywords)}
 
     async def _get_student_profile(
         self,
@@ -899,14 +987,19 @@ class OpportunityDiscoveryEngine:
         self,
         tracks: list[str],
         locations: list[str],
+        states: list[str],
         profile: StudentProfile | None,
         seen_urls: set[str],
         queries_per_category: int = 2,
     ) -> list[dict[str, Any]]:
-        """Discover events via all configured event sources (Eventbrite, Meetup, …)."""
+        """Discover events via the 4-tier personalisation waterfall.
+
+        Tier 1 — target role in event content + state match
+        Tier 2 — target role in event content + country match
+        Tier 3 — track keyword match + state match
+        Tier 4 — track keyword match + country match
+        """
         sem = asyncio.Semaphore(2)
-        # Build allowed-location set: full country name + ISO alpha-2 code (lower)
-        # so venue strings like "Albert's Schloss, GB" or "Lagos, NG" can match.
         readable_locations: set[str] = set()
         for loc in locations:
             readable_locations.add(_readable_location(loc).lower())
@@ -917,8 +1010,9 @@ class OpportunityDiscoveryEngine:
             except (LookupError, AttributeError):
                 pass
 
-        # Separate sources: Luma ignores location (global slug-only API) so fetch
-        # it once per query; Meetup and Eventbrite are location-aware.
+        states_set = {s.lower() for s in states} if states else set()
+        target_role_lower = (profile.target_role or "").lower().strip() if profile else ""
+
         global_sources = [s for s in self._event_sources if s.name == "luma"]
         location_sources = [s for s in self._event_sources if s.name != "luma"]
 
@@ -932,29 +1026,42 @@ class OpportunityDiscoveryEngine:
                 if not ev.url or ev.url in seen_urls:
                     continue
                 seen_urls.add(ev.url)
-                score = _score_text(f"{ev.title} {ev.description}", track)
-                # Lu.ma pre-filters by category slug (tech/ai) so the slug itself
-                # acts as a relevance signal — give it one keyword match's worth.
-                if ev.source == "luma" and score <= Decimal("0.50"):
-                    score = Decimal("0.58")
-                # Require at least one keyword match (base score 0.50 means no match)
-                elif score <= Decimal("0.50"):
-                    continue
-                # Location guard: accept online/remote events anywhere;
-                # physical events must match one of the user's allowed locations
+                content_lower = f"{ev.title} {ev.description}".lower()
+                kw_score = _score_text(f"{ev.title} {ev.description}", track)
+                if ev.source == "luma" and kw_score <= Decimal("0.50"):
+                    kw_score = Decimal("0.58")
+                elif kw_score <= Decimal("0.50"):
+                    continue  # not relevant to track
+
                 ev_loc = (ev.location or "").lower()
-                if (
-                    ev_loc
-                    and not any(kw in ev_loc for kw in ("online", "remote", "virtual"))
-                    and not self._job_location_allowed(ev.location, readable_locations)
-                ):
-                    logger.debug(
-                        "event_location_filtered",
-                        title=ev.title[:60],
-                        event_location=ev.location,
-                        allowed=list(readable_locations),
-                    )
+                is_online = not ev_loc or any(kw in ev_loc for kw in ("online", "remote", "virtual"))
+
+                # Country-level location gate
+                country_ok = is_online or self._job_location_allowed(ev.location, readable_locations)
+                if not country_ok:
+                    logger.debug("event_location_filtered", title=ev.title[:60], event_location=ev.location)
                     continue
+
+                state_ok = is_online or self._job_location_state_allowed(ev.location, states_set)
+                role_in_content = bool(target_role_lower and target_role_lower in content_lower)
+
+                # Assign tier
+                if role_in_content and state_ok:
+                    tier = 1
+                elif role_in_content and country_ok:
+                    tier = 2
+                elif state_ok:
+                    tier = 3
+                else:
+                    tier = 4
+
+                score = min(_TIER_BASE_SCORE[tier] + (kw_score - Decimal("0.50")), _TIER_SCORE_CAP[tier])
+                reason_tags = ["matched_track"]
+                if role_in_content:
+                    reason_tags.append("matched_target_role")
+                if state_ok and not is_online:
+                    reason_tags.append("matched_location")
+
                 parsed.append(
                     {
                         "opportunity_type": "event",
@@ -967,7 +1074,8 @@ class OpportunityDiscoveryEngine:
                         "salary_range": None,
                         "match_score": score,
                         "matched_track": track,
-                        "reason_tags": ["matched_track"],
+                        "reason_tags": reason_tags,
+                        "tier": tier,
                         "_source": ev.source,
                         "_query": ev.source_query,
                     }
@@ -1094,63 +1202,43 @@ class OpportunityDiscoveryEngine:
         self,
         tracks: list[str],
         locations: list[str],
+        states: list[str],
         profile: StudentProfile | None,
         seen_urls: set[str],
         queries_per_category: int = 2,
     ) -> list[dict[str, Any]]:
-        """Discover jobs via the board-based JobSourceRegistry.
+        """Discover jobs via the 4-tier personalisation waterfall.
 
-        Results are split into two buckets of 5 each:
-        - Track bucket  — jobs found via track keywords (e.g. "AI engineer")
-        - Role bucket   — jobs found via the user's target role (e.g. "Data Product Manager")
+        Tier 1 — exact target role + state/city match   (highest priority)
+        Tier 2 — exact target role + country match
+        Tier 3 — AI-adjacent role + state/city match
+        Tier 4 — AI-adjacent role + country match       (widest)
 
-        Both search terms are always fetched across every user location.
-        When no target_role is set the full 10-job budget goes to the track bucket.
+        Up to _PER_TIER_CAP results per tier; de-duplication enforced across all tiers.
         """
         search_locations = [_readable_location(loc) for loc in locations] if locations else ["remote"]
-        allowed_set = {loc.lower() for loc in search_locations}
+        country_set = {loc.lower() for loc in search_locations}
+        states_set = {s.lower() for s in states} if states else set()
 
-        # Identify the target-role term so we can route results to the right bucket.
         role_term: str = ""
-        role_anchor: str = ""  # simplified 2-word form, e.g. "product manager"
+        role_anchor: str = ""
         if profile and isinstance(profile.target_role, str) and profile.target_role.strip():
             role_term = profile.target_role.strip().lower()
             _rw = [w for w in role_term.split() if len(w) > 1]
             if len(_rw) >= 3:
                 role_anchor = " ".join(_rw[-2:])
 
-        search_terms = self._build_job_search_terms(
-            tracks,
-            profile=profile,
-            queries_per_category=queries_per_category,
-        )
-
-        # Always include: 1 track term + full role term + anchor (if any).
-        # queries_per_category may add more track keywords on top of that.
+        search_terms = self._build_job_search_terms(tracks, profile=profile, queries_per_category=queries_per_category)
         role_terms_count = (1 if role_term else 0) + (1 if role_anchor else 0)
         max_terms = max(1 + role_terms_count, queries_per_category) if role_term else queries_per_category
 
-        # Two-phase fetch strategy:
-        #
-        # Phase 1 — Location-aware sources (Indeed, LinkedIn, SmartRecruiters, Workable)
-        # Run once per user country so each market is queried with location context.
-        # Each search term gets its own result budget (results_per_source per term)
-        # so the role and anchor terms are never crowded out by track results.
-        #
-        # Phase 2 — Company boards (Greenhouse, Ashby, Lever, Rippling)
-        # Fetched ONCE (not per country) because these boards return company-global
-        # job listings regardless of the requested location.  Re-fetching per country
-        # wastes API calls and returns identical data.  Location filtering is applied
-        # downstream by _job_location_allowed.
+        # ── Phase 1: fetch from location-aware sources (one pass per country) ──────
         all_raw_jobs: list[RawJobOpportunity] = []
         loc_ctx_kwargs = {
             "search_terms": search_terms,
             "max_search_terms": max_terms,
-            # Per-term budget: each term gets results_per_source slots so later
-            # terms (role, anchor) are not crowded out by the first track term.
             "max_results_per_source": DEFAULT_MAX_RESULTS_PER_SOURCE * max_terms,
         }
-
         location_sources = self._job_registry.build_location_sources()
         for loc in search_locations:
             loc_ctx = JobDiscoveryContext(
@@ -1168,7 +1256,7 @@ class OpportunityDiscoveryEngine:
                 elif isinstance(result, Exception):
                     logger.warning("location_source_failed", source=src.name, location=loc, error=repr(result))
 
-        # Company boards — fetch once, filter by all user locations downstream.
+        # ── Phase 2: company ATS boards (fetched once, location filtered downstream) ─
         board_ctx = JobDiscoveryContext(
             primary_location=search_locations[0] if search_locations else "remote",
             indeed_country=self._indeed_country(search_locations),
@@ -1185,10 +1273,7 @@ class OpportunityDiscoveryEngine:
             elif isinstance(result, Exception):
                 logger.warning("board_source_failed", source=src.name, error=repr(result))
 
-        # Dedicated remote search for the role term.
-        # Fills the role bucket when country-specific sources return nothing for
-        # the target role (e.g. "Data Product Manager" in NG/GH markets).
-        # Only remote/hybrid-tagged jobs are allowed through from this batch.
+        # ── Phase 3: dedicated remote search for target role (fills Tier 1/2 gaps) ──
         remote_role_urls: set[str] = set()
         if role_term:
             role_search_terms = [t for t in search_terms if t.strip().lower() == role_term]
@@ -1213,15 +1298,12 @@ class OpportunityDiscoveryEngine:
                         logger.warning("remote_role_source_failed", source=src.name, role=role_term, error=repr(result))
 
         primary_location = search_locations[0] if search_locations else "remote"
-        all_jobs: list[dict[str, Any]] = []
 
-        # Bucket caps: 5 track jobs + 5 role jobs = 10 per run.
-        # If no target role, allow up to 10 track jobs.
-        per_bucket = 5
-        track_count = 0
-        role_count = 0
-        track_cap = per_bucket if role_term else per_bucket * 2
-        role_cap = per_bucket if role_term else 0
+        # ── Tier classification ───────────────────────────────────────────────────
+        # First pass: split each raw job into role-match vs track-candidate and
+        # check state / country location for each.
+        role_candidates: list[tuple[RawJobOpportunity, bool]] = []  # (raw, state_ok)
+        track_candidates: list[tuple[RawJobOpportunity, bool]] = []  # (raw, state_ok)
 
         for raw in all_raw_jobs:
             if not raw.url or raw.url in seen_urls:
@@ -1230,109 +1312,113 @@ class OpportunityDiscoveryEngine:
             _sq = (raw.source_query or "").strip().lower()
             is_role_job = bool(
                 role_term
-                and (
-                    _sq in {role_term, role_anchor}
-                    # Company boards (Greenhouse/Ashby/Lever) don't set source_query.
-                    # Route their jobs to the role bucket when the title matches the
-                    # role anchor, so London PM listings from Monzo/Revolut etc. reach
-                    # the role bucket instead of being dropped at the relevance gate.
-                    or (not _sq and _role_matches_title(role_term, raw.title))
-                )
+                and (_sq in {role_term, role_anchor} or (not _sq and _role_matches_title(role_term, raw.title)))
             )
 
-            # Location filter: always applied to track jobs.
-            # For role jobs from the dedicated remote search we also allow jobs
-            # from major English-speaking PM hiring markets (US, Canada,
-            # Australia, Ireland) so that users in NG/GH — where PM roles are
-            # rare — can still see realistic target-role listings. Jobs from
-            # unrelated markets (India, Southeast Asia, etc.) are still excluded.
+            # Country-level location check (gates entry to any tier).
             is_remote_role = is_role_job and raw.url in remote_role_urls
-            location_ok = self._job_location_allowed(raw.location, allowed_set)
-            if not location_ok and is_remote_role:
-                # For the dedicated remote-role batch, only pass through jobs that
-                # are explicitly remote/hybrid/worldwide — never city-specific jobs
-                # from unrelated markets (US, India, etc.).  Country-specific results
-                # for the user's own markets (NG/GH/GB) already go through the normal
-                # filter above; this bypass is a last-resort fill for truly remote
-                # listings when nothing exists in the user's home markets.
+            country_ok = self._job_location_allowed(raw.location, country_set)
+            if not country_ok and is_remote_role:
                 loc_lower = (raw.location or "").lower()
-                location_ok = not loc_lower or any(
+                country_ok = not loc_lower or any(
                     kw in loc_lower for kw in ("remote", "hybrid", "worldwide", "anywhere")
                 )
-            if not location_ok:
-                logger.debug(
-                    "job_location_filtered",
-                    title=raw.title[:60],
-                    job_location=raw.location,
-                    allowed=list(allowed_set),
-                )
+            if not country_ok:
                 continue
 
-            # Relevance gate: keep if track keywords appear OR the search query
-            # substantially matches the job title.
-            # Role jobs use a stricter anchor check (last 2 words of the role
-            # term must both appear) to prevent generic word overlaps from
-            # admitting unrelated jobs like "Data Scientist" for a
-            # "Data Product Manager" query.
+            # Relevance gate.
             content = f"{raw.title} {raw.description}"
             best_score = Decimal("0.50")
-            best_track = tracks[0] if tracks else ""
             for track in tracks:
-                score = _score_text(content, track)
-                if score > best_score:
-                    best_score = score
-                    best_track = track
+                s = _score_text(content, track)
+                if s > best_score:
+                    best_score = s
 
             if is_role_job:
-                query_relevant = _role_matches_title(role_term, raw.title)
+                relevant = _role_matches_title(role_term, raw.title)
             else:
-                query_relevant = _query_matches_title(raw.source_query or "", raw.title)
+                relevant = _query_matches_title(raw.source_query or "", raw.title)
 
-            if best_score <= Decimal("0.50") and not query_relevant:
-                logger.debug(
-                    "job_relevance_filtered",
-                    title=raw.title[:60],
-                    query=raw.source_query,
-                )
+            if best_score <= Decimal("0.50") and not relevant:
                 continue
 
-            if best_score <= Decimal("0.50"):
-                best_score = Decimal("0.60")
-            if is_role_job:
-                if role_count >= role_cap:
-                    continue
-                role_count += 1
-            else:
-                if track_count >= track_cap:
-                    continue
-                track_count += 1
+            state_ok = self._job_location_state_allowed(raw.location, states_set)
 
-            seen_urls.add(raw.url)
-            all_jobs.append(
-                {
-                    "opportunity_type": "job",
-                    "title": raw.title,
-                    "description": raw.description,
-                    "url": raw.url,
-                    "location": raw.location or primary_location,
-                    "event_date": None,
-                    "company": raw.company,
-                    "salary_range": raw.salary_range,
-                    "match_score": best_score,
-                    "matched_track": best_track,
-                    "reason_tags": ["matched_track"],
-                    "_source": raw.source,
-                    "_query": raw.source_query,
-                }
-            )
+            if is_role_job:
+                role_candidates.append((raw, state_ok))
+            else:
+                track_candidates.append((raw, state_ok))
+
+        # AI adjacency check for track candidates (Tiers 3 & 4).
+        track_titles = [raw.title for raw, _ in track_candidates]
+        adjacent_indices = await self._classify_track_adjacent_batch(track_titles, tracks[0] if tracks else "")
+        adjacent_candidates = [
+            (raw, state_ok) for i, (raw, state_ok) in enumerate(track_candidates) if i in adjacent_indices
+        ]
+
+        # ── Build tier buckets ────────────────────────────────────────────────────
+        tier_buckets: dict[int, list[dict[str, Any]]] = {1: [], 2: [], 3: [], 4: []}
+
+        def _make_job(raw: RawJobOpportunity, tier: int, best_track: str, reason_tags: list[str]) -> dict[str, Any]:
+            # Score within the tier's band: base + keyword bonus, capped at tier ceiling.
+            content = f"{raw.title} {raw.description}"
+            kw_bonus = Decimal("0.0")
+            for t in tracks:
+                for kw in _keywords_for_track(t):
+                    if kw.lower() in content.lower():
+                        kw_bonus += Decimal("0.02")
+            score = min(_TIER_BASE_SCORE[tier] + kw_bonus, _TIER_SCORE_CAP[tier])
+            return {
+                "opportunity_type": "job",
+                "title": raw.title,
+                "description": raw.description,
+                "url": raw.url,
+                "location": raw.location or primary_location,
+                "event_date": None,
+                "company": raw.company,
+                "salary_range": raw.salary_range,
+                "match_score": score,
+                "matched_track": best_track,
+                "reason_tags": reason_tags,
+                "tier": tier,
+                "_source": raw.source,
+                "_query": raw.source_query,
+            }
+
+        best_track_name = tracks[0] if tracks else ""
+
+        for raw, state_ok in role_candidates:
+            if raw.url in seen_urls:
+                continue
+            if state_ok and len(tier_buckets[1]) < _PER_TIER_CAP:
+                seen_urls.add(raw.url)
+                tier_buckets[1].append(_make_job(raw, 1, best_track_name, ["matched_target_role", "matched_location"]))
+            elif len(tier_buckets[2]) < _PER_TIER_CAP:
+                seen_urls.add(raw.url)
+                tier_buckets[2].append(_make_job(raw, 2, best_track_name, ["matched_target_role"]))
+
+        for raw, state_ok in adjacent_candidates:
+            if raw.url in seen_urls:
+                continue
+            if state_ok and len(tier_buckets[3]) < _PER_TIER_CAP:
+                seen_urls.add(raw.url)
+                tier_buckets[3].append(_make_job(raw, 3, best_track_name, ["matched_track", "matched_location"]))
+            elif len(tier_buckets[4]) < _PER_TIER_CAP:
+                seen_urls.add(raw.url)
+                tier_buckets[4].append(_make_job(raw, 4, best_track_name, ["matched_track"]))
+
+        all_jobs = tier_buckets[1] + tier_buckets[2] + tier_buckets[3] + tier_buckets[4]
 
         logger.info(
-            "job_discovery_complete",
+            "job_discovery_waterfall_complete",
+            tier1=len(tier_buckets[1]),
+            tier2=len(tier_buckets[2]),
+            tier3=len(tier_buckets[3]),
+            tier4=len(tier_buckets[4]),
             total=len(all_jobs),
-            track_jobs=track_count,
-            role_jobs=role_count,
             tracks=tracks,
             locations=search_locations,
+            states=list(states_set),
         )
         return all_jobs
 
@@ -1388,13 +1474,12 @@ class OpportunityDiscoveryEngine:
                         profile.resident_country = mongo_profile["resident_country"]
                     if not profile.work_countries and mongo_profile.get("work_countries"):
                         profile.work_countries = list(mongo_profile["work_countries"])
+                    if not profile.resident_cities and mongo_profile.get("resident_cities"):
+                        profile.resident_cities = list(mongo_profile["resident_cities"])
+                    if not profile.work_cities and mongo_profile.get("work_cities"):
+                        profile.work_cities = list(mongo_profile["work_cities"])
                     if not profile.target_role and mongo_profile.get("target_role"):
                         profile.target_role = mongo_profile["target_role"]
-                    # Use the s_track-derived track as a final fallback when all
-                    # other resolution paths (LMS API, subscription, prefs) return
-                    # nothing.  This covers users on the ai-mentor plan whose
-                    # subscription.track is null but whose onboarding s_track section
-                    # clearly indicates which path they chose.
                     if not effective_track and mongo_profile.get("active_track"):
                         effective_track = mongo_profile["active_track"]
                         logger.info(
@@ -1422,12 +1507,15 @@ class OpportunityDiscoveryEngine:
         if not locations:
             locations = ["remote"]
 
+        states = self.get_profile_states(profile)
+
         logger.info(
             "discovery_starting",
             user_id=user_id,
             track_count=len(tracks),
             tracks=tracks,
             locations=[_readable_location(loc) for loc in locations],
+            states=states,
         )
 
         # Collect existing URLs to avoid duplicates
@@ -1442,11 +1530,14 @@ class OpportunityDiscoveryEngine:
         event_results: list[dict[str, Any]] = []
         job_results: list[dict[str, Any]] = []
         if opportunity_type in {"all", "event"}:
-            event_results = await self._discover_events(tracks, locations, profile, seen_urls, queries_per_category)
+            event_results = await self._discover_events(
+                tracks, locations, states, profile, seen_urls, queries_per_category
+            )
         if opportunity_type in {"all", "job"}:
             job_results = await self._discover_jobs(
                 tracks,
                 locations,
+                states,
                 profile,
                 seen_urls,
                 queries_per_category,
@@ -1464,6 +1555,7 @@ class OpportunityDiscoveryEngine:
                 "query": parsed.get("_query", ""),
                 "search_locations": [_readable_location(loc) for loc in locations],
                 "reason_tags": parsed.get("reason_tags", ["matched_track"]),
+                "tier": parsed.get("tier", 4),
             }
             if parsed.get("networking_strategy"):
                 meta["networking_strategy"] = parsed["networking_strategy"]

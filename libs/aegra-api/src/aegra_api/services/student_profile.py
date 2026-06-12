@@ -51,6 +51,8 @@ class StudentProfile:
     years_tech: str = ""
     resident_country: str = ""
     work_countries: list[str] = field(default_factory=list)
+    resident_cities: list[str] = field(default_factory=list)
+    work_cities: list[str] = field(default_factory=list)
 
     # Section 4: Goals
     primary_goal: str = ""
@@ -175,6 +177,8 @@ async def fetch_student_profile(user_id: str, auth_token: str) -> StudentProfile
             profile.years_tech = sec2.get("yearsTech", "")
             profile.resident_country = sec2.get("residentCountry", "")
             profile.work_countries = sec2.get("workCountry", []) or []
+            profile.resident_cities = sec2.get("residentCity", []) or []
+            profile.work_cities = sec2.get("workCity", []) or []
 
         # Section 4: Goals
         sec4 = onboarding_data.get("s4", {}) or {}
