@@ -99,7 +99,7 @@ docker compose -f "$COMPOSE_FILE" up -d --no-deps --force-recreate "$SERVICE"
 
 # ─── [5/6] Health check ───────────────────────────────────
 log "[5/6] Waiting for health check..."
-MAX_RETRIES=30   # 2.5 minutes total
+MAX_RETRIES=60   # 5 minutes total
 RETRY=0
 HEALTHY=false
 while [ $RETRY -lt $MAX_RETRIES ]; do
@@ -116,7 +116,7 @@ done
 
 if [ "$HEALTHY" != "true" ]; then
     if [ "$ROLLBACK_SAVED" = "true" ]; then
-        restore_previous "Health check timed out after $((MAX_RETRIES * 5))s"
+        restore_previous "Health check timed out after ${MAX_RETRIES} retries ($((MAX_RETRIES * 5))s)"
     else
         log "!! Health check failed and no rollback image available!"
     fi
