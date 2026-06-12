@@ -4,6 +4,8 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from redis import ConnectionError as RedisConnectionError
+from redis import TimeoutError as RedisTimeoutError
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.models.auth import User
@@ -370,6 +372,76 @@ class TestRestoreTraceContext:
 
         assert call_order == ["clear", "set_trace", "bind"]
 
+    def test_user_metadata_merged_with_system_keys(self) -> None:
+        """job.run_metadata is merged into the trace context metadata."""
+        job = RunJob(
+            identity=RunIdentity(
+                run_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                thread_id="11111111-2222-3333-4444-555555555555",
+                graph_id="test-graph",
+            ),
+            user=User(identity="test-user"),
+            run_metadata={"tenant": "acme", "feature_flag": True},
+        )
+        trace = {"correlation_id": "req-abc"}
+
+        with patch(f"{MODULE}.set_trace_context") as mock_set_trace:
+            _restore_trace_context("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", job, trace)
+
+        metadata = mock_set_trace.call_args.kwargs["metadata"]
+        assert metadata["tenant"] == "acme"
+        assert metadata["feature_flag"] is True
+        # System keys still present
+        assert metadata["run_id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert metadata["thread_id"] == "11111111-2222-3333-4444-555555555555"
+        assert metadata["graph_id"] == "test-graph"
+        assert metadata["original_request_id"] == "req-abc"
+
+    def test_user_metadata_cannot_override_system_keys(self) -> None:
+        """Reserved system keys win on collision; user spoof is dropped."""
+        job = RunJob(
+            identity=RunIdentity(
+                run_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                thread_id="11111111-2222-3333-4444-555555555555",
+                graph_id="test-graph",
+            ),
+            user=User(identity="test-user"),
+            run_metadata={"run_id": "spoofed", "tenant": "acme"},
+        )
+        trace = {"correlation_id": "req-abc"}
+
+        with patch(f"{MODULE}.set_trace_context") as mock_set_trace:
+            _restore_trace_context("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", job, trace)
+
+        metadata = mock_set_trace.call_args.kwargs["metadata"]
+        assert metadata["run_id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert metadata["tenant"] == "acme"
+
+    def test_empty_run_metadata_with_correlation_id_keeps_four_system_keys(self) -> None:
+        """When a correlation-id is present, ``original_request_id`` is
+        included in the metadata alongside the three runtime keys."""
+        job = _make_run_job()  # run_metadata defaults to {}
+        trace = {"correlation_id": "req-abc"}
+
+        with patch(f"{MODULE}.set_trace_context") as mock_set_trace:
+            _restore_trace_context("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", job, trace)
+
+        metadata = mock_set_trace.call_args.kwargs["metadata"]
+        assert set(metadata.keys()) == {"run_id", "thread_id", "graph_id", "original_request_id"}
+
+    def test_missing_correlation_id_omits_original_request_id(self) -> None:
+        """Requests without an upstream correlation-id header should not produce
+        a ``langfuse.trace.metadata.original_request_id=""`` empty attribute."""
+        job = _make_run_job()
+        trace: dict[str, str] = {}  # no correlation_id
+
+        with patch(f"{MODULE}.set_trace_context") as mock_set_trace:
+            _restore_trace_context("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", job, trace)
+
+        metadata = mock_set_trace.call_args.kwargs["metadata"]
+        assert "original_request_id" not in metadata
+        assert set(metadata.keys()) == {"run_id", "thread_id", "graph_id"}
+
 
 # ------------------------------------------------------------------
 # WorkerExecutor.submit
@@ -599,3 +671,72 @@ class TestExecuteWithLease:
             await task  # Completes normally (CancelledError is handled internally)
 
         assert job_task_was_cancelled, "job_task must be cancelled when _execute_with_lease is cancelled"
+
+
+class TestDequeue:
+    """Tests for WorkerExecutor._dequeue BLPOP handling."""
+
+    def _make_executor_with_blpop(self, blpop: AsyncMock) -> WorkerExecutor:
+        executor = WorkerExecutor()
+        executor._poll_postgres = AsyncMock(return_value="from-postgres")  # type: ignore[method-assign]
+        self._client = MagicMock()
+        self._client.blpop = blpop
+        return executor
+
+    @pytest.mark.asyncio
+    async def test_returns_run_id_on_queue_hit(self) -> None:
+        blpop = AsyncMock(return_value=("aegra:worker:queue", "run-123"))
+        executor = self._make_executor_with_blpop(blpop)
+
+        with patch(f"{MODULE}.redis_manager.get_client", return_value=self._client):
+            result = await executor._dequeue()
+
+        assert result == "run-123"
+        executor._poll_postgres.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_blpop_returns_none(self) -> None:
+        blpop = AsyncMock(return_value=None)
+        executor = self._make_executor_with_blpop(blpop)
+
+        with patch(f"{MODULE}.redis_manager.get_client", return_value=self._client):
+            result = await executor._dequeue()
+
+        assert result is None
+        executor._poll_postgres.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_idle_socket_timeout_returns_none_without_fallback(self) -> None:
+        """A blocking BLPOP that hits the socket timeout raises redis TimeoutError
+        (a RedisError subclass). That is a normal idle expiry, not a connectivity
+        failure: it must return None silently, never poll Postgres (GH #bug)."""
+        blpop = AsyncMock(side_effect=RedisTimeoutError("Timeout reading from redis:6379"))
+        executor = self._make_executor_with_blpop(blpop)
+
+        with (
+            patch(f"{MODULE}.redis_manager.get_client", return_value=self._client),
+            patch(f"{MODULE}.logger.warning") as mock_warning,
+        ):
+            result = await executor._dequeue()
+
+        assert result is None
+        executor._poll_postgres.assert_not_awaited()
+        mock_warning.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_connection_error_falls_back_to_postgres(self) -> None:
+        """A genuine Redis failure (connection lost) must still warn and fall
+        back to the Postgres poll so jobs are not stranded."""
+        blpop = AsyncMock(side_effect=RedisConnectionError("Connection refused"))
+        executor = self._make_executor_with_blpop(blpop)
+
+        with (
+            patch(f"{MODULE}.redis_manager.get_client", return_value=self._client),
+            patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock),
+            patch(f"{MODULE}.logger.warning") as mock_warning,
+        ):
+            result = await executor._dequeue()
+
+        assert result == "from-postgres"
+        executor._poll_postgres.assert_awaited_once()
+        mock_warning.assert_called_once()

@@ -16,6 +16,7 @@ from aegra_api.api.accountability import router as accountability_router
 from aegra_api.api.activity_logs import router as activity_logs_router
 from aegra_api.api.assistants import router as assistants_router
 from aegra_api.api.career_advisors import router as career_advisors_router
+from aegra_api.api.crons import router as crons_router
 from aegra_api.api.management import router as management_router
 from aegra_api.api.notifications_ws import router as notifications_ws_router
 from aegra_api.api.opportunities import router as opportunities_router
@@ -40,6 +41,7 @@ from aegra_api.models.errors import AgentProtocolError, get_error_type
 from aegra_api.observability.metrics import setup_prometheus_metrics
 from aegra_api.observability.setup import setup_observability
 from aegra_api.services.broker import broker_manager
+from aegra_api.services.cron_scheduler import cron_scheduler
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.lease_reaper import lease_reaper
@@ -52,6 +54,7 @@ OPENAPI_TAGS: list[dict[str, Any]] = [
     {"name": "Threads", "description": "Accumulated state and outputs from a group of runs."},
     {"name": "Runs", "description": "Invoke a graph on a thread, updating its persistent state."},
     {"name": "Stateless Runs", "description": "Invoke a graph without state or memory persistence."},
+    {"name": "Crons", "description": "Scheduled recurring runs on a cron schedule."},
     {"name": "Store", "description": "Persistent key-value and semantic storage available from any thread."},
     {"name": "Health", "description": "Server health checks and service information."},
     {"name": "Activity Logs", "description": "Track and retrieve activity logs for auditing and monitoring."},
@@ -89,12 +92,16 @@ def _log_connection_help(error: Exception) -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan context manager for startup/shutdown"""
-    # Auto-apply pending database migrations before anything else
-    try:
-        await run_migrations_async()
-    except (ConnectionRefusedError, OSError) as e:
-        _log_connection_help(e)
-        raise
+    # Multi-pod K8s: set RUN_MIGRATIONS_ON_STARTUP=false + run `aegra db upgrade`
+    # out-of-band. See docs/guides/deployment.mdx.
+    if settings.app.RUN_MIGRATIONS_ON_STARTUP:
+        try:
+            await run_migrations_async()
+        except (ConnectionRefusedError, OSError) as e:
+            _log_connection_help(e)
+            raise
+    else:
+        logger.info("skipping startup migrations (RUN_MIGRATIONS_ON_STARTUP=false)")
 
     # Startup: Initialize database and LangGraph components
     try:
@@ -143,13 +150,19 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if settings.redis.REDIS_BROKER_ENABLED:
         await lease_reaper.start()
 
-    # Start Scheduler
+    # Start notification scheduler
     scheduler_service.start()
+
+    # Start cron scheduler (fires due cron jobs)
+    if settings.cron.CRON_ENABLED:
+        await cron_scheduler.start()
 
     yield
 
-    # Shutdown: scheduler → reaper → executor (drains jobs) → broker → Redis → DB
+    # Shutdown order: notification scheduler → cron → reaper → executor (drains jobs) → broker → Redis → DB
     scheduler_service.shutdown()
+    if settings.cron.CRON_ENABLED:
+        await cron_scheduler.stop()
     if settings.redis.REDIS_BROKER_ENABLED:
         await lease_reaper.stop()
     await executor.stop()
@@ -330,7 +343,8 @@ def _include_core_routers(app: FastAPI) -> None:
     3. Threads (with auth)
     4. Runs (with auth)
     5. Stateless Runs (with auth)
-    6. Store (with auth)
+    6. Crons (with auth)
+    7. Store (with auth)
 
     Args:
         app: FastAPI application instance
@@ -340,6 +354,7 @@ def _include_core_routers(app: FastAPI) -> None:
     app.include_router(threads_router, dependencies=auth_dependency, prefix="", tags=["Threads"])
     app.include_router(runs_router, dependencies=auth_dependency, prefix="", tags=["Runs"])
     app.include_router(stateless_runs_router, dependencies=auth_dependency, prefix="", tags=["Stateless Runs"])
+    app.include_router(crons_router, dependencies=auth_dependency, prefix="", tags=["Crons"])
     app.include_router(store_router, dependencies=auth_dependency, prefix="", tags=["Store"])
     app.include_router(activity_logs_router, dependencies=auth_dependency, prefix="", tags=["Activity Logs"])
     app.include_router(management_router, dependencies=auth_dependency, prefix="", tags=["Management"])

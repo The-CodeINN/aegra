@@ -1,6 +1,6 @@
 [project]
 name = "aegra-api"
-version = "0.9.3"
+version = "0.9.21"
 description = "Aegra core API - Self-hosted Agent Protocol server"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -22,6 +22,7 @@ dependencies = [
     "uvicorn[standard]>=0.35.0",
     "pydantic>=2.11.7",
     "pydantic-settings>=2.12.0",
+    "sse-starlette>=3.3.4,<4.0.0",
     # LangGraph
     "langgraph>=1.0.3",
     "langgraph-sdk>=0.3.5",
@@ -63,6 +64,10 @@ dependencies = [
     "aiosmtplib>=3.0.0",
     # Redis (optional broker backend for multi-instance streaming)
     "redis[hiredis]>=5.0.0",
+
+    # Cron expression parsing
+    "croniter>=6.0.0",
+
     # Langfuse
     "langfuse>=3.3.4",
     "pymongo[srv]>=4.16.0",
