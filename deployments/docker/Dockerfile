@@ -69,9 +69,9 @@ COPY auth.py ./auth.py
 COPY examples/ ./examples/
 COPY graphs/ ./graphs/
 
-# Add entrypoint for migrations
+# Add entrypoint for migrations (strip Windows CRLF in case file was edited on Windows)
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 2026
 
