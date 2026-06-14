@@ -22,7 +22,7 @@ from .orm import Base
 class ActionItem(Base):
     __tablename__ = "action_items"
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("public.uuid_generate_v4()::text"))
+    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("gen_random_uuid()::text"))
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     thread_id: Mapped[str | None] = mapped_column(Text, nullable=True)  # Optional link to thread
     description: Mapped[str] = mapped_column(Text, nullable=False)
@@ -52,7 +52,7 @@ class ActionItem(Base):
 class Notification(Base):
     __tablename__ = "notifications"
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("public.uuid_generate_v4()::text"))
+    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("gen_random_uuid()::text"))
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
@@ -104,7 +104,7 @@ class DiscoveredOpportunity(Base):
 
     __tablename__ = "discovered_opportunities"
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("public.uuid_generate_v4()::text"))
+    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("gen_random_uuid()::text"))
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     opportunity_type: Mapped[str] = mapped_column(Text, nullable=False)  # 'event' or 'job'
     title: Mapped[str] = mapped_column(Text, nullable=False)

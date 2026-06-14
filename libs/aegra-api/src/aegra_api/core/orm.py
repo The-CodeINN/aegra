@@ -197,7 +197,7 @@ class ActivityLog(Base):
 
     __tablename__ = "activity_log"
 
-    activity_id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("uuid_generate_v4()::text"))
+    activity_id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("gen_random_uuid()::text"))
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     assistant_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     thread_id: Mapped[str | None] = mapped_column(Text, nullable=True)

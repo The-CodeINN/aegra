@@ -1115,8 +1115,10 @@ class OpportunityDiscoveryEngine:
             # Global sources: one task per query (not per location)
             for q in capped:
                 tasks.append(_fetch_global(q, track))
-            # Location-aware sources: one task per (location, query)
-            for loc in locations:
+            # Location-aware sources: country-level AND city/state-level so that
+            # city-radius searches (Meetup, Eventbrite) surface local events
+            # even when the city is not the country's geographic centre.
+            for loc in [*locations, *states]:
                 for q in capped:
                     tasks.append(_fetch_located(q, loc, track))
 
@@ -1232,7 +1234,9 @@ class OpportunityDiscoveryEngine:
         role_terms_count = (1 if role_term else 0) + (1 if role_anchor else 0)
         max_terms = max(1 + role_terms_count, queries_per_category) if role_term else queries_per_category
 
-        # ── Phase 1: fetch from location-aware sources (one pass per country) ──────
+        # ── Phase 1: fetch from location-aware sources ───────────────────────────
+        # Search at both country AND city/state level so boards that rank by
+        # geography (e.g. Adzuna) surface city-specific listings in Tier 1.
         all_raw_jobs: list[RawJobOpportunity] = []
         loc_ctx_kwargs = {
             "search_terms": search_terms,
@@ -1240,7 +1244,8 @@ class OpportunityDiscoveryEngine:
             "max_results_per_source": DEFAULT_MAX_RESULTS_PER_SOURCE * max_terms,
         }
         location_sources = self._job_registry.build_location_sources()
-        for loc in search_locations:
+        _job_search_locs = [*search_locations, *states] if states else search_locations
+        for loc in _job_search_locs:
             loc_ctx = JobDiscoveryContext(
                 primary_location=loc,
                 indeed_country=self._indeed_country([loc]),

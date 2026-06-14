@@ -421,10 +421,11 @@ class DiscoverySettings(EnvBase):
         search_roots: list[Path] = []
         if _ENV_FILE:
             search_roots.append(Path(_ENV_FILE).resolve().parent)
+        _this_parents = Path(__file__).resolve().parents
         search_roots.extend(
             [
                 Path.cwd(),
-                Path(__file__).resolve().parents[4],
+                *([_this_parents[4]] if len(_this_parents) > 4 else []),
             ]
         )
 
