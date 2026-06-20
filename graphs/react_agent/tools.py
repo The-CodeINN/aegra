@@ -1662,6 +1662,156 @@ async def get_thread_summary_by_title(title: str) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Opportunities service (jobs + events)
+# ---------------------------------------------------------------------------
+try:
+    from aegra_api.core.orm import get_session_maker as _get_session_maker
+    from aegra_api.services.opportunity_service import OpportunityService as _OpportunityService
+
+    OPPORTUNITIES_AVAILABLE = True
+    logger.info("Opportunities service loaded successfully")
+except ImportError as _e:
+    OPPORTUNITIES_AVAILABLE = False
+    logger.warning(f"Opportunities service not available: {_e}. Opportunity tools will be disabled.")
+
+
+async def get_opportunities(
+    opportunity_type: str | None = None,
+    status: str = "new",
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Get the student's personalised job and event opportunities discovered by the platform.
+
+    Returns a ranked list of opportunities matched to the student's learning track.
+    Call this whenever the student asks about job openings, hiring opportunities, events,
+    or wants to know what roles are available for them.
+
+    Args:
+        opportunity_type: Filter by 'job' or 'event'. Omit to return both.
+        status: Which opportunities to show — 'new' (default, includes notified),
+                'saved' (bookmarked), 'applied', or 'dismissed'.
+        limit: How many to return (1–50, default 10).
+    """
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+
+    if not user_id:
+        return {
+            "error": "Authentication required",
+            "message": "Cannot fetch opportunities without user context.",
+        }
+
+    if not OPPORTUNITIES_AVAILABLE:
+        return {
+            "error": "Opportunities service unavailable",
+            "message": "The opportunities backend is not reachable from this environment.",
+        }
+
+    limit = min(max(1, limit), 50)
+    opp_type = opportunity_type.strip().lower() if opportunity_type else None
+    if opp_type not in {None, "job", "event"}:
+        return {"error": "opportunity_type must be 'job', 'event', or omitted for all"}
+
+    try:
+        session_maker = _get_session_maker()
+        async with session_maker() as session:
+            opportunities, total, has_more = await _OpportunityService.list_opportunities(
+                session=session,
+                user_id=user_id,
+                opportunity_type=opp_type,
+                status=status,
+                limit=limit,
+            )
+
+        return {
+            "ok": True,
+            "total": total,
+            "returned": len(opportunities),
+            "has_more": has_more,
+            "status_filter": status,
+            "type_filter": opp_type or "all",
+            "opportunities": [
+                {
+                    "id": opp.id,
+                    "type": opp.opportunity_type,
+                    "title": opp.title,
+                    "company": opp.company,
+                    "location": opp.location,
+                    "url": opp.url,
+                    "salary_range": opp.salary_range,
+                    "match_score": float(opp.match_score) if opp.match_score else None,
+                    "matched_track": opp.matched_track,
+                    "status": opp.status,
+                    "event_date": opp.event_date.isoformat() if opp.event_date else None,
+                    "discovered_at": opp.discovered_at.isoformat() if opp.discovered_at else None,
+                    "description": (opp.description or "")[:400] if opp.description else None,
+                }
+                for opp in opportunities
+            ],
+        }
+
+    except Exception as e:
+        logger.error("Error fetching opportunities for user=%s: %s", user_id, e, exc_info=True)
+        return {"error": "Failed to fetch opportunities", "message": str(e)}
+
+
+async def get_opportunity_strategy(opportunity_id: str) -> dict[str, Any]:
+    """Get the AI-generated application or networking strategy for a specific opportunity.
+
+    For job opportunities this returns a tailored application strategy — how to position
+    the student's skills, what to highlight in a cover letter, and how to approach the role.
+    For events it returns a networking strategy.
+
+    Call this after get_opportunities() when the student wants to act on a specific
+    opportunity and needs personalised guidance on how to pursue it.
+
+    Args:
+        opportunity_id: The ID of the opportunity (from get_opportunities results).
+    """
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+
+    if not user_id:
+        return {
+            "error": "Authentication required",
+            "message": "Cannot fetch strategy without user context.",
+        }
+
+    if not OPPORTUNITIES_AVAILABLE:
+        return {
+            "error": "Opportunities service unavailable",
+            "message": "The opportunities backend is not reachable from this environment.",
+        }
+
+    if not _validate_id(opportunity_id):
+        return {"error": "Invalid opportunity ID", "opportunity_id": opportunity_id}
+
+    try:
+        session_maker = _get_session_maker()
+        async with session_maker() as session:
+            data = await _OpportunityService.get_opportunity_with_strategy(session, opportunity_id, user_id)
+
+        if not data:
+            return {
+                "error": "Opportunity not found",
+                "opportunity_id": opportunity_id,
+                "message": "This opportunity may have expired or doesn't belong to this user.",
+            }
+
+        return {"ok": True, **data}
+
+    except Exception as e:
+        logger.error(
+            "Error fetching strategy for opportunity=%s user=%s: %s",
+            opportunity_id,
+            user_id,
+            e,
+            exc_info=True,
+        )
+        return {"error": "Failed to fetch strategy", "message": str(e)}
+
+
 # Build tools list dynamically based on availability
 TOOLS: list[Callable[..., Any]] = [
     # search,
@@ -1687,3 +1837,8 @@ TOOLS: list[Callable[..., Any]] = [
 if COURSE_CONTENT_AVAILABLE:
     TOOLS.append(search_course_content)
     logger.info("Course search tool enabled")
+
+# Add opportunities tools if the service is available
+if OPPORTUNITIES_AVAILABLE:
+    TOOLS.extend([get_opportunities, get_opportunity_strategy])
+    logger.info("Opportunities tools enabled")

@@ -56,6 +56,8 @@ _PROGRAMMATIC_SAFE_TOOLS = {
     "manage_memory",
     "search_memory",
     "search_past_conversations",
+    "get_opportunities",
+    "get_opportunity_strategy",
 }
 
 _POLICY_OVERRIDES: dict[str, ToolPolicy] = {
@@ -174,6 +176,22 @@ _POLICY_OVERRIDES: dict[str, ToolPolicy] = {
         max_retries=1,
         call_limit=5,
         output_schema_name="ConversationSearchResult",
+    ),
+    "get_opportunities": ToolPolicy(
+        name="get_opportunities",
+        timeout_seconds=15.0,
+        max_retries=2,
+        call_limit=5,
+        output_schema_name="OpportunitiesResult",
+        evidence_required=False,
+    ),
+    "get_opportunity_strategy": ToolPolicy(
+        name="get_opportunity_strategy",
+        timeout_seconds=30.0,
+        max_retries=1,
+        call_limit=5,
+        output_schema_name="OpportunityStrategyResult",
+        evidence_required=False,
     ),
 }
 
