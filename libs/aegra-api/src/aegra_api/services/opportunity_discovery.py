@@ -31,7 +31,13 @@ from aegra_api.core.accountability_orm import (
     UserPreferences,
 )
 from aegra_api.services.advisor_cache import get_cached_learning_track
-from aegra_api.services.opportunity_event_sources import EventbriteSource, LumaSource, MeetupSource, RawEventOpportunity
+from aegra_api.services.opportunity_event_sources import (
+    EventbriteSource,
+    LumaSource,
+    MeetupSource,
+    RawEventOpportunity,
+    TixAfricaSource,
+)
 from aegra_api.services.opportunity_job_sources import (
     DEFAULT_MAX_RESULTS_PER_SOURCE,
     JobDiscoveryContext,
@@ -336,6 +342,7 @@ _TIER_SCORE_CAP: dict[int, Decimal] = {
     4: Decimal("0.59"),
 }
 _PER_TIER_CAP = 5  # max results stored per tier per discovery run
+_MAX_EVENTS_PER_SOURCE = 8  # max events saved per source per discovery run
 
 # Indeed expects specific country strings; map ISO alpha-2 → jobspy/Indeed string
 _INDEED_ALPHA2_MAP: dict[str, str] = {
@@ -504,7 +511,7 @@ class OpportunityDiscoveryEngine:
     """Discovers relevant events and jobs for a user and persists them."""
 
     def __init__(self) -> None:
-        self._event_sources = [EventbriteSource(), MeetupSource(), LumaSource()]
+        self._event_sources = [EventbriteSource(), MeetupSource(), LumaSource(), TixAfricaSource()]
         self._job_registry = JobSourceRegistry(settings.discovery.company_job_boards)
 
     @property
@@ -1014,7 +1021,9 @@ class OpportunityDiscoveryEngine:
         target_role_lower = (profile.target_role or "").lower().strip() if profile else ""
 
         global_sources = [s for s in self._event_sources if s.name == "luma"]
-        location_sources = [s for s in self._event_sources if s.name != "luma"]
+        # Tix Africa filters by country internally — no benefit calling it per city/state.
+        country_sources = [s for s in self._event_sources if s.name == "tix_africa"]
+        location_sources = [s for s in self._event_sources if s.name not in {"luma", "tix_africa"}]
 
         def _parse_raw(
             raw_events: list[RawEventOpportunity],
@@ -1028,7 +1037,7 @@ class OpportunityDiscoveryEngine:
                 seen_urls.add(ev.url)
                 content_lower = f"{ev.title} {ev.description}".lower()
                 kw_score = _score_text(f"{ev.title} {ev.description}", track)
-                if ev.source == "luma" and kw_score <= Decimal("0.50"):
+                if ev.source in {"luma", "tix_africa"} and kw_score <= Decimal("0.50"):
                     kw_score = Decimal("0.58")
                 elif kw_score <= Decimal("0.50"):
                     continue  # not relevant to track
@@ -1108,6 +1117,19 @@ class OpportunityDiscoveryEngine:
                         raw.extend(b)
                 return _parse_raw(raw, track, location)
 
+        async def _fetch_country(query: str, location: str, track: str) -> list[dict[str, Any]]:
+            """Fetch from country-scoped sources (Tix Africa) — once per country, not per city."""
+            async with sem:
+                batches = await asyncio.gather(
+                    *[src.fetch(query, location) for src in country_sources],
+                    return_exceptions=True,
+                )
+                raw: list[RawEventOpportunity] = []
+                for b in batches:
+                    if isinstance(b, list):
+                        raw.extend(b)
+                return _parse_raw(raw, track, location)
+
         tasks = []
         for track in tracks:
             queries = self._build_event_queries(track)
@@ -1115,6 +1137,10 @@ class OpportunityDiscoveryEngine:
             # Global sources: one task per query (not per location)
             for q in capped:
                 tasks.append(_fetch_global(q, track))
+            # Country-scoped sources (Tix Africa): once per country query, not per city.
+            for loc in locations:
+                for q in capped:
+                    tasks.append(_fetch_country(q, loc, track))
             # Location-aware sources: country-level AND city/state-level so that
             # city-radius searches (Meetup, Eventbrite) surface local events
             # even when the city is not the country's geographic centre.
@@ -1535,9 +1561,16 @@ class OpportunityDiscoveryEngine:
         event_results: list[dict[str, Any]] = []
         job_results: list[dict[str, Any]] = []
         if opportunity_type in {"all", "event"}:
-            event_results = await self._discover_events(
+            raw_events = await self._discover_events(
                 tracks, locations, states, profile, seen_urls, queries_per_category
             )
+            # Cap per source so no single platform dominates the dashboard.
+            source_counts: dict[str, int] = {}
+            for ev in sorted(raw_events, key=lambda x: x.get("match_score", Decimal("0")), reverse=True):
+                src = str(ev.get("_source") or "unknown")
+                if source_counts.get(src, 0) < _MAX_EVENTS_PER_SOURCE:
+                    source_counts[src] = source_counts.get(src, 0) + 1
+                    event_results.append(ev)
         if opportunity_type in {"all", "job"}:
             job_results = await self._discover_jobs(
                 tracks,

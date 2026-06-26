@@ -596,3 +596,163 @@ class LumaSource:
 
         logger.info("luma_search_completed", query=query, slug=slug, result_count=len(results))
         return results
+
+
+# ---------------------------------------------------------------------------
+# Tix Africa source — GraphQL API, Africa-focused ticketing platform
+# ---------------------------------------------------------------------------
+
+_TIX_AFRICA_COUNTRY_CODES: dict[str, str] = {
+    "ng": "NG",
+    "nigeria": "NG",
+    "ke": "KE",
+    "kenya": "KE",
+    "za": "ZA",
+    "south africa": "ZA",
+    "gh": "GH",
+    "ghana": "GH",
+    "ug": "UG",
+    "uganda": "UG",
+    "tz": "TZ",
+    "tanzania": "TZ",
+    "rw": "RW",
+    "rwanda": "RW",
+    "et": "ET",
+    "ethiopia": "ET",
+    "eg": "EG",
+    "egypt": "EG",
+    "sn": "SN",
+    "senegal": "SN",
+    "cm": "CM",
+    "cameroon": "CM",
+    "ci": "CI",
+    "ivory coast": "CI",
+    "gb": "GB",
+    "uk": "GB",
+    "united kingdom": "GB",
+}
+
+_TIX_AFRICA_GRAPHQL_URL = "https://core.tix.africa/graphql"
+_TIX_AFRICA_EVENT_BASE = "https://tix.africa/e/"
+
+
+def _tix_africa_search_term(query: str) -> str:
+    """Map a track query to a broad Tix Africa title keyword that returns results."""
+    q = query.lower()
+    if any(kw in q for kw in ("ai", "llm", "machine learning", "deep learning", "mlops")):
+        return "AI"
+    return "tech"
+
+
+_TIX_AFRICA_FILTER_QUERY = (
+    "query filterEvents($country: String, $title: String, $ended: Boolean, "
+    "$discoverable: Boolean, $page: Int, $per: Int) {"
+    " filterEvents(country: $country title: $title ended: $ended"
+    " discoverable: $discoverable page: $page per: $per) {"
+    " slug title kind address locationName startDate eventType headerImage currency"
+    " tickets { edges { node { price status priceWithFees } } }"
+    " } }"
+)
+
+
+class TixAfricaSource:
+    """Fetches events from the Tix Africa GraphQL API (Africa-focused ticketing platform)."""
+
+    name = "tix_africa"
+
+    _HEADERS: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    def _country_code(self, location: str) -> str | None:
+        return _TIX_AFRICA_COUNTRY_CODES.get(location.strip().lower())
+
+    def _min_active_price(self, tickets: dict) -> float | None:
+        prices = [
+            edge["node"]["price"]
+            for edge in (tickets.get("edges") or [])
+            if isinstance(edge.get("node"), dict)
+            and edge["node"].get("status") == "active"
+            and edge["node"].get("price") is not None
+        ]
+        return min(prices) if prices else None
+
+    async def _fetch_page(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        query: str,
+        country: str | None,
+        page: int,
+        per: int,
+    ) -> list[dict]:
+        variables: dict[str, Any] = {"discoverable": True, "ended": False, "page": page, "per": per}
+        if query:
+            variables["title"] = query
+        if country:
+            variables["country"] = country
+
+        resp = await client.post(
+            _TIX_AFRICA_GRAPHQL_URL,
+            json={"operationName": "filterEvents", "query": _TIX_AFRICA_FILTER_QUERY, "variables": variables},
+            headers=self._HEADERS,
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", {}).get("filterEvents") or []
+
+    def _parse_event(self, event: dict, query: str) -> RawEventOpportunity | None:
+        slug = str(event.get("slug") or "").strip()
+        title = str(event.get("title") or "").strip()
+        if not slug or not title:
+            return None
+
+        raw_start = event.get("startDate")
+        event_date = datetime.fromtimestamp(raw_start, tz=UTC) if isinstance(raw_start, (int, float)) else None
+
+        return RawEventOpportunity(
+            title=title,
+            url=_TIX_AFRICA_EVENT_BASE + slug,
+            description="",
+            location=str(event.get("address") or event.get("locationName") or "").strip(),
+            event_date=event_date,
+            source=self.name,
+            source_query=query,
+            metadata={
+                "kind": event.get("kind"),
+                "event_type": event.get("eventType"),
+                "header_image": event.get("headerImage"),
+                "min_price": self._min_active_price(event.get("tickets") or {}),
+                "currency": str(event.get("currency") or "").strip(),
+            },
+        )
+
+    async def fetch(self, query: str, location: str) -> list[RawEventOpportunity]:
+        country = self._country_code(location)
+        results: list[RawEventOpportunity] = []
+        seen_urls: set[str] = set()
+
+        search_term = _tix_africa_search_term(query)
+        try:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                for page in range(1, 3):
+                    events = await self._fetch_page(client, query=search_term, country=country, page=page, per=20)
+                    if not events:
+                        break
+                    for raw in events:
+                        ev = self._parse_event(raw, query)
+                        if ev and ev.url not in seen_urls:
+                            seen_urls.add(ev.url)
+                            results.append(ev)
+        except Exception as exc:
+            logger.warning(
+                "tix_africa_fetch_failed",
+                query=query,
+                location=location,
+                error=repr(exc),
+                error_type=type(exc).__name__,
+            )
+
+        logger.info("tix_africa_search_completed", query=query, location=location, result_count=len(results))
+        return results
