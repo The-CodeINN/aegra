@@ -85,8 +85,18 @@ def test_build_cached_system_prompt_places_cache_point_between_blocks_bedrock() 
     )
     blocks = message.content
     assert blocks[0] == {"text": "STATIC CONTENT"}
-    assert blocks[1] == {"cachePoint": {"type": "default"}}
+    # ttl must be carried on the block: a bare cachePoint defaults to 5m, and
+    # Bedrock rejects the 1h points langchain-aws appends after a 5m one
+    # (verified against the live Converse API).
+    assert blocks[1] == {"cachePoint": {"type": "default", "ttl": "1h"}}
     assert blocks[2] == {"text": "DYNAMIC CONTENT"}
+
+
+def test_build_cached_system_prompt_bedrock_omits_ttl_for_5m_default() -> None:
+    message = prompt_caching.build_cached_system_prompt(
+        "STATIC CONTENT", "DYNAMIC CONTENT", provider="bedrock", cache_ttl="5m"
+    )
+    assert message.content[1] == {"cachePoint": {"type": "default"}}
 
 
 def test_build_cached_system_prompt_falls_back_to_plain_string_for_other_providers() -> None:

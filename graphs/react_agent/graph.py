@@ -402,7 +402,11 @@ async def _invoke_integrated_agent(
     runtime_tools, _ = _resolve_runtime_tooling(runtime)
     provider_kind = _prompt_caching.resolve_provider_kind(runtime.context.model)
     if runtime.context.anthropic_prompt_caching_enabled:
-        runtime_tools = _prompt_caching.tag_last_tool_for_caching(runtime_tools, provider=provider_kind)
+        runtime_tools = _prompt_caching.tag_last_tool_for_caching(
+            runtime_tools,
+            provider=provider_kind,
+            cache_ttl=runtime.context.anthropic_prompt_caching_ttl,
+        )
     agent = create_agent(
         model=_build_runtime_model(runtime),
         tools=runtime_tools,
@@ -1606,7 +1610,9 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
     # logged a task via the manage_task hot path this turn, so a task is never
     # double-written.
     if not state.agent_wrote_task:
-        _task_model = _build_runtime_model(runtime)
+        # Cheap model on purpose: this is a small JSON extraction, matching the
+        # session-memory extraction convention — not worth full-model price per turn.
+        _task_model = load_chat_model(runtime.context.guardrail_model)
         _task_messages = _normalize_messages_for_memory(list(state.messages))
         _advisor = runtime.context.advisor or {}
         _advisor_persona = _advisor.get("name", "").split()[0] if _advisor.get("name") else None

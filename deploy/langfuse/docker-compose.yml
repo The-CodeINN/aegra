@@ -1,0 +1,216 @@
+# Self-hosted Langfuse v3 observability stack for ai-service tracing (spec Item 0).
+#
+# ai-service ships OTel spans to langfuse-web at /api/public/otel/v1/traces
+# (langfuse.py, x-langfuse-ingestion-version: 4) — a v3-only endpoint, hence v3.
+# Blob storage is RustFS (S3-compatible, Apache 2.0) instead of MinIO.
+#
+# Run:  cp .env.example .env  &&  <fill secrets>  &&  docker compose up -d
+# The langfuse project/API keys are bootstrapped headless via LANGFUSE_INIT_*.
+
+name: langfuse
+
+services:
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:3
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
+      NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      SALT: ${SALT}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-false}
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${REDIS_AUTH}
+      # --- Blob storage (RustFS, S3-compatible) ---
+      LANGFUSE_S3_EVENT_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${S3_BUCKET}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${S3_REGION}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://rustfs:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${S3_BUCKET}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${S3_REGION}
+      # External endpoint = browser-reachable RustFS S3 (presigned media URLs).
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${S3_EXTERNAL_ENDPOINT}
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
+      LANGFUSE_S3_BATCH_EXPORT_BUCKET: ${S3_BUCKET}
+      LANGFUSE_S3_BATCH_EXPORT_REGION: ${S3_REGION}
+      LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: http://rustfs:9000
+      LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: ${S3_EXTERNAL_ENDPOINT}
+      LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY}
+      LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY}
+      LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
+      # --- Headless bootstrap: creates org/project/user + API keys on first boot ---
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD}
+
+  langfuse-worker:
+    image: docker.io/langfuse/langfuse-worker:3
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:3030:3030"
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
+      SALT: ${SALT}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-false}
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${REDIS_AUTH}
+      LANGFUSE_S3_EVENT_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${S3_BUCKET}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${S3_REGION}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://rustfs:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${S3_BUCKET}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${S3_REGION}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${S3_EXTERNAL_ENDPOINT}
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+
+  postgres:
+    image: docker.io/postgres:17
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server
+    restart: always
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9004:9000"
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  redis:
+    image: docker.io/redis:7
+    restart: always
+    command: >
+      --requirepass ${REDIS_AUTH} --maxmemory-policy noeviction
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_AUTH}", "--no-auth-warning", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  # S3-compatible blob storage (RustFS) — replaces Langfuse's default MinIO.
+  # S3 API on host 9090, console on host 9091 (mirrors Langfuse's MinIO ports).
+  rustfs:
+    image: rustfs/rustfs:latest
+    restart: always
+    ports:
+      - "9090:9000"
+      - "127.0.0.1:9091:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
+      RUSTFS_CONSOLE_ENABLE: "true"
+    volumes:
+      - langfuse_rustfs_data:/data
+
+  # One-shot: create the langfuse bucket via the S3 API, then exit.
+  # RustFS uses erasure-coded on-disk layout, so a pre-made directory is not a
+  # bucket — the bucket must be created through the API.
+  rustfs-init:
+    image: amazon/aws-cli:latest
+    depends_on:
+      - rustfs
+    entrypoint: /bin/sh
+    environment:
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY}
+      AWS_DEFAULT_REGION: ${S3_REGION}
+    command:
+      - -c
+      - |
+        until aws --endpoint-url http://rustfs:9000 s3 ls >/dev/null 2>&1; do
+          echo "waiting for rustfs S3 API..."; sleep 2;
+        done
+        aws --endpoint-url http://rustfs:9000 s3 mb "s3://${S3_BUCKET}" || true
+        echo "bucket ${S3_BUCKET} ready"
+
+volumes:
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_redis_data:
+  langfuse_rustfs_data:

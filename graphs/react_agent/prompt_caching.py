@@ -83,10 +83,17 @@ def build_cached_system_prompt(
         )
 
     if provider == "bedrock":
+        # TTL must match the cache points langchain-aws appends via the
+        # cache_control bind kwarg (tools + last message): Bedrock rejects a
+        # longer-TTL block after a shorter one, and a bare cachePoint defaults
+        # to 5m. Mirror _apply_cache_points: omit ttl only for the 5m default.
+        cache_point: dict[str, Any] = {"type": "default"}
+        if cache_ttl and cache_ttl != "5m":
+            cache_point["ttl"] = cache_ttl
         return SystemMessage(
             content=[
                 {"text": static_block},
-                {"cachePoint": {"type": "default"}},
+                {"cachePoint": cache_point},
                 {"text": dynamic_block},
             ]
         )
