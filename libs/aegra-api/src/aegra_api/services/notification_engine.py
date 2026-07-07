@@ -20,7 +20,6 @@ Responsibilities
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -215,6 +214,11 @@ class NotificationEngine:
                     ctx_parts.append(f"Current streak: {context['current_streak']} days")
                 if context.get("biggest_challenge"):
                     ctx_parts.append(f"Recent struggle: {context['biggest_challenge']}")
+                # Named tasks (spec Item 7) — lets a rewrite reference a specific
+                # commitment instead of staying generic even with persona voicing applied.
+                overdue_details = context.get("overdue_task_details") or []
+                if overdue_details:
+                    ctx_parts.append(f"Overdue task: {overdue_details[0].get('description')}")
 
             context_str = "\n".join(ctx_parts) if ctx_parts else "No additional context."
 
@@ -235,6 +239,8 @@ class NotificationEngine:
                             f"\n\nStudent context:\n{context_str}\n\n"
                             "Rewrite the following notification message in your voice. "
                             "Use the student's first name if available. "
+                            "If an overdue task is listed above, name it specifically instead of "
+                            "leaving the message generic — that's more useful than tone alone. "
                             "Keep it under 160 characters. "
                             "Reply with ONLY the rewritten message, nothing else."
                         )
@@ -582,6 +588,12 @@ class NotificationEngine:
         tasks_done = student_context.get("tasks_completed_this_week", 0)
         overdue = student_context.get("overdue_tasks", 0)
         pending = student_context.get("pending_tasks", 0)
+        # Named tasks, not just counts (spec Item 7) — see
+        # SchedulerService._build_student_context, which reads these from the
+        # same AccountabilityService.get_open_and_overdue query the live agent
+        # uses for conversation-start injection.
+        overdue_task_details = student_context.get("overdue_task_details") or []
+        pending_task_details = student_context.get("pending_task_details") or []
         goal = student_context.get("primary_goal") or ""
         # Course progress fields from MongoDB enrollment data
         enrolled_course = student_context.get("enrolled_course") or ""
@@ -591,6 +603,7 @@ class NotificationEngine:
         last_active_in_course = student_context.get("last_active_in_course") or ""
 
         day_name = datetime.now(UTC).strftime("%A")
+        has_escalated_task = any(t.get("miss_count", 0) >= 2 for t in overdue_task_details)
 
         try:
             from langchain_aws import ChatBedrockConverse
@@ -608,9 +621,24 @@ class NotificationEngine:
                 f"Learning track: {track}\n"
                 f"Streak: {streak} day{'s' if streak != 1 else ''}\n"
                 f"Tasks completed this week: {tasks_done}\n"
-                f"Overdue tasks: {overdue}\n"
-                f"Pending tasks: {pending}\n"
             )
+            if overdue_task_details:
+                data_summary += "Overdue tasks (name these specifically, do not just say a count):\n"
+                for t in overdue_task_details:
+                    data_summary += (
+                        f"  - {t.get('description')} (due {t.get('due_date') or 'unspecified'}, "
+                        f"missed {t.get('miss_count', 0)} time(s))\n"
+                    )
+            elif overdue:
+                # Counts without names shouldn't normally happen once callers pass
+                # *_task_details, but don't silently drop the signal if it does.
+                data_summary += f"Overdue tasks: {overdue} (no task names available)\n"
+            if pending_task_details:
+                data_summary += "Other open tasks:\n"
+                for t in pending_task_details:
+                    data_summary += f"  - {t.get('description')} (due {t.get('due_date') or 'unspecified'})\n"
+            elif pending:
+                data_summary += f"Pending tasks: {pending} (no task names available)\n"
             if goal:
                 data_summary += f"Career goal / target role: {goal}\n"
             if enrolled_course:
@@ -624,6 +652,22 @@ class NotificationEngine:
             if last_active_in_course:
                 data_summary += f"Last active in course: {last_active_in_course}\n"
 
+            task_instruction = (
+                "If they have overdue tasks, name them specifically by description — never say only "
+                "'you have N overdue tasks'. "
+            )
+            if has_escalated_task:
+                task_instruction += (
+                    "At least one overdue task has been missed 2+ times — do NOT re-list it as a "
+                    "reminder again. Instead, ask what's actually blocking it and offer to help solve "
+                    "that, not just repeat the ask. "
+                )
+            if not overdue_task_details and not pending_task_details and not overdue and not pending:
+                task_instruction += (
+                    "There are no open tasks right now — say so honestly and suggest ONE concrete next "
+                    "step to set as a new task. Do NOT invent or imply an existing task that isn't listed above. "
+                )
+
             resp = await llm.ainvoke(
                 [
                     SystemMessage(
@@ -633,12 +677,12 @@ class NotificationEngine:
                             f"Tone: {persona['tone']}.\n"
                             f"Use these emojis sparingly (1–2 max): {persona['emoji']}.\n\n"
                             "Write a short, PERSONALISED career check-in message for the student below. "
-                            "Use THEIR specific data — streak, tasks completed, overdue count, course name, "
+                            "Use THEIR specific data — streak, tasks completed, named overdue tasks, course name, "
                             "progress percentage, lessons completed, and hours watched — to make the message "
                             "feel genuinely written for them, not a generic template. "
+                            f"{task_instruction}"
                             "If they have a streak, celebrate it. "
                             "If they've made real course progress, mention the actual percentage or lessons. "
-                            "If they have overdue tasks, gently acknowledge it and suggest one concrete small step. "
                             "If they have a career goal, tie their current progress back to that goal. "
                             "If they're doing well, challenge them toward the next milestone. "
                             "Keep it to 3–5 sentences. "
@@ -652,7 +696,8 @@ class NotificationEngine:
             body = resp.content.strip()
         except Exception as e:
             logger.warning("personalized_email_generation_failed", persona=persona_name, error=str(e))
-            # Graceful fallback — still references real numbers, no generic filler
+            # Graceful fallback — still references real task names when available,
+            # never a fabricated one, and never just a bare count when we have names.
             if streak > 0:
                 body = (
                     f"You're on a {streak}-day streak on your {track} journey — "
@@ -668,16 +713,21 @@ class NotificationEngine:
                 if total_watched_hours:
                     body += f" and {total_watched_hours}h watched"
                 body += " — the finish line is closer than it feels. "
-            if overdue:
-                body += (
-                    f"You have {overdue} overdue task{'s' if overdue != 1 else ''} — "
-                    "tackling even one today would be a win. "
-                )
+            if overdue_task_details:
+                names = ", ".join(t.get("description", "") for t in overdue_task_details[:2])
+                if has_escalated_task:
+                    body += f"'{names}' has stalled a few times now — what's actually in the way? Let's solve that together. "
+                else:
+                    body += f"'{names}' is still open — tackling it today would be a real win. "
+            elif overdue:
+                body += f"You have {overdue} overdue task{'s' if overdue != 1 else ''} — tackling even one today would be a win. "
             elif tasks_done:
                 body += (
                     f"You completed {tasks_done} task{'s' if tasks_done != 1 else ''} this week — "
                     "keep the momentum going."
                 )
+            elif not pending_task_details and not pending:
+                body += "You don't have any open tasks right now — want to set one together for this week? "
             if goal:
                 body += f" Every step you take brings you closer to becoming a {goal}."
             body += f"\n{persona['sign_off']}"
@@ -703,21 +753,32 @@ class NotificationEngine:
         check_frequency: bool = True,
         student_context: dict[str, Any] | None = None,
         email_body_override: str | None = None,
+        advisor_persona: str | None = None,
     ) -> Notification | None:
-        """``email_body_override`` lets callers supply a pre-generated, longer email body.
-
-        When set it is used exclusively for the email channel; the in-app / push
-        notification still shows ``content`` (potentially rewritten by
-        ``generate_persona_message``).  This avoids double LLM calls when the
-        personalised email body was already generated before ``create_notification``
-        was called.
-        """
         """Create a notification with frequency checks, persona rewriting, and multi-channel delivery.
 
         Per spec §3.1, delivers via:
         1. In-app notification
         2. Web push (if subscribed)
         3. Email (if enabled and email available)
+
+        ``email_body_override`` lets callers supply a pre-generated, longer email
+        body. When set it is used exclusively for the email channel; the in-app /
+        push notification still shows ``content`` (potentially rewritten by
+        ``generate_persona_message``). This avoids double LLM calls when the
+        personalised email body was already generated before this call.
+
+        ``advisor_persona`` is the AUTHORITATIVE persona for the email sign-off.
+        Distinct from ``persona`` (which additionally triggers an in-app content
+        rewrite via ``generate_persona_message``) because some callers want the
+        in-app rewrite skipped (body already personalised) while still needing
+        the correct advisor identity on the email. Defaults to ``persona`` when
+        not given, so existing call sites that only pass ``persona`` are
+        unaffected. Previously ``_send_email_notification`` re-resolved the
+        advisor independently via its own Mongo lookup — a second, disconnected
+        resolution that could disagree with whatever persona the caller had
+        already correctly resolved, producing an email whose body voice and
+        sign-off named different advisors.
         """
         if check_frequency:
             # Check fatigue first
@@ -808,7 +869,7 @@ class NotificationEngine:
                 content=content,
                 category=category,
                 action_buttons=action_buttons,
-                persona=persona or DEFAULT_PERSONA,
+                persona=advisor_persona or persona or DEFAULT_PERSONA,
                 student_context=student_context,
                 email_body_override=email_body_override,
             )
@@ -878,26 +939,12 @@ class NotificationEngine:
             logger.debug("email_skipped_no_address", user_id=user_id, category=category)
             return
 
-        # Resolve the actual advisor name for this user (based on learning track)
-        # instead of using the default "Alexandra" or whatever was passed in.
-        # This ensures emails always show the correct advisor persona.
-        try:
-            from aegra_api.data import get_advisor_by_track, get_default_advisor
-            from aegra_api.services.course_content import get_course_content_mongo_client
-
-            advisor_first_name = DEFAULT_PERSONA
-            mongo_client = get_course_content_mongo_client()
-            raw_track = await asyncio.to_thread(mongo_client.get_learning_track, user_id)
-            if raw_track:
-                normalised = raw_track.lower().strip().replace(" ", "-")
-                advisor = get_advisor_by_track(normalised)
-                if advisor:
-                    advisor_first_name = advisor["name"].split()[0]
-            else:
-                advisor_first_name = get_default_advisor()["name"].split()[0]
-        except Exception as exc:
-            logger.debug("advisor_resolve_failed_in_email", user_id=user_id, error=str(exc))
-            advisor_first_name = DEFAULT_PERSONA
+        # Use the persona the caller already resolved — do NOT re-resolve here.
+        # This used to independently re-derive the advisor from the student's
+        # learning track via a second Mongo lookup, which could disagree with
+        # whatever persona voiced the body, producing an email where the body
+        # and sign-off named different advisors (spec Item 7).
+        advisor_first_name = persona or DEFAULT_PERSONA
 
         subject = f"[DeDataHub] {title}"
         # Use pre-generated personalised body when available; otherwise use

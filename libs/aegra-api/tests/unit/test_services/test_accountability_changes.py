@@ -161,6 +161,11 @@ class TestBuildStudentContextEnrollment:
         count_result = MagicMock()
         count_result.scalar.return_value = 0
 
+        # AccountabilityService.get_open_and_overdue's own query (spec Item 7:
+        # _build_student_context now also fetches named tasks, not just counts).
+        open_tasks_result = MagicMock()
+        open_tasks_result.scalars.return_value.all.return_value = []
+
         session.execute = AsyncMock(
             side_effect=[
                 prefs_result,  # UserPreferences
@@ -168,6 +173,7 @@ class TestBuildStudentContextEnrollment:
                 count_result,  # completed tasks
                 count_result,  # overdue tasks
                 count_result,  # pending tasks
+                open_tasks_result,  # AccountabilityService.get_open_and_overdue
             ]
         )
         return session

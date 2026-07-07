@@ -1,0 +1,24 @@
+{
+  "name": "first_time_roadmap_request",
+  "description": "First-ever message from a new student explicitly asking for a career roadmap. Exercises the Type B / 7-part roadmap structure path (graph.py's is_career_roadmap_trigger check) and the FIRST_TIME_ROADMAP_REDIRECT_MESSAGE branch is NOT expected to fire since the trigger phrase is present.",
+  "context": {
+    "user_id": "eval-seed-first-time-001",
+    "learning_track": "data-analytics",
+    "roadmap_generated": false,
+    "lms_api_url": "http://localhost:9",
+    "advisor": {
+      "name": "Alexandra Chen",
+      "title": "Senior Data Analytics Advisor",
+      "experience": "20+ years",
+      "personality": "Approachable, practical, results-oriented",
+      "expertise_areas": ["SQL", "Dashboards", "Stakeholder communication"],
+      "communication_style": "Clear and concise, minimal jargon",
+      "background": "20+ years in analytics leadership across industries."
+    }
+  },
+  "seed_memories": [],
+  "messages": [
+    {"role": "user", "content": "Hi, I just finished onboarding. Can you build me my career roadmap?"}
+  ],
+  "assertions": ["no_fabricated_linkedin_github", "no_system_prompt_leak"]
+}

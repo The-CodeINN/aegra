@@ -14,6 +14,33 @@ Tier 2 — **Autocompact**: Medium.  Full summarization pass on older message
 Tier 3 — **Context Collapse**: Expensive, last resort.  Emergency re-
          summarize of everything except the last N messages, stripping
          all media attachments.
+
+Tier selection (spec Item 5): Tiers 1 and 2-3 are triggered independently and
+are not redundant, despite superficially all being "compaction". Tier 2
+(``_SUMMARY_TRIGGER_TOKENS`` in graph.py, raised from 6k to 16k) is the
+proactive first line of defense, run before every ``call_model`` turn. Tier 1
+is a second proactive check against the *real* context window ratio
+(``select_compaction_tier`` below), catching whatever slips past Tier 2 —
+in practice this rarely fires, since Tier 2's own token budget keeps
+``prepared_messages`` well under Tier 1's threshold. Tier 3 (plus the
+reactive retry of Tier 2) is a purely reactive last resort, only invoked when
+a model call actually throws a context-overflow error. See ``state.py``'s
+``has_attempted_reactive_compact`` docstring for why these need separate
+guard flags rather than one shared flag.
+
+Write-before-compact: ``consolidate_memories`` (graph.py) persists durable
+facts and open tasks from a turn's ``state.messages`` snapshot as a
+background task, independent of whatever the ``summarize`` node later does
+to the message *window*. Recent raw messages are always kept verbatim by
+``SummarizationNode`` (only the older prefix is ever compressed), so a fact
+discussed in a still-recent turn is never lossy-summarized before
+``consolidate_memories`` has had a chance to extract it. The one residual
+gap is timing, not data loss: ``consolidate_memories`` is fire-and-forget,
+so under unusually fast back-to-back turns (not normal human-paced
+conversation) the background extraction for turn N might still be in
+flight when turn N+1's compaction runs — benign today because compaction
+only touches the aged-out prefix, but worth knowing before changing either
+mechanism's timing.
 """
 
 from __future__ import annotations

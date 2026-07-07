@@ -126,18 +126,33 @@ class State(InputState):
     Set to ``True`` after the first context-overflow recovery attempt inside
     ``call_model``.  Prevents an infinite retry loop when the model context
     is too large even after summarization.
+
+    Spec Item 5 note: this, ``has_attempted_context_collapse``, and
+    ``has_attempted_microcompact`` gate three DIFFERENT trigger conditions,
+    not three copies of the same one — they are not redundant with each
+    other. ``has_attempted_microcompact`` gates a *proactive* check (ratio of
+    tokens to the real context window, run before every model call).
+    ``has_attempted_reactive_compact``/``has_attempted_context_collapse`` gate
+    a *reactive* fallback chain that only runs when a model call actually
+    throws a context-overflow error — a last-resort safety net, independent
+    of the ``summarize`` node's own proactive ``_SUMMARY_TRIGGER_TOKENS``
+    check. Collapsing these into one flag would either weaken the emergency
+    path or make the proactive check fire on every reactive retry.
     """
 
     has_attempted_context_collapse: bool = field(default=False)
     """
     Set to ``True`` after the first context collapse (emergency compaction).
-    Prevents infinite collapse retries.
+    Prevents infinite collapse retries. See ``has_attempted_reactive_compact``
+    for why this is a distinct flag, not a duplicate.
     """
 
     has_attempted_microcompact: bool = field(default=False)
     """
     Set to ``True`` after the first microcompact pass to avoid repeating
-    the same compression within the same error-recovery cycle.
+    the same compression within the same error-recovery cycle. See
+    ``has_attempted_reactive_compact`` for why this is a distinct flag,
+    not a duplicate.
     """
 
     session_cost: Annotated[SessionCost, merge_session_cost] = field(default_factory=SessionCost)
@@ -179,4 +194,12 @@ class State(InputState):
     path.  When set, ``consolidate_memories`` skips background extraction
     to avoid duplication (ported from Claude-code's mutual exclusion pattern).
     Reset to ``False`` at the start of each turn.
+    """
+
+    agent_wrote_task: bool = field(default=False)
+    """
+    Set to ``True`` when the agent called ``manage_task`` during the hot path
+    (spec Item 2). Mirrors ``agent_wrote_memory``: when set, the cold-path
+    task extraction in ``consolidate_memories`` is skipped so a task the agent
+    already logged explicitly is never double-written. Reset each turn.
     """

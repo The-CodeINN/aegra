@@ -9,6 +9,7 @@ Enhanced with:
 """
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -25,6 +26,23 @@ from aegra_api.core.accountability_orm import (
 )
 
 logger = structlog.getLogger(__name__)
+
+# Status values an open/in-progress task can be in. "pending" is this
+# table's existing name for what the agent optimisation spec calls "open" —
+# kept as-is rather than renamed, to avoid a data migration; "abandoned" and
+# "renegotiated" are new terminal-ish states the agent can set directly.
+OPEN_STATUSES = ("pending", "in_progress")
+
+
+@dataclass(kw_only=True)
+class OpenTaskGroup:
+    """A user's open tasks, split by due-date status."""
+
+    not_yet_due: list[ActionItem]
+    overdue: list[ActionItem]
+
+    def __bool__(self) -> bool:
+        return bool(self.not_yet_due or self.overdue)
 
 
 class AccountabilityService:
@@ -49,14 +67,111 @@ class AccountabilityService:
         return result.scalars().all()
 
     @staticmethod
-    async def update_action_item_status(session: AsyncSession, item_id: str, user_id: str, status: str) -> dict:
+    async def create_action_item(
+        session: AsyncSession,
+        user_id: str,
+        description: str,
+        *,
+        thread_id: str | None = None,
+        due_date: datetime | None = None,
+        priority: str = "normal",
+        category: str | None = None,
+        advisor_persona: str | None = None,
+        source: str = "conversation",
+        advisor_note: str | None = None,
+    ) -> ActionItem:
+        """Log a task the advisor assigned — the write path TaskMemory was missing.
+
+        Called from both the agent's hot-path tool (assigned during the live
+        conversation) and the cold-path background scan (commitments the
+        agent phrased in prose but didn't log explicitly).
+        """
+        item = ActionItem(
+            user_id=user_id,
+            thread_id=thread_id,
+            description=description,
+            due_date=due_date,
+            priority=priority,
+            category=category,
+            advisor_persona=advisor_persona,
+            source=source,
+            advisor_note=advisor_note,
+        )
+        session.add(item)
+        await session.commit()
+        await session.refresh(item)
+        return item
+
+    @staticmethod
+    async def get_open_and_overdue(session: AsyncSession, user_id: str) -> OpenTaskGroup:
+        """Return this user's open tasks, split into not-yet-due vs overdue.
+
+        This is what conversation-start injection (call_model) and outreach
+        generation (notification_engine) both read — the single source of
+        truth for "what did the advisor assign that isn't done yet".
+        """
+        now = datetime.now(UTC)
+        query = (
+            select(ActionItem)
+            .where(ActionItem.user_id == user_id, ActionItem.status.in_(OPEN_STATUSES))
+            .order_by(ActionItem.due_date.asc().nulls_last())
+        )
+        result = await session.execute(query)
+        items = result.scalars().all()
+
+        overdue: list[ActionItem] = []
+        not_yet_due: list[ActionItem] = []
+        for item in items:
+            due = item.due_date
+            if due is not None and due.tzinfo is None:
+                due = due.replace(tzinfo=UTC)
+            if due is not None and due < now:
+                overdue.append(item)
+            else:
+                not_yet_due.append(item)
+
+        return OpenTaskGroup(not_yet_due=not_yet_due, overdue=overdue)
+
+    @staticmethod
+    async def mark_missed(session: AsyncSession, item_id: str, user_id: str) -> ActionItem:
+        """Increment miss_count for a task confirmed overdue-and-not-done.
+
+        Called when the agent (or the weekly check-in) chases an overdue
+        task and the student confirms it still isn't done — drives the
+        escalation logic (don't reassign a third time; address the blocker).
+        """
+        stmt = select(ActionItem).where(ActionItem.id == item_id, ActionItem.user_id == user_id)
+        item = await session.scalar(stmt)
+        if not item:
+            raise ValueError("Item not found")
+
+        item.miss_count += 1
+        item.last_reminder_sent = datetime.now(UTC)
+        item.updated_at = datetime.now(UTC)
+        await session.commit()
+        await session.refresh(item)
+        return item
+
+    @staticmethod
+    async def update_action_item_status(
+        session: AsyncSession,
+        item_id: str,
+        user_id: str,
+        status: str,
+        *,
+        evidence: str | None = None,
+    ) -> dict:
         stmt = select(ActionItem).where(ActionItem.id == item_id, ActionItem.user_id == user_id)
         item = await session.scalar(stmt)
 
         if not item:
             raise ValueError("Item not found")
 
+        if evidence:
+            item.evidence = evidence
+
         if item.status == status:
+            await session.commit()
             return {"status": "updated", "message": "no_change"}
 
         item.status = status

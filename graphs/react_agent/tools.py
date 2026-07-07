@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 import httpx
 from langchain_community.tools import BraveSearch
+from langgraph.config import get_config
 from langgraph.runtime import get_runtime
 
 from react_agent.context import Context
@@ -1812,6 +1813,260 @@ async def get_opportunity_strategy(opportunity_id: str) -> dict[str, Any]:
         return {"error": "Failed to fetch strategy", "message": str(e)}
 
 
+# ---------------------------------------------------------------------------
+# TaskMemory (accountability ledger) — agent optimisation spec Item 2
+# ---------------------------------------------------------------------------
+# Backed by the existing action_items Postgres table (aegra_api), not a new
+# LangGraph-store memory schema — that table already had a service layer,
+# REST API, and downstream readers (notification_engine's deadline reminders,
+# struggle detection) but no write path. These tools are that write path.
+try:
+    from aegra_api.core.orm import get_session_maker as _get_task_session_maker
+    from aegra_api.services.accountability_service import AccountabilityService as _AccountabilityService
+
+    TASK_MEMORY_AVAILABLE = True
+    logger.info("Task memory (accountability) service loaded successfully")
+except ImportError as _e:
+    TASK_MEMORY_AVAILABLE = False
+    logger.warning(f"Task memory service not available: {_e}. Task tools will be disabled.")
+
+_TASK_UPDATE_STATUSES = frozenset({"in_progress", "completed", "skipped", "abandoned", "renegotiated"})
+_TASK_PRIORITIES = frozenset({"high", "normal", "low"})
+
+
+def _serialize_action_item(item: Any) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "description": item.description,
+        "status": item.status,
+        "due_date": item.due_date.isoformat() if item.due_date else None,
+        "priority": item.priority,
+        "category": item.category,
+        "evidence": item.evidence,
+        "miss_count": item.miss_count,
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+    }
+
+
+def _parse_due_date(due_date: str | None) -> Any:
+    """Parse an ISO date/datetime string. Returns None for empty or unparseable input.
+
+    Callers pass free-text timeframes ("by next session") through
+    ``category``/``description`` instead — only real dates belong here.
+    """
+    if not due_date or not due_date.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(due_date.strip())
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+async def fetch_open_task_group_for_prompt(user_id: str) -> dict[str, list[dict[str, Any]]] | None:
+    """Fetch and serialize a user's open/overdue tasks. Returns ``None`` on any failure.
+
+    Shared by the ``get_open_tasks`` tool (hot path, agent-initiated) and
+    ``call_model``'s conversation-start injection (graph.py) — both need the
+    exact same query and serialization, so this is the single implementation.
+    """
+    if not TASK_MEMORY_AVAILABLE:
+        return None
+    try:
+        session_maker = _get_task_session_maker()
+        async with session_maker() as session:
+            group = await _AccountabilityService.get_open_and_overdue(session, user_id)
+        return {
+            "not_yet_due": [_serialize_action_item(item) for item in group.not_yet_due],
+            "overdue": [_serialize_action_item(item) for item in group.overdue],
+        }
+    except Exception:
+        logger.warning("Failed to fetch open tasks for user=%s", user_id, exc_info=True)
+        return None
+
+
+def _normalize_task_description(description: str) -> str:
+    """Lowercased, whitespace-collapsed form for cold-path dedup comparison."""
+    return re.sub(r"\s+", " ", description.strip().lower())
+
+
+async def persist_extracted_tasks(
+    user_id: str,
+    tasks: list[dict[str, Any]],
+    *,
+    thread_id: str | None = None,
+    advisor_persona: str | None = None,
+) -> int:
+    """Cold-path write for tasks extracted from conversation prose (spec Item 2, §4.2).
+
+    Dedups each candidate against the user's currently-open tasks by normalized
+    description before creating it — because ``consolidate_memories`` runs after
+    every turn, this prevents a task from being re-created on subsequent turns.
+    Returns the number of tasks actually created.
+    """
+    if not TASK_MEMORY_AVAILABLE or not tasks:
+        return 0
+    try:
+        session_maker = _get_task_session_maker()
+        async with session_maker() as session:
+            group = await _AccountabilityService.get_open_and_overdue(session, user_id)
+            existing = {_normalize_task_description(item.description) for item in (*group.not_yet_due, *group.overdue)}
+            created = 0
+            for task in tasks:
+                description = (task.get("description") or "").strip()
+                if not description or _normalize_task_description(description) in existing:
+                    continue
+                priority = task.get("priority")
+                if priority not in _TASK_PRIORITIES:
+                    priority = "normal"
+                await _AccountabilityService.create_action_item(
+                    session,
+                    user_id,
+                    description,
+                    thread_id=thread_id,
+                    due_date=_parse_due_date(task.get("due_date")),
+                    priority=priority,
+                    advisor_persona=advisor_persona,
+                    source="conversation",
+                )
+                existing.add(_normalize_task_description(description))
+                created += 1
+        return created
+    except Exception:
+        logger.warning("Cold-path task persistence failed for user=%s", user_id, exc_info=True)
+        return 0
+
+
+async def get_open_tasks() -> dict[str, Any]:
+    """Get the student's open and overdue tasks — what you've assigned that isn't done yet.
+
+    ALWAYS call this at the very start of a new conversation (before your
+    first reply, when there are no prior AI messages yet) so you can open by
+    checking in on open commitments instead of starting from a blank slate.
+    Also call it before assigning a new task, to avoid re-assigning
+    something already open.
+
+    Reasoning by task state (do not just recite the list):
+      - Overdue, miss_count == 0 or 1: ask what blocked it, don't just restate the task.
+      - Overdue, miss_count >= 2: do NOT assign it a third time — address the
+        underlying blocker directly instead.
+      - Not yet due: a brief, light-touch check-in only. No pressure.
+    """
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+
+    if not user_id:
+        return {"error": "Authentication required", "message": "Cannot fetch tasks without user context."}
+    if not TASK_MEMORY_AVAILABLE:
+        return {
+            "error": "Task memory service unavailable",
+            "message": "The task backend is not reachable from this environment.",
+        }
+
+    group = await fetch_open_task_group_for_prompt(user_id)
+    if group is None:
+        return {"error": "Failed to fetch tasks", "message": "Task lookup failed — see server logs."}
+    return {"ok": True, **group}
+
+
+async def manage_task(
+    action: str,
+    *,
+    task_id: str | None = None,
+    description: str | None = None,
+    due_date: str | None = None,
+    priority: str = "normal",
+    category: str | None = None,
+    status: str | None = None,
+    evidence: str | None = None,
+) -> dict[str, Any]:
+    """Create or update a task you've assigned the student — the accountability ledger.
+
+    Call this immediately when you assign a task in conversation — do not
+    wait until the end, and do not rely on it being inferred automatically.
+
+    Args:
+        action: "create" to log a new task, or "update_status" to change an
+            existing one.
+        task_id: Required for "update_status". The task's id (from
+            get_open_tasks results).
+        description: Required for "create". A specific, concrete commitment —
+            e.g. "Rebuild GitHub README with 3 pinned projects", not "work on
+            portfolio".
+        due_date: Optional ISO date/datetime (e.g. "2026-07-10"). Omit for
+            vague timeframes like "by next session" — fold those into
+            `description` instead.
+        priority: One of high/normal/low. Defaults to normal.
+        category: Optional free-text grouping, e.g. "Portfolio", "Job Search".
+        status: Required for "update_status". One of: in_progress, completed,
+            skipped, abandoned, renegotiated.
+        evidence: Proof of completion — a URL, submission id, or the
+            student's own description of what they did. Pass this when
+            marking a task completed. If none is available, ask the student
+            for it before marking done — never assume completion.
+    """
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+    thread_id: str | None = None
+    config = get_config()
+    if config:
+        thread_id = config.get("configurable", {}).get("thread_id")
+
+    if not user_id:
+        return {"error": "Authentication required", "message": "Cannot manage tasks without user context."}
+    if not TASK_MEMORY_AVAILABLE:
+        return {
+            "error": "Task memory service unavailable",
+            "message": "The task backend is not reachable from this environment.",
+        }
+
+    if action not in {"create", "update_status"}:
+        return {"error": "Invalid action", "message": "action must be 'create' or 'update_status'"}
+
+    try:
+        session_maker = _get_task_session_maker()
+        async with session_maker() as session:
+            if action == "create":
+                if not description or not description.strip():
+                    return {"error": "description is required to create a task"}
+                if priority not in _TASK_PRIORITIES:
+                    return {"error": f"priority must be one of {sorted(_TASK_PRIORITIES)}"}
+
+                advisor = runtime.context.advisor or {}
+                advisor_persona = advisor.get("name", "").split()[0] if advisor.get("name") else None
+
+                item = await _AccountabilityService.create_action_item(
+                    session,
+                    user_id,
+                    description.strip(),
+                    thread_id=thread_id,
+                    due_date=_parse_due_date(due_date),
+                    priority=priority,
+                    category=category,
+                    advisor_persona=advisor_persona,
+                    source="conversation",
+                )
+                return {"ok": True, "task": _serialize_action_item(item)}
+
+            # action == "update_status"
+            if not task_id:
+                return {"error": "task_id is required for update_status"}
+            if status not in _TASK_UPDATE_STATUSES:
+                return {"error": f"status must be one of {sorted(_TASK_UPDATE_STATUSES)}"}
+
+            result = await _AccountabilityService.update_action_item_status(
+                session, task_id, user_id, status, evidence=evidence
+            )
+            evidence_missing = status == "completed" and not evidence
+            return {"ok": True, **result, "evidence_missing": evidence_missing}
+
+    except ValueError as e:
+        return {"error": "Task not found", "message": str(e)}
+    except Exception as e:
+        logger.error("Error managing task for user=%s action=%s: %s", user_id, action, e, exc_info=True)
+        return {"error": "Failed to manage task", "message": str(e)}
+
+
 # Build tools list dynamically based on availability
 TOOLS: list[Callable[..., Any]] = [
     # search,
@@ -1842,3 +2097,8 @@ if COURSE_CONTENT_AVAILABLE:
 if OPPORTUNITIES_AVAILABLE:
     TOOLS.extend([get_opportunities, get_opportunity_strategy])
     logger.info("Opportunities tools enabled")
+
+# Add task memory tools if the accountability service is available
+if TASK_MEMORY_AVAILABLE:
+    TOOLS.extend([get_open_tasks, manage_task])
+    logger.info("Task memory tools enabled")

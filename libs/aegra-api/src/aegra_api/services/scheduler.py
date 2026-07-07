@@ -39,6 +39,7 @@ from aegra_api.core.accountability_orm import (
 )
 from aegra_api.core.database import db_manager
 from aegra_api.data.career_advisors import get_advisor_by_track, get_default_advisor
+from aegra_api.services.accountability_service import AccountabilityService
 from aegra_api.services.email_service import build_digest_email, resolve_student_contact, send_email
 from aegra_api.services.notification_engine import notification_engine
 from aegra_api.services.opportunity_discovery import opportunity_engine
@@ -334,6 +335,12 @@ class SchedulerService:
                     days = max(1, abs(int(hours_diff / 24)))
                     content = content_tpl.format(description=item.description, days=days)
 
+                    # Older/externally-created tasks may not have a persona stamped
+                    # on them — fall back to a live resolution rather than letting
+                    # create_notification's own DEFAULT_PERSONA fallback silently
+                    # pick the wrong advisor for this student's track.
+                    task_persona = item.advisor_persona or await self._resolve_advisor_first_name(item.user_id)
+
                     notif = await notification_engine.create_notification(
                         session=session,
                         user_id=item.user_id,
@@ -341,7 +348,7 @@ class SchedulerService:
                         content=content,
                         category="deadline",
                         priority=priority,
-                        persona=item.advisor_persona,
+                        persona=task_persona,
                         action_buttons=[
                             {"action": "complete", "title": "Mark Complete"},
                             {"action": "snooze", "title": "Snooze 1hr"},
@@ -434,7 +441,11 @@ class SchedulerService:
                         continue
 
                     content = content_tpl.format(days=days_inactive)
-                    advisor_name = await self._resolve_advisor_first_name(activity.user_id)
+                    advisor_name, track = await self._resolve_advisor_for_user(activity.user_id)
+                    # Real student context (spec Item 7) so generate_persona_message
+                    # can name an actual open task instead of leaving the elapsed-time
+                    # template as generic as pure inactivity metrics alone would be.
+                    student_ctx = await self._build_student_context(session, activity.user_id, advisor_name, track)
 
                     sent = await notification_engine.create_notification(
                         session=session,
@@ -444,6 +455,7 @@ class SchedulerService:
                         category="inactivity",
                         priority=priority,
                         persona=advisor_name,
+                        student_context=student_ctx,
                         action_buttons=[
                             {
                                 "action": "resume",
@@ -737,6 +749,9 @@ class SchedulerService:
             "tasks_completed_this_week": 0,
             "overdue_tasks": 0,
             "pending_tasks": 0,
+            # Named tasks, not just counts (spec Item 7) — [{description, due_date, miss_count}, ...]
+            "overdue_task_details": [],
+            "pending_task_details": [],
             "first_name": "",
             "primary_goal": "",
             # Course progress fields — populated from MongoDB enrollment data
@@ -818,6 +833,27 @@ class SchedulerService:
                 )
             )
             context["pending_tasks"] = pending_result.scalar() or 0
+
+            # ── Named tasks (spec Item 7) ──────────────────────────────
+            # Same query AccountabilityService.get_open_and_overdue uses for
+            # conversation-start injection — outreach and live chat read from
+            # the same source of truth, not two independently-computed views.
+            task_group = await AccountabilityService.get_open_and_overdue(session, user_id)
+            context["overdue_task_details"] = [
+                {
+                    "description": item.description,
+                    "due_date": item.due_date.isoformat() if item.due_date else None,
+                    "miss_count": item.miss_count,
+                }
+                for item in task_group.overdue
+            ]
+            context["pending_task_details"] = [
+                {
+                    "description": item.description,
+                    "due_date": item.due_date.isoformat() if item.due_date else None,
+                }
+                for item in task_group.not_yet_due
+            ]
 
             # ── Onboarding goal (best-effort from Mongo) ──────────────
             try:
@@ -908,8 +944,13 @@ class SchedulerService:
                         # Short in-app notification — a single sentence drawn from the context
                         streak = student_ctx["current_streak"]
                         overdue = student_ctx["overdue_tasks"]
+                        overdue_details = student_ctx["overdue_task_details"]
                         if streak > 0:
                             short_content = f"You're on a {streak}-day streak — keep it going! 🔥"
+                        elif overdue_details:
+                            # Name the actual task, not a bare count (spec Item 7).
+                            first_task = overdue_details[0].get("description", "")
+                            short_content = f"'{first_task}' is still open. Let's tackle it together."
                         elif overdue:
                             short_content = f"You have {overdue} overdue task{'s' if overdue != 1 else ''}. Let's clear the backlog together."
                         else:
@@ -923,6 +964,10 @@ class SchedulerService:
                             category="motivation",
                             priority="low",
                             persona=None,  # body already personalised — skip LLM rewrite
+                            # But the email sign-off still needs the correct advisor —
+                            # explicit, since persona=None would otherwise fall through
+                            # to create_notification's DEFAULT_PERSONA (spec Item 7).
+                            advisor_persona=advisor_name,
                             action_buttons=[
                                 {
                                     "action": "chat",

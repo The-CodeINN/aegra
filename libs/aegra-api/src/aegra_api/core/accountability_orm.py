@@ -39,6 +39,10 @@ class ActionItem(Base):
     dependencies: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # IDs of prerequisite action items
     reminder_sent_count: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
     last_reminder_sent: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    # Task-tracking fields (agent optimisation spec Item 2 / TaskMemory).
+    evidence: Mapped[str | None] = mapped_column(Text, nullable=True)  # proof of completion: URL, submission id, claim
+    advisor_note: Mapped[str | None] = mapped_column(Text, nullable=True)  # private note on how to handle follow-ups
+    miss_count: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)  # consecutive misses
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 

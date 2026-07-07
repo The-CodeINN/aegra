@@ -128,6 +128,42 @@ def _get_pricing(model_name: str) -> ModelPricing:
     return _MODEL_PRICING.get(key, _FALLBACK_PRICING)
 
 
+def extract_usage_from_message(msg: Any) -> dict[str, Any]:
+    """Normalise an AIMessage's token usage into the flat shape ``track_llm_usage`` expects.
+
+    ``ChatAnthropic`` (direct API) preserves the raw Anthropic usage block —
+    already flat with ``cache_read_input_tokens``/``cache_creation_input_tokens`` —
+    on ``response_metadata["usage"]``. ``ChatBedrockConverse`` instead *pops*
+    that key and reports cache tokens nested under
+    ``usage_metadata["input_token_details"]["cache_read"/"cache_creation"]``
+    (LangChain's standardized shape), leaving ``response_metadata["usage"]``
+    empty. Reading only ``response_metadata`` (as this code used to) silently
+    dropped all token/cost/cache accounting for the Bedrock path — the
+    default production model. Check the standardized field first; it's
+    present for both providers, whereas the raw fallback only exists on
+    Anthropic-direct responses.
+    """
+    usage_metadata = getattr(msg, "usage_metadata", None)
+    if usage_metadata:
+        details = usage_metadata.get("input_token_details") or {}
+        cache_read = details.get("cache_read", 0) or 0
+        cache_write = details.get("cache_creation", 0) or 0
+        # LangChain's standardized ``input_tokens`` counts the FULL prompt,
+        # cache tokens included (Bedrock Converse's convention). The pricing
+        # formula below expects the Anthropic-raw convention instead —
+        # ``input_tokens`` net of cache tokens, priced separately at the
+        # cache rate — so subtract them back out here to avoid double-billing.
+        input_tokens = max(0, (usage_metadata.get("input_tokens", 0) or 0) - cache_read - cache_write)
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": usage_metadata.get("output_tokens", 0) or 0,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_write,
+        }
+
+    return getattr(msg, "response_metadata", {}).get("usage", {})
+
+
 def track_llm_usage(
     session_cost: SessionCost,
     model_name: str,

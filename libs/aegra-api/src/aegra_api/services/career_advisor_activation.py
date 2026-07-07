@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -16,6 +17,12 @@ from aegra_api.core.orm import _get_session_maker
 logger = structlog.get_logger()
 
 ROADMAP_GENERATED_PREFERENCE_KEY = "career_roadmap_generated"
+
+# Agent optimisation spec Item 6: A/B variant for returning students' roadmap
+# structure. Assigned once per user, on first use, and persisted — a user
+# must never flip variants mid-experiment.
+ROADMAP_VARIANT_PREFERENCE_KEY = "roadmap_variant"
+ROADMAP_VARIANTS = ("full", "adaptive")
 
 FIRST_TIME_ROADMAP_REDIRECT_MESSAGE = (
     "Before we dive in, the best place to start is generating your personalised career roadmap "
@@ -74,6 +81,52 @@ async def mark_roadmap_generated_for_user(user_id: str) -> None:
     async with maker() as session:
         await set_roadmap_generated_flag(session, user_id, True)
     logger.info("career_roadmap_generated_flag_set", user_id=user_id)
+
+
+def pick_roadmap_variant(existing_preferences: dict[str, Any] | None) -> str:
+    """Return the sticky variant from ``existing_preferences``, or randomly pick one.
+
+    Pure — no DB access — so callers that already have a fetched
+    ``UserPreferences`` row (e.g. ``WeeklyCheckinService.provision_user``,
+    which writes it back as part of a larger combined commit) don't need a
+    second round-trip through ``get_or_assign_roadmap_variant`` below.
+    """
+    existing = (existing_preferences or {}).get(ROADMAP_VARIANT_PREFERENCE_KEY)
+    if existing in ROADMAP_VARIANTS:
+        return existing
+    return random.choice(ROADMAP_VARIANTS)  # nosec B311 — A/B experiment bucketing, not security-sensitive
+
+
+async def get_or_assign_roadmap_variant(session: AsyncSession, user_id: str) -> str:
+    """Return this user's roadmap A/B variant, assigning + persisting one (sticky) on first use.
+
+    Only meaningful for returning students — the caller should only invoke
+    this once ``roadmap_generated`` is already True for the user, since a
+    variant assigned before their first roadmap has nothing to govern yet.
+    """
+    prefs = await session.scalar(select(UserPreferences).where(UserPreferences.user_id == user_id))
+    variant = pick_roadmap_variant(prefs.preferences if prefs else None)
+    if prefs and prefs.preferences and prefs.preferences.get(ROADMAP_VARIANT_PREFERENCE_KEY) == variant:
+        return variant  # already persisted, nothing to write
+
+    if not prefs:
+        prefs = UserPreferences(user_id=user_id)
+        session.add(prefs)
+
+    pref_json = dict(prefs.preferences or {})
+    pref_json[ROADMAP_VARIANT_PREFERENCE_KEY] = variant
+    prefs.preferences = pref_json
+    prefs.updated_at = datetime.now(UTC)
+    await session.commit()
+    logger.info("roadmap_variant_assigned", user_id=user_id, variant=variant)
+    return variant
+
+
+async def get_or_assign_roadmap_variant_for_user(user_id: str) -> str:
+    """Load/assign the roadmap A/B variant using a short-lived session."""
+    maker = _get_session_maker()
+    async with maker() as session:
+        return await get_or_assign_roadmap_variant(session, user_id)
 
 
 def extract_latest_human_text(input_data: dict[str, Any] | None) -> str:

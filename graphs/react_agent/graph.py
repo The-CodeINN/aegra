@@ -15,14 +15,14 @@ Memory architecture (LangMem):
 """
 
 import asyncio
+import json
 import logging
 import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 from langchain.agents import create_agent
-from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_config, get_stream_writer
@@ -35,6 +35,7 @@ from aegra_api.services.career_advisor_activation import (
     FIRST_TIME_ROADMAP_REDIRECT_MESSAGE,
     is_career_roadmap_trigger,
 )
+from react_agent import prompt_caching as _prompt_caching
 from react_agent import prompts as _prompts
 from react_agent.compaction import (
     CompactionTier,
@@ -43,7 +44,12 @@ from react_agent.compaction import (
     select_compaction_tier,
 )
 from react_agent.context import Context
-from react_agent.cost_tracker import SessionCost, is_over_cost_threshold, track_llm_usage
+from react_agent.cost_tracker import (
+    SessionCost,
+    extract_usage_from_message,
+    is_over_cost_threshold,
+    track_llm_usage,
+)
 from react_agent.execution import ExecutionEvent, build_runtime_tools, build_tool_limit_notice, serialize_event
 from react_agent.guardrails import (
     INJECTION_BLOCKED_RESPONSE,
@@ -73,14 +79,19 @@ from react_agent.session_memory import (
     should_extract_session_memory,
 )
 from react_agent.state import InputState, State
-from react_agent.tools import TOOLS
+from react_agent.tools import TOOLS, fetch_open_task_group_for_prompt, persist_extracted_tasks
 from react_agent.utils import get_message_text, load_chat_model
 
 logger = logging.getLogger(__name__)
 
 # Short-term memory token budgets (LangMem SummarizationNode)
 _TRIM_MAX_TOKENS = 8000  # max tokens returned to call_model each turn
-_SUMMARY_TRIGGER_TOKENS = 6000  # summarise when history exceeds this
+# Spec Item 5: 6k was very aggressive against Sonnet 4.5's 200k window — it
+# compressed normal conversations mid-flow, exactly when a advising chat needs
+# its recent thread intact. Raised so a normal single sitting is never
+# compressed; deliberately not raised further (100k+) since a bigger live
+# window isn't how the agent remembers — long-term memory (Items 2, 4) is.
+_SUMMARY_TRIGGER_TOKENS = 16000  # summarise when history exceeds this
 _MAX_SUMMARY_TOKENS = 512  # budget for the generated summary itself
 
 # Module-level cache: one SummarizationNode per model string to avoid
@@ -307,11 +318,23 @@ def _resolve_runtime_tooling(runtime: Runtime[Context]) -> tuple[list[Any], dict
 
 def _build_runtime_model(runtime: Runtime[Context]) -> Any:
     if _is_bedrock_model(runtime.context.model):
-        return load_chat_model(
+        model = load_chat_model(
             runtime.context.model,
             enable_thinking=runtime.context.enable_thinking,
             thinking_budget=runtime.context.thinking_budget,
         )
+        # cache_control triggers ChatBedrockConverse._apply_cache_points, which
+        # caches the tool list and the last conversation turn — the system-prompt
+        # breakpoint itself is placed manually (see prompt_caching.py) since this
+        # kwarg alone would cache the whole (still-volatile) system block as one
+        # unit. Only bind for Claude-on-Bedrock — see resolve_provider_kind's
+        # docstring on why the Kimi fallback must not get this.
+        if (
+            runtime.context.anthropic_prompt_caching_enabled
+            and _prompt_caching.resolve_provider_kind(runtime.context.model) == "bedrock"
+        ):
+            model = model.bind(cache_control={"ttl": runtime.context.anthropic_prompt_caching_ttl})
+        return model
 
     if _is_anthropic_model(runtime.context.model):
         model_kwargs: dict[str, Any] = {
@@ -337,11 +360,13 @@ def _build_runtime_model(runtime: Runtime[Context]) -> Any:
 
 
 def _build_runtime_middleware(runtime: Runtime[Context]) -> list[Any]:
-    if _is_bedrock_model(runtime.context.model):
-        # Bedrock handles caching at the infrastructure level; no client middleware needed.
-        return []
-    if _is_anthropic_model(runtime.context.model) and runtime.context.anthropic_prompt_caching_enabled:
-        return [AnthropicPromptCachingMiddleware(ttl=runtime.context.anthropic_prompt_caching_ttl)]
+    # No client middleware for either provider: prompt caching is applied
+    # manually (system-prompt block construction in prompt_caching.py, plus
+    # tool tagging / the Bedrock cache_control bind kwarg) rather than via
+    # AnthropicPromptCachingMiddleware, which tags the *last* system-message
+    # content block — the wrong end once the prompt is split into a static
+    # block followed by a volatile one. See prompt_caching.py's module
+    # docstring for the full rationale.
     return []
 
 
@@ -358,9 +383,14 @@ def _latest_human_text(messages: list[AnyMessage]) -> str:
 
 
 async def _invoke_integrated_agent(
-    messages: list[AnyMessage], runtime: Runtime[Context], system_message: str
+    messages: list[AnyMessage], runtime: Runtime[Context], system_message: str | SystemMessage
 ) -> tuple[AIMessage, list[dict[str, Any]], dict[str, Any], list[str]]:
     """Invoke a single integrated LangChain agent runtime for all providers.
+
+    ``system_message`` may be a plain string (no caching wired for this
+    provider) or a multi-block ``SystemMessage`` with a cache breakpoint
+    already placed (see ``prompt_caching.build_cached_system_prompt``) —
+    ``create_agent`` accepts either.
 
     Returns:
         (ai_message, execution_events, usage_metadata, tool_result_texts) —
@@ -370,6 +400,9 @@ async def _invoke_integrated_agent(
         tool-calling loop (used for hallucination grounding).
     """
     runtime_tools, _ = _resolve_runtime_tooling(runtime)
+    provider_kind = _prompt_caching.resolve_provider_kind(runtime.context.model)
+    if runtime.context.anthropic_prompt_caching_enabled:
+        runtime_tools = _prompt_caching.tag_last_tool_for_caching(runtime_tools, provider=provider_kind)
     agent = create_agent(
         model=_build_runtime_model(runtime),
         tools=runtime_tools,
@@ -401,11 +434,18 @@ async def _invoke_integrated_agent(
                 original_model = runtime.context.model
                 runtime.context.model = fallback_model
                 try:
+                    # The system_message was built with a cache breakpoint for the
+                    # primary (caching-capable) model. If the fallback doesn't
+                    # support caching (e.g. Kimi), strip the marker so its baked-in
+                    # cachePoint block can't turn the 529 recovery into a hard error.
+                    fallback_system = system_message
+                    if _prompt_caching.resolve_provider_kind(fallback_model) == "other":
+                        fallback_system = _prompt_caching.flatten_system_message(system_message)
                     fallback_agent = create_agent(
                         model=_build_runtime_model(runtime),
                         tools=runtime_tools,
                         middleware=_build_runtime_middleware(runtime),
-                        system_prompt=system_message,
+                        system_prompt=fallback_system,
                     )
 
                     @with_retry(max_retries=2)
@@ -422,7 +462,7 @@ async def _invoke_integrated_agent(
                     ]
                     for msg in reversed(final_messages):
                         if isinstance(msg, AIMessage):
-                            usage = getattr(msg, "response_metadata", {}).get("usage", {})
+                            usage = extract_usage_from_message(msg)
                             events = [
                                 serialize_event(
                                     ExecutionEvent(
@@ -475,7 +515,7 @@ async def _invoke_integrated_agent(
     ]
     for msg in reversed(final_messages):
         if isinstance(msg, AIMessage):
-            usage = getattr(msg, "response_metadata", {}).get("usage", {})
+            usage = extract_usage_from_message(msg)
             return msg, [], usage, agent_tool_texts
 
     return (
@@ -675,9 +715,10 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     - Cost/token tracking per session
     - Max output token recovery
     """
-    # Use str.replace instead of .format() — the 1000-line prompt contains literal
-    # {blocks} in examples/directives; .format() would KeyError on any unknown placeholder.
-    static_prompt = runtime.context.system_prompt.replace("{system_time}", datetime.now(tz=UTC).isoformat())
+    # runtime.context.system_prompt is fully static now — no per-turn
+    # interpolation. System time and all other volatile content live in the
+    # dynamic block assembled below, after the cache breakpoint (Item 1).
+    static_prompt = runtime.context.system_prompt
 
     latest_human_text = _latest_human_text(list(state.messages))
     if not runtime.context.roadmap_generated and latest_human_text and not is_career_roadmap_trigger(latest_human_text):
@@ -687,6 +728,7 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
             "session_cost": state.session_cost or SessionCost(),
             "execution_events": list(state.execution_events),
             "agent_wrote_memory": state.agent_wrote_memory,
+            "agent_wrote_task": state.agent_wrote_task,
         }
 
     _, tool_policies = _resolve_runtime_tooling(runtime)
@@ -706,59 +748,79 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
             )
         )
 
-    # Assemble the final system prompt via the section builder.  Static sections
-    # (memory instructions) are memoized across turns; volatile sections
-    # (tool_limit_notice) are appended fresh each turn.
-    system_message = _prompts.build_runtime_system_prompt(
-        static_prompt,
-        tool_limit_notice=tool_limit_notice,
-    )
+    # Static block: persona/directives/roadmap structure/anti-fabrication
+    # rules/tool descriptions plus the static memory-instructions section.
+    # Byte-identical across turns within a session — this is the half of the
+    # prompt that gets cached (see prompt_caching.build_cached_system_prompt
+    # below). Nothing volatile may be appended to this value.
+    static_block = _prompts.build_runtime_system_prompt(static_prompt)
 
     # --- Session context injection ---
-    # If we have session notes from a previous extraction, inject them into
-    # the system prompt so the agent retains context after compaction.
+    # If we have session notes from a previous extraction, they go in the
+    # dynamic block (assembled below) so they never invalidate the cache.
     session_block = build_session_context_block(state.session_notes)
-    if session_block:
-        system_message = system_message + "\n" + session_block
 
     # --- Proactive memory load ---
     # On the first turn (no previous AI messages), pre-load relevant memories
     # and inject them as a system reminder.  This ensures the agent has context
     # before its first response without relying on it to call search_memory.
     proactive_memory_text: str = ""
+    proactive_memory_block: str = ""
+    advisor_behavior_block: str = ""
     store = runtime.store
     user_id = runtime.context.user_id
-    if store and user_id:
-        ai_count = sum(1 for m in state.messages if isinstance(m, AIMessage))
-        if ai_count == 0:
+    ai_count = sum(1 for m in state.messages if isinstance(m, AIMessage))
+    if store and user_id and ai_count == 0:
+        try:
+            namespace = (user_id, DEFAULT_MEMORY_NAMESPACE)
+            existing_memories = await store.asearch(namespace, limit=20)
+
+            # AdvisorBehaviorProfile is fetched with a targeted filter, NOT taken
+            # from the 20-item generic recall above (spec Item 4): a student with
+            # ≥20 memories could otherwise push the profile out of that window and
+            # silently lose procedural adaptation. Pick the most recent match.
             try:
-                namespace = (user_id, DEFAULT_MEMORY_NAMESPACE)
-                existing_memories = await store.asearch(namespace, limit=20)
-                if existing_memories:
-                    memory_lines: list[str] = []
-                    for item in existing_memories:
-                        kind = item.value.get("kind", "unknown")
-                        content = item.value.get("content", {})
-                        updated_at = getattr(item, "updated_at", None) or getattr(item, "created_at", None)
-                        freshness = memory_freshness_note(updated_at)
-                        summary = str(content) if isinstance(content, dict) else str(content)
-                        line = f"  [{kind}] {summary[:200]}"
-                        if freshness:
-                            line += f"\n  {freshness}"
-                        memory_lines.append(line)
-                    if memory_lines:
-                        memory_block = "\n".join(memory_lines)
-                        proactive_memory_text = memory_block
-                        # Strip freshness metadata from what the model sees —
-                        # the <system-reminder> tags cause the model to make
-                        # false temporal claims like "it's been a few days".
-                        clean_block = re.sub(
-                            r"\n?\s*<system-reminder>.*?</system-reminder>",
-                            "",
-                            memory_block,
-                            flags=re.DOTALL,
-                        )
-                        system_message += f"""
+                behavior_items = await store.asearch(namespace, filter={"kind": "AdvisorBehaviorProfile"}, limit=5)
+                if behavior_items:
+                    latest_behavior = max(
+                        behavior_items,
+                        key=lambda item: getattr(item, "updated_at", None) or getattr(item, "created_at", None) or "",
+                    )
+                    advisor_behavior_block = _prompts.build_advisor_behavior_block(
+                        latest_behavior.value.get("content", {})
+                    )
+            except Exception:
+                logger.debug("Advisor behavior profile load failed; continuing without.", exc_info=True)
+
+            if existing_memories:
+                memory_lines: list[str] = []
+                for item in existing_memories:
+                    kind = item.value.get("kind", "unknown")
+                    if kind == "AdvisorBehaviorProfile":
+                        continue  # rendered separately in its own emphasized block above
+                    content = item.value.get("content", {})
+                    updated_at = getattr(item, "updated_at", None) or getattr(item, "created_at", None)
+                    freshness = memory_freshness_note(updated_at, kind=kind)
+                    summary = str(content) if isinstance(content, dict) else str(content)
+                    line = f"  [{kind}] {summary[:200]}"
+                    if freshness:
+                        line += f"\n  {freshness}"
+                    memory_lines.append(line)
+                if memory_lines:
+                    memory_block = "\n".join(memory_lines)
+                    # Grounding text for the hallucination screen (screen_output_for_hallucination),
+                    # kept with freshness tags intact — see tool_result_texts below.
+                    proactive_memory_text = memory_block
+                    # Strip freshness metadata from what the model sees —
+                    # the <system-reminder> tags cause the model to make
+                    # false temporal claims like "it's been a few days".
+                    clean_block = re.sub(
+                        r"\n?\s*<system-reminder>.*?</system-reminder>",
+                        "",
+                        memory_block,
+                        flags=re.DOTALL,
+                    )
+                    proactive_memory_block = f"""
 <proactive_memory_recall>
 The following memories were recalled for this student at the start of the conversation.
 Use them to personalize your response. Do NOT repeat these verbatim — weave them naturally.
@@ -768,8 +830,36 @@ conversation and greet the student without time references.
 
 {clean_block}
 </proactive_memory_recall>"""
-            except Exception:
-                logger.debug("Proactive memory load failed; continuing without.", exc_info=True)
+        except Exception:
+            logger.debug("Proactive memory load failed; continuing without.", exc_info=True)
+
+    # --- Proactive task load (spec Item 2: conversation-start injection) ---
+    # Same trigger as proactive memory load (first turn of a new conversation)
+    # but doesn't require the LangGraph store — tasks live in the accountability
+    # Postgres table, keyed only on user_id.
+    open_tasks_block = ""
+    if user_id and ai_count == 0:
+        task_group = await fetch_open_task_group_for_prompt(user_id)
+        open_tasks_block = _prompts.build_open_tasks_block(task_group)
+
+    # Dynamic block: system time, tool-limit notices, session context,
+    # proactive memory recall, open tasks, and the learned advisor-behavior
+    # profile — everything that changes turn to turn. Placed after the cache
+    # breakpoint so it never invalidates the static block.
+    dynamic_block = _prompts.build_dynamic_prompt_block(
+        system_time=datetime.now(tz=UTC).isoformat(),
+        tool_limit_notice=tool_limit_notice,
+        session_block=session_block,
+        proactive_memory_block=proactive_memory_block,
+        open_tasks_block=open_tasks_block,
+        advisor_behavior_block=advisor_behavior_block,
+    )
+    system_message = _prompt_caching.build_cached_system_prompt(
+        static_block,
+        dynamic_block,
+        provider=_prompt_caching.resolve_provider_kind(runtime.context.model),
+        cache_ttl=runtime.context.anthropic_prompt_caching_ttl,
+    )
 
     # Use the token-bounded summarised messages from the previous node.
     # Fall back to the full message list on the very first turn (before
@@ -1130,10 +1220,12 @@ conversation and greet the student without time references.
                 if name:
                     updated_counts[name] = updated_counts.get(name, 0) + 1
 
-    # --- Mutual exclusion: detect if the agent called manage_memory ---
-    # If the agent wrote memories during the hot path, consolidate_memories
-    # should skip to avoid duplication (Claude-code's mutual exclusion pattern).
+    # --- Mutual exclusion: detect if the agent called manage_memory / manage_task ---
+    # If the agent wrote during the hot path, consolidate_memories should skip
+    # the corresponding cold-path extraction to avoid duplication (Claude-code's
+    # mutual exclusion pattern).
     _agent_wrote_memory = updated_counts.get("manage_memory", 0) > 0
+    _agent_wrote_task = updated_counts.get("manage_task", 0) > 0
 
     # Handle the case when it's the last step and the model still wants to use a tool
     if state.is_last_step and response.tool_calls:
@@ -1151,6 +1243,7 @@ conversation and greet the student without time references.
             "session_cost": session_cost,
             "execution_events": execution_events,
             "agent_wrote_memory": _agent_wrote_memory,
+            "agent_wrote_task": _agent_wrote_task,
         }
 
     return {
@@ -1162,6 +1255,7 @@ conversation and greet the student without time references.
         "session_cost": session_cost,
         "execution_events": execution_events,
         "agent_wrote_memory": _agent_wrote_memory,
+        "agent_wrote_task": _agent_wrote_task,
     }
 
 
@@ -1259,6 +1353,78 @@ def _spawn_background_task(coro, label: str = "") -> None:
         return
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+
+# Cold-path task extraction (spec Item 2, §4.2). Only the last exchange is
+# scanned — a task assigned in an earlier turn was already a candidate on its
+# own turn, so scanning the recent window (plus dedup in persist_extracted_tasks)
+# keeps this from re-extracting old tasks on every subsequent turn.
+_TASK_EXTRACTION_RECENT_MESSAGES = 6
+
+_TASK_EXTRACTION_PROMPT = """You are reviewing a finished exchange between an AI career advisor and a student.
+Extract ONLY concrete tasks the ADVISOR assigned to the student, or that the student explicitly committed to,
+in this exchange — specific, checkable actions expected to be done before a future session.
+
+Rules:
+- Only real assignments/commitments. Ignore vague suggestions ("you could look into X someday") and anything
+  already described as finished.
+- Each task must be specific and checkable: "Rebuild GitHub README with 3 pinned projects", NOT "work on portfolio".
+- NEVER invent a task. Every task must trace to something actually stated in the exchange.
+- If there is no such concrete task, return an empty array.
+
+Return ONLY a JSON array. Each element: {"description": string, "due_date": string|null, "priority": "high"|"normal"|"low"}.
+due_date is an ISO date (YYYY-MM-DD) ONLY when an explicit date was stated; otherwise null."""
+
+
+def _parse_extracted_tasks(raw: str) -> list[dict[str, Any]]:
+    """Parse the extraction model's reply into a list of task dicts. Tolerant of code fences."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL).strip()
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return []
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except (json.JSONDecodeError, ValueError):
+        return []
+    return [t for t in parsed if isinstance(t, dict) and t.get("description")]
+
+
+async def _extract_and_log_tasks(
+    messages: list[AnyMessage],
+    model: Any,
+    user_id: str,
+    thread_id: str | None,
+    advisor_persona: str | None,
+) -> None:
+    """Run the extraction model over the recent exchange and persist any new tasks."""
+    recent = messages[-_TASK_EXTRACTION_RECENT_MESSAGES:]
+    lines: list[str] = []
+    for msg in recent:
+        if isinstance(msg, HumanMessage):
+            lines.append(f"Student: {get_message_text(msg)[:800]}")
+        elif isinstance(msg, AIMessage):
+            text = get_message_text(msg)
+            if text.strip():
+                lines.append(f"Advisor: {text[:800]}")
+    if not lines:
+        return
+
+    response = await model.ainvoke(
+        [
+            {"role": "system", "content": _TASK_EXTRACTION_PROMPT},
+            {"role": "user", "content": "Exchange:\n\n" + "\n".join(lines)},
+        ],
+        config=RunnableConfig(callbacks=[]),
+    )
+    tasks = _parse_extracted_tasks(get_message_text(response))
+    if not tasks:
+        return
+    created = await persist_extracted_tasks(user_id, tasks, thread_id=thread_id, advisor_persona=advisor_persona)
+    if created:
+        logger.info("Cold-path task extraction created %d task(s) for user=%s", created, user_id)
 
 
 async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
@@ -1434,6 +1600,24 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
                 logger.debug("Background session memory extraction failed; continuing.", exc_info=True)
 
         _spawn_background_task(_run_session_memory(), f"session-mem-{thread_id}")
+
+    # ---- 3. Cold-path task extraction (spec Item 2, §4.2) ----
+    # Mutual exclusion mirrors memory consolidation: skip when the agent already
+    # logged a task via the manage_task hot path this turn, so a task is never
+    # double-written.
+    if not state.agent_wrote_task:
+        _task_model = _build_runtime_model(runtime)
+        _task_messages = _normalize_messages_for_memory(list(state.messages))
+        _advisor = runtime.context.advisor or {}
+        _advisor_persona = _advisor.get("name", "").split()[0] if _advisor.get("name") else None
+
+        async def _run_task_extraction() -> None:
+            try:
+                await _extract_and_log_tasks(_task_messages, _task_model, user_id, thread_id or None, _advisor_persona)
+            except Exception:
+                logger.debug("Background cold-path task extraction failed; continuing.", exc_info=True)
+
+        _spawn_background_task(_run_task_extraction(), f"task-extract-{user_id}")
 
     return {}
 

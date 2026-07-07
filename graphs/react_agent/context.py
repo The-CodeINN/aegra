@@ -55,6 +55,15 @@ class Context:
         metadata={"description": "Whether this user has already successfully generated their career roadmap before."},
     )
 
+    roadmap_variant: str | None = field(
+        default=None,
+        metadata={
+            "description": "A/B variant for returning students' roadmap structure: 'adaptive' (loose, "
+            "task/episode-led) or 'full' (fixed 7-part). Only takes effect when roadmap_generated=True — "
+            "first-time students always get the full structure. See graphs/react_agent/prompts.py."
+        },
+    )
+
     model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
         # default="openai/gpt-5-mini-2025-08-07",  # noqa: ERA001
         # default="anthropic/claude-sonnet-4-5-20250929",  # noqa: ERA001
@@ -117,12 +126,19 @@ class Context:
 
     anthropic_prompt_caching_enabled: bool = field(
         default=True,
-        metadata={"description": "Enable Anthropic prompt-caching middleware when using Claude models."},
+        metadata={
+            "description": "Enable prompt caching for Claude models on both providers — direct "
+            "Anthropic API and Bedrock Converse. See graphs/react_agent/prompt_caching.py."
+        },
     )
 
     anthropic_prompt_caching_ttl: str = field(
-        default="5m",
-        metadata={"description": "Anthropic prompt cache TTL. Supported values: '5m' or '1h'."},
+        default="1h",
+        metadata={
+            "description": "Prompt cache TTL for the static system-prompt block. Supported "
+            "values: '5m' or '1h'. The static block is stable for the whole session, so '1h' "
+            "avoids cache expiry mid-conversation on longer sittings."
+        },
     )
 
     anthropic_tool_search_enabled: bool = field(
@@ -181,6 +197,7 @@ class Context:
                 advisor=self.advisor,
                 learning_track=self.learning_track,
                 roadmap_generated=self.roadmap_generated,
+                roadmap_variant=self.roadmap_variant,
             )
 
 

@@ -32,6 +32,7 @@ from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import get_session_maker
 from aegra_api.data.career_advisors import get_advisor_by_track, get_default_advisor
 from aegra_api.models.crons import CronCreate
+from aegra_api.services.career_advisor_activation import ROADMAP_VARIANT_PREFERENCE_KEY, pick_roadmap_variant
 from aegra_api.services.cron_service import CronService
 from aegra_api.services.langgraph_service import LangGraphService
 from aegra_api.services.scheduler import SchedulerService
@@ -75,6 +76,11 @@ class WeeklyCheckinService:
 
         _, track = await SchedulerService._resolve_advisor_for_user(user_id)
         advisor_info: dict[str, Any] = get_advisor_by_track(track) or get_default_advisor()
+        # Weekly check-ins are by definition a returning-student surface —
+        # assign (or reuse) the same sticky A/B variant as live chat (spec Item 6).
+        # Uses the already-fetched `pref` (no second round-trip); persisted
+        # below alongside the thread/cron IDs in the single combined commit.
+        roadmap_variant = pick_roadmap_variant(pref.preferences if pref else None)
 
         # Flush the thread into the current transaction so it is visible to
         # create_cron's FK validation without committing yet. create_cron
@@ -101,6 +107,7 @@ class WeeklyCheckinService:
                         "learning_track": track or None,
                         "advisor": advisor_info,
                         "roadmap_generated": True,
+                        "roadmap_variant": roadmap_variant,
                     },
                     enabled=True,
                 ),
@@ -121,6 +128,7 @@ class WeeklyCheckinService:
             **(pref.preferences or {}),
             _PREF_THREAD_KEY: thread_id,
             _PREF_CRON_KEY: str(cron_orm.cron_id),
+            ROADMAP_VARIANT_PREFERENCE_KEY: roadmap_variant,
         }
         flag_modified(pref, "preferences")
         await session.commit()
