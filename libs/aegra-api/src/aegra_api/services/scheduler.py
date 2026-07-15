@@ -40,6 +40,7 @@ from aegra_api.core.accountability_orm import (
 from aegra_api.core.database import db_manager
 from aegra_api.data.career_advisors import get_advisor_by_track, get_default_advisor
 from aegra_api.services.accountability_service import AccountabilityService
+from aegra_api.services.advisor_memory import fetch_advisor_memory_context
 from aegra_api.services.email_service import build_digest_email, resolve_student_contact, send_email
 from aegra_api.services.notification_engine import notification_engine
 from aegra_api.services.opportunity_discovery import opportunity_engine
@@ -752,6 +753,9 @@ class SchedulerService:
             # Named tasks, not just counts (spec Item 7) — [{description, due_date, miss_count}, ...]
             "overdue_task_details": [],
             "pending_task_details": [],
+            # Advisor memory (spec Item 7) — shared history + learned tone
+            "relevant_episode": "",
+            "behavior_profile": "",
             "first_name": "",
             "primary_goal": "",
             # Course progress fields — populated from MongoDB enrollment data
@@ -903,6 +907,15 @@ class SchedulerService:
                             context["last_active_in_course"] = str(updated)[:10]
             except Exception:  # nosec B110 — best-effort Mongo read; failure is non-fatal
                 pass
+
+            # ── Advisor memory (spec Item 7) — episode + tone profile ──
+            # Semantic query built from what outreach is about to discuss, so
+            # the recalled episode is relevant, not just the most recent one.
+            memory_query_parts = [t["description"] for t in context["overdue_task_details"][:2]]
+            if context["primary_goal"]:
+                memory_query_parts.append(context["primary_goal"])
+            memory_ctx = await fetch_advisor_memory_context(user_id, query="; ".join(memory_query_parts) or None)
+            context.update(memory_ctx)
 
         except Exception as exc:
             logger.warning("student_context_build_failed", user_id=user_id, error=str(exc))

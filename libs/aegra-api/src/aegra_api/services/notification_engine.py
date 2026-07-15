@@ -219,11 +219,16 @@ class NotificationEngine:
                 overdue_details = context.get("overdue_task_details") or []
                 if overdue_details:
                     ctx_parts.append(f"Overdue task: {overdue_details[0].get('description')}")
+                # Advisor memory (spec Item 7) — tone + shared history for the rewrite
+                if context.get("behavior_profile"):
+                    ctx_parts.append(f"This student responds best to: {context['behavior_profile']}")
+                if context.get("relevant_episode"):
+                    ctx_parts.append(f"Shared history: {context['relevant_episode']}")
 
             context_str = "\n".join(ctx_parts) if ctx_parts else "No additional context."
 
             llm = ChatBedrockConverse(
-                model="eu.anthropic.claude-haiku-4-5-20250929-v1:0",
+                model="eu.anthropic.claude-haiku-4-5-20251001-v1:0",
                 region_name=settings.aws.AWS_REGION_NAME,
                 temperature=0.7,
                 max_tokens=200,
@@ -595,6 +600,10 @@ class NotificationEngine:
         overdue_task_details = student_context.get("overdue_task_details") or []
         pending_task_details = student_context.get("pending_task_details") or []
         goal = student_context.get("primary_goal") or ""
+        # Advisor memory (spec Item 7) — same stores the live agent reads, via
+        # SchedulerService._build_student_context → fetch_advisor_memory_context.
+        relevant_episode = student_context.get("relevant_episode") or ""
+        behavior_profile = student_context.get("behavior_profile") or ""
         # Course progress fields from MongoDB enrollment data
         enrolled_course = student_context.get("enrolled_course") or ""
         course_progress_pct = student_context.get("course_progress_pct", 0)
@@ -641,6 +650,10 @@ class NotificationEngine:
                 data_summary += f"Pending tasks: {pending} (no task names available)\n"
             if goal:
                 data_summary += f"Career goal / target role: {goal}\n"
+            if relevant_episode:
+                data_summary += f"Relevant shared history (a real past event with this student): {relevant_episode}\n"
+            if behavior_profile:
+                data_summary += f"How this student responds best (learned from past sessions): {behavior_profile}\n"
             if enrolled_course:
                 data_summary += f"Enrolled course: {enrolled_course}\n"
             if course_progress_pct:
@@ -668,6 +681,17 @@ class NotificationEngine:
                     "step to set as a new task. Do NOT invent or imply an existing task that isn't listed above. "
                 )
 
+            memory_instruction = ""
+            if relevant_episode:
+                memory_instruction += (
+                    "Their data includes a real past event — weave it in naturally to show shared history "
+                    "(e.g. what helped them last time), and never invent events beyond it. "
+                )
+            if behavior_profile:
+                memory_instruction += (
+                    "Match your framing to how this student responds best, as described in their data. "
+                )
+
             resp = await llm.ainvoke(
                 [
                     SystemMessage(
@@ -681,6 +705,7 @@ class NotificationEngine:
                             "progress percentage, lessons completed, and hours watched — to make the message "
                             "feel genuinely written for them, not a generic template. "
                             f"{task_instruction}"
+                            f"{memory_instruction}"
                             "If they have a streak, celebrate it. "
                             "If they've made real course progress, mention the actual percentage or lessons. "
                             "If they have a career goal, tie their current progress back to that goal. "

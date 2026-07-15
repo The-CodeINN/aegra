@@ -26,6 +26,8 @@ def _student_context(**overrides: object) -> dict:
         "pending_tasks": 0,
         "overdue_task_details": [],
         "pending_task_details": [],
+        "relevant_episode": "",
+        "behavior_profile": "",
         "primary_goal": "",
         "enrolled_course": "",
         "course_progress_pct": 0,
@@ -261,3 +263,75 @@ class TestPersonaConsistency:
             )
 
         assert mock_send_email.await_args.kwargs["persona"] == "David"
+
+
+class TestAdvisorMemoryInOutreach:
+    """Spec Item 7 §9.1: outreach references a real past episode and adapts
+    tone from the learned behavior profile — same stores as live chat."""
+
+    @pytest.mark.asyncio
+    async def test_relevant_episode_lands_in_llm_prompt(self) -> None:
+        engine = NotificationEngine()
+        student_ctx = _student_context(
+            relevant_episode="event: Momentum stalled last month; outcome: breaking it into one small step got them moving",
+        )
+        fake_llm = _FakeLLM()
+        p1, p2 = _patched_bedrock(fake_llm)
+        with p1, p2 as mock_settings:
+            mock_settings.aws.AWS_REGION_NAME = "eu-west-1"
+            await engine.generate_personalized_motivational_content(persona_name="David", student_context=student_ctx)
+
+        all_text = " ".join(str(m.content) for m in fake_llm.captured_messages)
+        assert "Momentum stalled last month" in all_text
+        assert "never invent events" in all_text
+
+    @pytest.mark.asyncio
+    async def test_behavior_profile_drives_tone_instruction(self) -> None:
+        engine = NotificationEngine()
+        student_ctx = _student_context(behavior_profile="responds to direct challenge, dislikes vague encouragement")
+        fake_llm = _FakeLLM()
+        p1, p2 = _patched_bedrock(fake_llm)
+        with p1, p2 as mock_settings:
+            mock_settings.aws.AWS_REGION_NAME = "eu-west-1"
+            await engine.generate_personalized_motivational_content(persona_name="David", student_context=student_ctx)
+
+        all_text = " ".join(str(m.content) for m in fake_llm.captured_messages)
+        assert "responds to direct challenge" in all_text
+        assert "how this student responds best" in all_text.lower()
+
+    @pytest.mark.asyncio
+    async def test_no_memory_context_means_no_memory_instructions(self) -> None:
+        """Without stored memory the prompt must not hint at shared history —
+        that would invite the model to fabricate one."""
+        engine = NotificationEngine()
+        student_ctx = _student_context()
+        fake_llm = _FakeLLM()
+        p1, p2 = _patched_bedrock(fake_llm)
+        with p1, p2 as mock_settings:
+            mock_settings.aws.AWS_REGION_NAME = "eu-west-1"
+            await engine.generate_personalized_motivational_content(persona_name="David", student_context=student_ctx)
+
+        all_text = " ".join(str(m.content) for m in fake_llm.captured_messages).lower()
+        assert "shared history" not in all_text
+        assert "past event" not in all_text
+
+    @pytest.mark.asyncio
+    async def test_persona_rewrite_receives_behavior_profile_and_episode(self) -> None:
+        engine = NotificationEngine()
+        fake_llm = _FakeLLM()
+        p1, p2 = _patched_bedrock(fake_llm)
+        with p1, p2 as mock_settings:
+            mock_settings.aws.AWS_REGION_NAME = "eu-west-1"
+            await engine.generate_persona_message(
+                base_message="Your task is overdue.",
+                persona_name="David",
+                context={
+                    "first_name": "Kudus",
+                    "behavior_profile": "prefers concrete steps over theory",
+                    "relevant_episode": "event: Rebuilt README after a nudge",
+                },
+            )
+
+        all_text = " ".join(str(m.content) for m in fake_llm.captured_messages)
+        assert "prefers concrete steps over theory" in all_text
+        assert "Rebuilt README after a nudge" in all_text

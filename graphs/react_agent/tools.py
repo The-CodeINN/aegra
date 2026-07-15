@@ -26,6 +26,7 @@ from langgraph.config import get_config
 from langgraph.runtime import get_runtime
 
 from react_agent.context import Context
+from react_agent.memory import DEFAULT_MEMORY_NAMESPACE
 from react_agent.retry import with_retry
 from react_agent.sanitization import validate_resource_id as _validate_id
 from react_agent.session_memory import SESSION_MEMORY_NAMESPACE_SUFFIX
@@ -1162,6 +1163,46 @@ async def _fetch_github_profile(username: str) -> dict[str, Any]:
     }
 
 
+def _normalize_url_for_match(url: str) -> str:
+    """Scheme/www/trailing-slash-insensitive form for comparing stored reference URLs."""
+    cleaned = url.strip().lower().rstrip("/")
+    cleaned = cleaned.removeprefix("https://").removeprefix("http://")
+    return cleaned.removeprefix("www.")
+
+
+async def _stored_reference_note(url: str) -> str | None:
+    """Item 3 're-verify on use': flag a dead URL that a saved ReferenceMemory points at.
+
+    ReferenceMemory carries no time-based staleness window — a link is only
+    known bad when actually used. Best-effort; never raises.
+    """
+    try:
+        runtime = get_runtime(Context)
+        store = runtime.store
+        user_id = runtime.context.user_id
+        if not store or not user_id:
+            return None
+        items = await store.asearch((user_id, DEFAULT_MEMORY_NAMESPACE), filter={"kind": "ReferenceMemory"}, limit=20)
+    except Exception:
+        logger.debug("Stored-reference lookup failed; skipping dead-link note.", exc_info=True)
+        return None
+
+    target = _normalize_url_for_match(url)
+    for item in items:
+        content = item.value.get("content", {})
+        if not isinstance(content, dict):
+            continue
+        location = str(content.get("location") or "")
+        if location and _normalize_url_for_match(location) == target:
+            resource = content.get("resource") or "a saved reference"
+            return (
+                f"This URL is stored in memory as a reference ({resource}) and appears to be dead. "
+                "Confirm the correct link with the student and update that reference via manage_memory "
+                "so future sessions don't rely on a broken link."
+            )
+    return None
+
+
 async def read_webpage(url: str) -> dict[str, Any]:
     """Fetch and summarize a webpage so advice can be based on page content, not just snippet text."""
     if not isinstance(url, str) or not url.strip():
@@ -1364,7 +1405,7 @@ async def read_webpage(url: str) -> dict[str, Any]:
             }
 
     except httpx.HTTPStatusError as e:
-        return {
+        result: dict[str, Any] = {
             "error": "http_error",
             "status_code": e.response.status_code,
             "message": (
@@ -1373,6 +1414,10 @@ async def read_webpage(url: str) -> dict[str, Any]:
             ),
             "url": cleaned_url,
         }
+        memory_note = await _stored_reference_note(cleaned_url)
+        if memory_note:
+            result["memory_note"] = memory_note
+        return result
     except httpx.TimeoutException:
         return {
             "error": "timeout",
