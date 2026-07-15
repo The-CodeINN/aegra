@@ -115,7 +115,7 @@ class Assistant(Base):
             "idx_assistant_user_graph_config",
             "user_id",
             "graph_id",
-            "config",
+            text("md5(config::text)"),
             unique=True,
         ),
     )

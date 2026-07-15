@@ -659,6 +659,19 @@ class CronSettings(EnvBase):
         return self
 
 
+class EventStreamingSettings(EnvBase):
+    """Agent Protocol v2 event streaming (/threads/{id}/stream/events + /commands).
+
+    On by default — it's a new endpoint set the LangGraph SDK targets and
+    has no v1 to break. The flag is a kill switch: set false to disable v2
+    serving (requests return 503 with an enable hint) and roll back without
+    a redeploy. Also requires a langgraph/langchain-core new enough to emit
+    native v3 events (enforced by event_streaming.capabilities; otherwise 503).
+    """
+
+    FF_V2_EVENT_STREAMING: bool = True
+
+
 class Settings:
     """Container object that instantiates all application settings groups."""
 
@@ -675,6 +688,7 @@ class Settings:
         self.aws = AWSSettings()
         self.worker = WorkerSettings()
         self.cron = CronSettings()
+        self.event_streaming = EventStreamingSettings()
 
 
 settings = Settings()

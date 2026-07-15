@@ -17,6 +17,7 @@ from aegra_api.api.activity_logs import router as activity_logs_router
 from aegra_api.api.assistants import router as assistants_router
 from aegra_api.api.career_advisors import router as career_advisors_router
 from aegra_api.api.crons import router as crons_router
+from aegra_api.api.event_streaming import router as event_streaming_router
 from aegra_api.api.management import router as management_router
 from aegra_api.api.notifications_ws import router as notifications_ws_router
 from aegra_api.api.opportunities import router as opportunities_router
@@ -56,6 +57,7 @@ OPENAPI_TAGS: list[dict[str, Any]] = [
     {"name": "Stateless Runs", "description": "Invoke a graph without state or memory persistence."},
     {"name": "Crons", "description": "Scheduled recurring runs on a cron schedule."},
     {"name": "Store", "description": "Persistent key-value and semantic storage available from any thread."},
+    {"name": "Event Streaming", "description": "Agent Protocol v2 thread event streaming and commands."},
     {"name": "Health", "description": "Server health checks and service information."},
     {"name": "Activity Logs", "description": "Track and retrieve activity logs for auditing and monitoring."},
     {"name": "Management", "description": "Administrative management endpoints and utilities."},
@@ -349,13 +351,19 @@ def _include_core_routers(app: FastAPI) -> None:
     Args:
         app: FastAPI application instance
     """
+    # health/assistants/threads/runs/stateless_runs/crons/store/event_streaming
+    # self-apply auth_dependency at their own APIRouter(...) construction
+    # (upstream's auth-hoist refactor) — do not double up here.
     app.include_router(health_router, prefix="", tags=["Health"])
-    app.include_router(assistants_router, dependencies=auth_dependency, prefix="", tags=["Assistants"])
-    app.include_router(threads_router, dependencies=auth_dependency, prefix="", tags=["Threads"])
-    app.include_router(runs_router, dependencies=auth_dependency, prefix="", tags=["Runs"])
-    app.include_router(stateless_runs_router, dependencies=auth_dependency, prefix="", tags=["Stateless Runs"])
-    app.include_router(crons_router, dependencies=auth_dependency, prefix="", tags=["Crons"])
-    app.include_router(store_router, dependencies=auth_dependency, prefix="", tags=["Store"])
+    app.include_router(assistants_router, prefix="", tags=["Assistants"])
+    app.include_router(threads_router, prefix="", tags=["Threads"])
+    app.include_router(runs_router, prefix="", tags=["Runs"])
+    app.include_router(stateless_runs_router, prefix="", tags=["Stateless Runs"])
+    app.include_router(crons_router, prefix="", tags=["Crons"])
+    app.include_router(store_router, prefix="", tags=["Store"])
+    app.include_router(event_streaming_router, prefix="", tags=["Event Streaming"])
+    # Fork-only routers still rely on this include_router-level dependency —
+    # their own APIRouter(...) calls don't set dependencies=auth_dependency.
     app.include_router(activity_logs_router, dependencies=auth_dependency, prefix="", tags=["Activity Logs"])
     app.include_router(management_router, dependencies=auth_dependency, prefix="", tags=["Management"])
     app.include_router(career_advisors_router, dependencies=auth_dependency, prefix="", tags=["Career Advisors"])
