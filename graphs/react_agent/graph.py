@@ -774,27 +774,32 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     store = runtime.store
     user_id = runtime.context.user_id
     ai_count = sum(1 for m in state.messages if isinstance(m, AIMessage))
+
+    if store and user_id:
+        namespace = (user_id, DEFAULT_MEMORY_NAMESPACE)
+
+        # AdvisorBehaviorProfile shapes tone for the whole conversation, not
+        # just a first-turn greeting (spec Item 4: injected "each turn") — it
+        # is fetched every turn, independent of the first-turn-only recall
+        # below, with its own targeted filter so a student with ≥20 memories
+        # can't push the profile out of the generic recall window. Placed
+        # after the cache breakpoint (dynamic block), so re-fetching it each
+        # turn does not affect prompt caching.
+        try:
+            behavior_items = await store.asearch(namespace, filter={"kind": "AdvisorBehaviorProfile"}, limit=5)
+            if behavior_items:
+                latest_behavior = max(
+                    behavior_items,
+                    key=lambda item: getattr(item, "updated_at", None) or getattr(item, "created_at", None) or "",
+                )
+                advisor_behavior_block = _prompts.build_advisor_behavior_block(latest_behavior.value.get("content", {}))
+        except Exception:
+            logger.debug("Advisor behavior profile load failed; continuing without.", exc_info=True)
+
     if store and user_id and ai_count == 0:
         try:
             namespace = (user_id, DEFAULT_MEMORY_NAMESPACE)
             existing_memories = await store.asearch(namespace, limit=20)
-
-            # AdvisorBehaviorProfile is fetched with a targeted filter, NOT taken
-            # from the 20-item generic recall above (spec Item 4): a student with
-            # ≥20 memories could otherwise push the profile out of that window and
-            # silently lose procedural adaptation. Pick the most recent match.
-            try:
-                behavior_items = await store.asearch(namespace, filter={"kind": "AdvisorBehaviorProfile"}, limit=5)
-                if behavior_items:
-                    latest_behavior = max(
-                        behavior_items,
-                        key=lambda item: getattr(item, "updated_at", None) or getattr(item, "created_at", None) or "",
-                    )
-                    advisor_behavior_block = _prompts.build_advisor_behavior_block(
-                        latest_behavior.value.get("content", {})
-                    )
-            except Exception:
-                logger.debug("Advisor behavior profile load failed; continuing without.", exc_info=True)
 
             if existing_memories:
                 memory_lines: list[str] = []
