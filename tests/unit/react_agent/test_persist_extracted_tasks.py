@@ -41,7 +41,7 @@ class TestPersistExtractedTasks:
         session_ctx = MagicMock()
         session_ctx.__aenter__ = AsyncMock(return_value=session)
         session_ctx.__aexit__ = AsyncMock(return_value=False)
-        monkeypatch.setattr(tools_module, "_get_task_session_maker", lambda: (lambda: session_ctx))
+        monkeypatch.setattr(tools_module, "_get_task_session_maker", lambda: lambda: session_ctx)
         monkeypatch.setattr(tools_module, "TASK_MEMORY_AVAILABLE", True)
 
         group = MagicMock()
@@ -79,7 +79,7 @@ class TestPersistExtractedTasks:
         session_ctx = MagicMock()
         session_ctx.__aenter__ = AsyncMock(return_value=session)
         session_ctx.__aexit__ = AsyncMock(return_value=False)
-        monkeypatch.setattr(tools_module, "_get_task_session_maker", lambda: (lambda: session_ctx))
+        monkeypatch.setattr(tools_module, "_get_task_session_maker", lambda: lambda: session_ctx)
         monkeypatch.setattr(tools_module, "TASK_MEMORY_AVAILABLE", True)
 
         group = MagicMock()
