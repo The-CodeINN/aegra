@@ -135,12 +135,17 @@ async def _cached_lms_get_with_evidence(
     parsed = urlparse(url)
     path = parsed.path
     full_path = f"{parsed.netloc}{parsed.path}"
-    uid = user_id or "anon"
-    key = _cache_key(uid, full_path)
     ttl = _ttl_for_path(full_path)
     fetched_at = datetime.now(tz=UTC).isoformat()
 
-    # Critical paths enforce live fetch.
+    # No caching without a real user_id: a shared "anon" bucket would let two
+    # different mis-authenticated callers read each other's cached response.
+    if not user_id:
+        ttl = 0
+    else:
+        key = _cache_key(user_id, full_path)
+
+    # Critical paths (and missing user_id) enforce live fetch.
     if ttl <= 0:
 
         @with_retry(max_retries=3)
@@ -2014,6 +2019,36 @@ async def get_open_tasks() -> dict[str, Any]:
     return {"ok": True, **group}
 
 
+async def get_completed_tasks() -> dict[str, Any]:
+    """Get the student's recently completed tasks — for "what have I done so far?" style questions.
+
+    Use this ONLY when the student explicitly asks about past completed work
+    (e.g. "what have I done so far", "what did I finish last month"). Do NOT
+    use this for check-ins or opening a conversation — those must stay
+    open-task-only via `get_open_tasks`. Completed tasks are never resurfaced
+    as if still live.
+    """
+    runtime = get_runtime(Context)
+    user_id = runtime.context.user_id
+
+    if not user_id:
+        return {"error": "Authentication required", "message": "Cannot fetch tasks without user context."}
+    if not TASK_MEMORY_AVAILABLE:
+        return {
+            "error": "Task memory service unavailable",
+            "message": "The task backend is not reachable from this environment.",
+        }
+
+    try:
+        session_maker = _get_task_session_maker()
+        async with session_maker() as session:
+            items = await _AccountabilityService.list_completed_items(session, user_id)
+        return {"ok": True, "completed": [_serialize_action_item(item) for item in items]}
+    except Exception:
+        logger.warning("Failed to fetch completed tasks for user=%s", user_id, exc_info=True)
+        return {"error": "Failed to fetch tasks", "message": "Task lookup failed — see server logs."}
+
+
 async def manage_task(
     action: str,
     *,
@@ -2145,5 +2180,5 @@ if OPPORTUNITIES_AVAILABLE:
 
 # Add task memory tools if the accountability service is available
 if TASK_MEMORY_AVAILABLE:
-    TOOLS.extend([get_open_tasks, manage_task])
+    TOOLS.extend([get_open_tasks, get_completed_tasks, manage_task])
     logger.info("Task memory tools enabled")

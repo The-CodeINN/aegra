@@ -278,11 +278,21 @@ async def report_progress(
     This triggers celebration/struggle notifications as appropriate.
     """
     from aegra_api.services.notification_engine import notification_engine
+    from aegra_api.services.scheduler import SchedulerService
 
     # Record as course activity
     await AccountabilityService.record_activity(session, user.identity, "course")
 
     result: dict[str, Any] = {"status": "recorded", "event_type": body.event_type}
+
+    # Resolve the student's actual advisor so these emails sign off with the
+    # right persona instead of silently falling through to
+    # create_notification's own DEFAULT_PERSONA ("Alexandra") for everyone.
+    # Only the three event types below send a notification, so skip the
+    # lookup entirely otherwise.
+    advisor_name = None
+    if body.event_type in ("course_completed", "milestone", "quiz_failed"):
+        advisor_name = await SchedulerService._resolve_advisor_first_name(user.identity)
 
     # Generate celebration notifications based on event type
     if body.event_type == "course_completed":
@@ -302,6 +312,7 @@ async def report_progress(
             ],
             metadata={"event_type": body.event_type, "course_name": body.course_name},
             check_frequency=False,
+            persona=advisor_name,
             student_context={"first_name": user.display_name, "email": getattr(user, "email", None)},
         )
         result["notification"] = "celebration_sent"
@@ -317,6 +328,7 @@ async def report_progress(
             priority="normal",
             metadata={"event_type": body.event_type, "progress": pct},
             check_frequency=True,
+            persona=advisor_name,
             student_context={"first_name": user.display_name, "email": getattr(user, "email", None)},
         )
         result["notification"] = "milestone_sent"
@@ -338,6 +350,7 @@ async def report_progress(
             ],
             metadata={"event_type": body.event_type, "score": body.score},
             check_frequency=True,
+            persona=advisor_name,
             student_context={"first_name": user.display_name, "email": getattr(user, "email", None)},
         )
         result["notification"] = "encouragement_sent"

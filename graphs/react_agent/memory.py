@@ -239,3 +239,25 @@ MEMORY_SCHEMAS: list[type[BaseModel]] = [
     EpisodicMemory,
     AdvisorBehaviorProfile,
 ]
+
+# Passed as `instructions` to create_memory_store_manager (background extraction).
+# The identity carve-out exists because a name mentioned anywhere in a
+# conversation — the student's own, a friend's, a hypothetical — was
+# previously getting captured as a StudentContext "fact" and then used to
+# address the student on later turns instead of get_student_profile()'s
+# actual name. Extraction must never write identity to memory at all; the
+# live agent's own Identity rule (prompts.py) is the only place that governs
+# how the student is addressed.
+MEMORY_EXTRACTION_INSTRUCTIONS = """You are extracting durable memories about a student from a career-advising
+conversation, structured into the provided schemas (career goals, background facts, feedback the
+student gave about your approach, and references to external resources they've shared).
+
+Extract only what is clearly stated or directly implied — do not speculate. Consolidate and update
+existing memories rather than duplicating them. Prefer dense, specific facts over vague ones.
+
+CRITICAL — never extract identity:
+Do NOT create or update any memory whose content is a name — the student's own name, a name they
+mention for someone else (a friend, colleague, recruiter), or a name from a hypothetical or story.
+This applies regardless of which schema or category it might otherwise fit under. The student's
+name is never durable-memory content; it comes exclusively from get_student_profile() at read time,
+not from anything extracted here. If an existing memory already contains a name as fact, delete it."""

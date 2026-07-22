@@ -13,12 +13,6 @@ ExecutionEventType = Literal[
     "tool_completed",
     "tool_failed",
     "tool_timeout",
-    # Context compaction
-    "reactive_compact_attempted",
-    "reactive_compact_succeeded",
-    "reactive_compact_failed",
-    "microcompact_applied",
-    "context_collapse_triggered",
     # Retry / fallback
     "retry_exhausted",
     "fallback_mode",

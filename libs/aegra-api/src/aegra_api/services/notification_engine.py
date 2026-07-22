@@ -224,6 +224,11 @@ class NotificationEngine:
                     ctx_parts.append(f"This student responds best to: {context['behavior_profile']}")
                 if context.get("relevant_episode"):
                     ctx_parts.append(f"Shared history: {context['relevant_episode']}")
+                # Durable facts the live agent has learned (spec Item 7 — same
+                # source call_model reads, via context_assembly), not just the
+                # static onboarding-form goal.
+                if context.get("semantic_context"):
+                    ctx_parts.append(f"What the advisor knows about this student:\n{context['semantic_context']}")
 
             context_str = "\n".join(ctx_parts) if ctx_parts else "No additional context."
 
@@ -604,6 +609,11 @@ class NotificationEngine:
         # SchedulerService._build_student_context → fetch_advisor_memory_context.
         relevant_episode = student_context.get("relevant_episode") or ""
         behavior_profile = student_context.get("behavior_profile") or ""
+        # Durable facts the live agent has learned (career goals, background,
+        # preferences) — same react_agent.context_assembly function call_model
+        # uses, so this can reflect a goal the agent updated mid-conversation,
+        # not just the static onboarding-form value.
+        semantic_context = student_context.get("semantic_context") or ""
         # Course progress fields from MongoDB enrollment data
         enrolled_course = student_context.get("enrolled_course") or ""
         course_progress_pct = student_context.get("course_progress_pct", 0)
@@ -654,6 +664,8 @@ class NotificationEngine:
                 data_summary += f"Relevant shared history (a real past event with this student): {relevant_episode}\n"
             if behavior_profile:
                 data_summary += f"How this student responds best (learned from past sessions): {behavior_profile}\n"
+            if semantic_context:
+                data_summary += f"What the advisor knows about this student:\n{semantic_context}\n"
             if enrolled_course:
                 data_summary += f"Enrolled course: {enrolled_course}\n"
             if course_progress_pct:

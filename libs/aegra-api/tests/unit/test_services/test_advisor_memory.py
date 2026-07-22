@@ -7,6 +7,8 @@ degrades to empty context (never an error) when the store is unavailable.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -14,6 +16,13 @@ import pytest
 
 from aegra_api.services import advisor_memory
 from aegra_api.services.advisor_memory import fetch_advisor_memory_context
+
+# advisor_memory lazily imports react_agent.context_assembly (mirrors how the
+# real aegra server adds graphs/ to sys.path at startup via aegra.json's
+# `dependencies` — see langgraph_service._setup_dependencies).
+_GRAPHS_ROOT = Path(__file__).resolve().parents[5] / "graphs"
+if str(_GRAPHS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_GRAPHS_ROOT))
 
 
 def _store_item(kind: str, content: dict | str, updated_at: str = "2026-07-01T00:00:00") -> SimpleNamespace:
@@ -29,17 +38,20 @@ def _patch_store(monkeypatch: pytest.MonkeyPatch, store: MagicMock | None) -> No
     monkeypatch.setattr(advisor_memory, "db_manager", manager)
 
 
+_EMPTY_CONTEXT = {"relevant_episode": "", "behavior_profile": "", "semantic_context": ""}
+
+
 @pytest.mark.asyncio
 async def test_returns_empty_context_when_store_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_store(monkeypatch, None)
     result = await fetch_advisor_memory_context("user-1", query="sql joins")
-    assert result == {"relevant_episode": "", "behavior_profile": ""}
+    assert result == _EMPTY_CONTEXT
 
 
 @pytest.mark.asyncio
 async def test_returns_empty_context_for_missing_user_id(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_store(monkeypatch, MagicMock())
-    assert await fetch_advisor_memory_context("") == {"relevant_episode": "", "behavior_profile": ""}
+    assert await fetch_advisor_memory_context("") == _EMPTY_CONTEXT
 
 
 @pytest.mark.asyncio
@@ -113,4 +125,37 @@ async def test_store_errors_never_propagate(monkeypatch: pytest.MonkeyPatch) -> 
     _patch_store(monkeypatch, store)
 
     result = await fetch_advisor_memory_context("user-1", query="anything")
-    assert result == {"relevant_episode": "", "behavior_profile": ""}
+    assert result == _EMPTY_CONTEXT
+
+
+@pytest.mark.asyncio
+async def test_semantic_context_uses_shared_context_assembly_function(monkeypatch: pytest.MonkeyPatch) -> None:
+    """semantic_context must come from the SAME function call_model uses (spec Item 7 §9.1),
+    not a parallel reimplementation — proven here by patching that exact function."""
+    _patch_store(monkeypatch, MagicMock())
+
+    import react_agent.context_assembly as context_assembly
+
+    async def _fake_semantic_block(store, user_id, *, limit=20):
+        return "raw", "  [CareerGoal] Data Scientist"
+
+    monkeypatch.setattr(context_assembly, "fetch_semantic_memory_block", _fake_semantic_block)
+
+    result = await fetch_advisor_memory_context("user-1")
+    assert result["semantic_context"] == "  [CareerGoal] Data Scientist"
+
+
+@pytest.mark.asyncio
+async def test_behavior_profile_uses_shared_context_assembly_function(monkeypatch: pytest.MonkeyPatch) -> None:
+    """behavior_profile selection must come from the SAME function call_model uses."""
+    _patch_store(monkeypatch, MagicMock())
+
+    import react_agent.context_assembly as context_assembly
+
+    async def _fake_profile(store, user_id):
+        return {"trait": "responds well to direct challenge"}
+
+    monkeypatch.setattr(context_assembly, "fetch_advisor_behavior_profile", _fake_profile)
+
+    result = await fetch_advisor_memory_context("user-1")
+    assert "responds well to direct challenge" in result["behavior_profile"]

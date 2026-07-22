@@ -61,7 +61,7 @@ class AccountabilityService:
         query = (
             select(ActionItem)
             .where(ActionItem.user_id == user_id, ActionItem.status.in_(statuses))
-            .order_by(ActionItem.created_at.desc())
+            .order_by(ActionItem.due_date.asc().nulls_last(), ActionItem.created_at.desc())
         )
         result = await session.execute(query)
         return result.scalars().all()
@@ -101,6 +101,23 @@ class AccountabilityService:
         await session.commit()
         await session.refresh(item)
         return item
+
+    @staticmethod
+    async def list_completed_items(session: AsyncSession, user_id: str, limit: int = 20) -> Sequence[ActionItem]:
+        """Return the user's most recently completed tasks — for "what have I done" recall.
+
+        Kept separate from list_action_items (which defaults to open-only and
+        feeds check-ins/dashboard) so completed tasks are answerable on request
+        without ever leaking into the open-task surfaces.
+        """
+        query = (
+            select(ActionItem)
+            .where(ActionItem.user_id == user_id, ActionItem.status == "completed")
+            .order_by(ActionItem.updated_at.desc())
+            .limit(limit)
+        )
+        result = await session.execute(query)
+        return result.scalars().all()
 
     @staticmethod
     async def get_open_and_overdue(session: AsyncSession, user_id: str) -> OpenTaskGroup:

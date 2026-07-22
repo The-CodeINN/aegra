@@ -12,6 +12,20 @@ Memory architecture (LangMem):
                 agent native tools to persist and retrieve durable facts about
                 the user across ALL threads.  The agent decides proactively when
                 to store or search — no keyword heuristics are required.
+
+Compaction (spec Item 5, §7.2 — one clean path, not four):
+  1. Write  — before ``summarize`` compresses anything, it awaits any
+              still-in-flight ``consolidate_memories`` background write from
+              the previous turn (``_await_pending_writes``), so durable facts
+              and open tasks are never summarized away before they've
+              survived elsewhere.
+  2. Summarize — LangMem's SummarizationNode compresses the older prefix once
+              history exceeds ``_SUMMARY_TRIGGER_TOKENS``.
+  3. Keep    — SummarizationNode always keeps the most recent messages
+              verbatim; immediate context is never lossy.
+  4. Circuit breaker — after 3 consecutive summarization failures, skip
+              compression and pass the full history through rather than
+              retrying with more compaction mechanisms.
 """
 
 import asyncio
@@ -37,13 +51,8 @@ from aegra_api.services.career_advisor_activation import (
 )
 from react_agent import prompt_caching as _prompt_caching
 from react_agent import prompts as _prompts
-from react_agent.compaction import (
-    CompactionTier,
-    context_collapse,
-    microcompact_messages,
-    select_compaction_tier,
-)
 from react_agent.context import Context
+from react_agent.context_assembly import fetch_advisor_behavior_profile, fetch_semantic_memory_block
 from react_agent.cost_tracker import (
     SessionCost,
     extract_usage_from_message,
@@ -58,7 +67,12 @@ from react_agent.guardrails import (
     screen_output_for_hallucination,
     screen_output_for_leak,  # also used to validate session notes
 )
-from react_agent.memory import DEFAULT_MEMORY_NAMESPACE, MAX_MEMORIES_PER_USER, MEMORY_SCHEMAS, memory_freshness_note
+from react_agent.memory import (
+    DEFAULT_MEMORY_NAMESPACE,
+    MAX_MEMORIES_PER_USER,
+    MEMORY_EXTRACTION_INSTRUCTIONS,
+    MEMORY_SCHEMAS,
+)
 from react_agent.message_utils import (
     apply_tool_result_budget as _apply_tool_result_budget,
 )
@@ -679,6 +693,15 @@ async def summarize(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
             "summarization_failure_count": state.summarization_failure_count,
         }
 
+    # Write-before-compact (spec Item 5, §7.2 step 1): only when this pass is
+    # actually about to compress history — waiting on every turn regardless
+    # would add latency for no benefit, since nothing is at risk of being
+    # summarized away until the trigger is crossed.
+    if count_tokens_approximately(state.messages) > _SUMMARY_TRIGGER_TOKENS:
+        config = get_config()
+        thread_id = config.get("configurable", {}).get("thread_id") if config else None
+        await _await_pending_writes(thread_id)
+
     try:
         node = _get_summarization_node(runtime)
         result = await node.ainvoke(
@@ -714,7 +737,6 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
 
     Enhanced with:
     - Fallback model support (automatic model swap on overload)
-    - Multi-tier compaction (microcompact + context collapse)
     - Hallucination screening (grounding verification)
     - Cost/token tracking per session
     - Max output token recovery
@@ -770,66 +792,27 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     # before its first response without relying on it to call search_memory.
     proactive_memory_text: str = ""
     proactive_memory_block: str = ""
-    advisor_behavior_block: str = ""
     store = runtime.store
     user_id = runtime.context.user_id
     ai_count = sum(1 for m in state.messages if isinstance(m, AIMessage))
 
-    if store and user_id:
-        namespace = (user_id, DEFAULT_MEMORY_NAMESPACE)
-
-        # AdvisorBehaviorProfile shapes tone for the whole conversation, not
-        # just a first-turn greeting (spec Item 4: injected "each turn") — it
-        # is fetched every turn, independent of the first-turn-only recall
-        # below, with its own targeted filter so a student with ≥20 memories
-        # can't push the profile out of the generic recall window. Placed
-        # after the cache breakpoint (dynamic block), so re-fetching it each
-        # turn does not affect prompt caching.
-        try:
-            behavior_items = await store.asearch(namespace, filter={"kind": "AdvisorBehaviorProfile"}, limit=5)
-            if behavior_items:
-                latest_behavior = max(
-                    behavior_items,
-                    key=lambda item: getattr(item, "updated_at", None) or getattr(item, "created_at", None) or "",
-                )
-                advisor_behavior_block = _prompts.build_advisor_behavior_block(latest_behavior.value.get("content", {}))
-        except Exception:
-            logger.debug("Advisor behavior profile load failed; continuing without.", exc_info=True)
+    # AdvisorBehaviorProfile shapes tone for the whole conversation, not just
+    # a first-turn greeting (spec Item 4: injected "each turn") — fetched
+    # every turn, independent of the first-turn-only recall below. Placed
+    # after the cache breakpoint (dynamic block), so re-fetching it each turn
+    # does not affect prompt caching. Shared with outreach generation via
+    # context_assembly (spec Item 7, §9.1) — same selection rule everywhere.
+    behavior_content = await fetch_advisor_behavior_profile(store, user_id)
+    advisor_behavior_block = _prompts.build_advisor_behavior_block(behavior_content) if behavior_content else ""
 
     if store and user_id and ai_count == 0:
-        try:
-            namespace = (user_id, DEFAULT_MEMORY_NAMESPACE)
-            existing_memories = await store.asearch(namespace, limit=20)
-
-            if existing_memories:
-                memory_lines: list[str] = []
-                for item in existing_memories:
-                    kind = item.value.get("kind", "unknown")
-                    if kind == "AdvisorBehaviorProfile":
-                        continue  # rendered separately in its own emphasized block above
-                    content = item.value.get("content", {})
-                    updated_at = getattr(item, "updated_at", None) or getattr(item, "created_at", None)
-                    freshness = memory_freshness_note(updated_at, kind=kind)
-                    summary = str(content) if isinstance(content, dict) else str(content)
-                    line = f"  [{kind}] {summary[:200]}"
-                    if freshness:
-                        line += f"\n  {freshness}"
-                    memory_lines.append(line)
-                if memory_lines:
-                    memory_block = "\n".join(memory_lines)
-                    # Grounding text for the hallucination screen (screen_output_for_hallucination),
-                    # kept with freshness tags intact — see tool_result_texts below.
-                    proactive_memory_text = memory_block
-                    # Strip freshness metadata from what the model sees —
-                    # the <system-reminder> tags cause the model to make
-                    # false temporal claims like "it's been a few days".
-                    clean_block = re.sub(
-                        r"\n?\s*<system-reminder>.*?</system-reminder>",
-                        "",
-                        memory_block,
-                        flags=re.DOTALL,
-                    )
-                    proactive_memory_block = f"""
+        # Shared with outreach generation via context_assembly (spec Item 7).
+        memory_block, clean_block = await fetch_semantic_memory_block(store, user_id, limit=20)
+        if memory_block:
+            # Grounding text for the hallucination screen (screen_output_for_hallucination),
+            # kept with freshness tags intact — see tool_result_texts below.
+            proactive_memory_text = memory_block
+            proactive_memory_block = f"""
 <proactive_memory_recall>
 The following memories were recalled for this student at the start of the conversation.
 Use them to personalize your response. Do NOT repeat these verbatim — weave them naturally.
@@ -839,8 +822,6 @@ conversation and greet the student without time references.
 
 {clean_block}
 </proactive_memory_recall>"""
-        except Exception:
-            logger.debug("Proactive memory load failed; continuing without.", exc_info=True)
 
     # --- Proactive task load (spec Item 2: conversation-start injection) ---
     # Same trigger as proactive memory load (first turn of a new conversation)
@@ -881,37 +862,13 @@ conversation and greet the student without time references.
     prepared_messages = _apply_tool_result_budget(prepared_messages)
     prepared_messages = _snip_old_tool_results(prepared_messages)
 
-    # --- Multi-tier compaction check (Tier 1: microcompact) ---
-    _did_microcompact = False
-    if not state.has_attempted_microcompact:
-        tier = select_compaction_tier(
-            prepared_messages,
-            has_attempted_microcompact=state.has_attempted_microcompact,
-            has_attempted_collapse=state.has_attempted_context_collapse,
-        )
-        if tier == CompactionTier.MICROCOMPACT:
-            try:
-                compact_model = load_chat_model(runtime.context.guardrail_model)
-                prepared_messages, chars_saved = await microcompact_messages(prepared_messages, compact_model)
-                if chars_saved > 0:
-                    _did_microcompact = True
-                    execution_events.append(
-                        serialize_event(
-                            ExecutionEvent(
-                                event_type="microcompact_applied",
-                                message=f"Microcompact saved {chars_saved} characters.",
-                                metadata={"chars_saved": chars_saved},
-                            )
-                        )
-                    )
-            except Exception:
-                logger.warning("Microcompact failed — continuing with original messages")
-
-    # Reactive compact: if the context is too long and we haven't tried yet,
-    # force a summarisation pass and retry the model call once.
-    # Mirrors Claude-code's REACTIVE_COMPACT pattern.
-    _did_reactive_compact = False
-    _did_context_collapse = False
+    # Compaction is a single proactive path now (spec Item 5, §7.2): the
+    # `summarize` node already ran before this node and compressed history if
+    # it exceeded `_SUMMARY_TRIGGER_TOKENS`, with its own circuit breaker.
+    # There is deliberately no reactive retry chain here any more — if a
+    # model call still overflows context despite that, raising the trigger
+    # (16k of Sonnet's 200k window) is meant to make this unreachable in
+    # normal operation, so a single fallback response is enough.
     agent_tool_results: list[str] = []
     try:
         response, invoke_events, usage_metadata, agent_tool_results = await _invoke_integrated_agent(
@@ -933,118 +890,23 @@ conversation and greet the student without time references.
                 "context window",
             )
         )
-        if is_context_overflow and not state.has_attempted_reactive_compact:
-            execution_events.append(
-                serialize_event(
-                    ExecutionEvent(
-                        event_type="reactive_compact_attempted",
-                        level="warning",
-                        message="Attempting reactive compact after context overflow.",
-                        metadata={"error": str(first_exc)[:200]},
-                    )
-                )
-            )
-            logger.warning(
-                "Context overflow detected — attempting reactive compact before retry: %s",
-                str(first_exc)[:200],
-            )
-            try:
-                summ_node = _get_summarization_node(runtime)
-                summ_result = await summ_node.ainvoke(
-                    {
-                        "messages": list(state.messages),
-                        "context": dict(state.context or {}),
-                    },
-                    config=RunnableConfig(callbacks=[]),
-                )
-                prepared_messages = summ_result.get("summarized_messages", prepared_messages)
-                response, invoke_events, usage_metadata, agent_tool_results = await _invoke_integrated_agent(
-                    prepared_messages, runtime, system_message
-                )
-                execution_events.extend(invoke_events)
-                if usage_metadata:
-                    session_cost = track_llm_usage(session_cost, runtime.context.model, usage_metadata)
-                execution_events.append(
-                    serialize_event(
-                        ExecutionEvent(
-                            event_type="reactive_compact_succeeded",
-                            message="Reactive compact succeeded and model invocation was retried.",
-                        )
-                    )
-                )
-                _did_reactive_compact = True
-            except Exception:
-                # Reactive compact failed — try context collapse as last resort
-                logger.exception("Reactive compact recovery also failed — attempting context collapse")
-                if not state.has_attempted_context_collapse:
-                    try:
-                        collapse_model = load_chat_model(runtime.context.guardrail_model)
-                        collapsed = await context_collapse(list(state.messages), collapse_model)
-                        response, invoke_events, usage_metadata, agent_tool_results = await _invoke_integrated_agent(
-                            collapsed, runtime, system_message
-                        )
-                        execution_events.extend(invoke_events)
-                        if usage_metadata:
-                            session_cost = track_llm_usage(session_cost, runtime.context.model, usage_metadata)
-                        execution_events.append(
-                            serialize_event(
-                                ExecutionEvent(
-                                    event_type="context_collapse_triggered",
-                                    level="warning",
-                                    message="Context collapse succeeded after reactive compact failure.",
-                                )
-                            )
-                        )
-                        _did_context_collapse = True
-                    except Exception:
-                        logger.exception("Context collapse also failed")
-                        execution_events.append(
-                            serialize_event(
-                                ExecutionEvent(
-                                    event_type="reactive_compact_failed",
-                                    level="error",
-                                    message="All compaction tiers failed; returning fallback response.",
-                                )
-                            )
-                        )
-                        response = AIMessage(
-                            content="I'm having trouble processing this conversation right now. Please try again."
-                        )
-                        execution_events.append(
-                            serialize_event(
-                                ExecutionEvent(
-                                    event_type="fallback_mode",
-                                    level="warning",
-                                    message="Returned fallback response after all compaction tiers failed.",
-                                    metadata={"component": "model"},
-                                )
-                            )
-                        )
-                else:
-                    execution_events.append(
-                        serialize_event(
-                            ExecutionEvent(
-                                event_type="reactive_compact_failed",
-                                level="error",
-                                message="Reactive compact failed; returning fallback response.",
-                            )
-                        )
-                    )
-                    response = AIMessage(
-                        content="I'm having trouble processing this conversation right now. Please try again."
-                    )
-                    execution_events.append(
-                        serialize_event(
-                            ExecutionEvent(
-                                event_type="fallback_mode",
-                                level="warning",
-                                message="Returned fallback response after reactive compact failure.",
-                                metadata={"component": "model"},
-                            )
-                        )
-                    )
-        else:
+        if not is_context_overflow:
             raise
+        logger.error(
+            "Context overflow despite proactive compaction — returning fallback response: %s",
+            str(first_exc)[:200],
+        )
+        execution_events.append(
+            serialize_event(
+                ExecutionEvent(
+                    event_type="fallback_mode",
+                    level="error",
+                    message="Context overflow despite proactive compaction; returned fallback response.",
+                    metadata={"component": "model", "error": str(first_exc)[:200]},
+                )
+            )
+        )
+        response = AIMessage(content="I'm having trouble processing this conversation right now. Please try again.")
 
     # --- Max output token recovery ---
     # If the model hit its output token limit, retry with a continuation prompt.
@@ -1246,9 +1108,6 @@ conversation and greet the student without time references.
                 )
             ],
             "tool_call_counts": updated_counts,
-            "has_attempted_reactive_compact": state.has_attempted_reactive_compact or _did_reactive_compact,
-            "has_attempted_context_collapse": state.has_attempted_context_collapse or _did_context_collapse,
-            "has_attempted_microcompact": state.has_attempted_microcompact or _did_microcompact,
             "session_cost": session_cost,
             "execution_events": execution_events,
             "agent_wrote_memory": _agent_wrote_memory,
@@ -1258,9 +1117,6 @@ conversation and greet the student without time references.
     return {
         "messages": [response],
         "tool_call_counts": updated_counts,
-        "has_attempted_reactive_compact": state.has_attempted_reactive_compact or _did_reactive_compact,
-        "has_attempted_context_collapse": state.has_attempted_context_collapse or _did_context_collapse,
-        "has_attempted_microcompact": state.has_attempted_microcompact or _did_microcompact,
         "session_cost": session_cost,
         "execution_events": execution_events,
         "agent_wrote_memory": _agent_wrote_memory,
@@ -1349,8 +1205,13 @@ _background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
 _MAX_BACKGROUND_TASKS = 100
 
 
-def _spawn_background_task(coro, label: str = "") -> None:
-    """Create a fire-and-forget asyncio.Task with pool overflow protection."""
+def _spawn_background_task(coro, label: str = "", *, thread_id: str | None = None) -> None:
+    """Create a fire-and-forget asyncio.Task with pool overflow protection.
+
+    When ``thread_id`` is given, the task is also tracked in
+    ``_pending_writes_by_thread`` so ``summarize`` can await it before
+    compacting that thread's history (write-before-compact, spec Item 5).
+    """
     task = asyncio.create_task(coro)
     if len(_background_tasks) >= _MAX_BACKGROUND_TASKS:
         logger.warning(
@@ -1362,6 +1223,42 @@ def _spawn_background_task(coro, label: str = "") -> None:
         return
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+    if thread_id:
+        pending = _pending_writes_by_thread.setdefault(thread_id, set())
+        pending.add(task)
+        task.add_done_callback(lambda _t, _pending=pending: _pending.discard(_t))
+
+
+# Tracks in-flight consolidate_memories background writes per thread, so the
+# summarize node can wait for the previous turn's write-before-compact writes
+# to land before compacting that turn's messages away (spec Item 5, §7.2).
+_pending_writes_by_thread: dict[str, set[asyncio.Task]] = {}
+_WRITE_BEFORE_COMPACT_TIMEOUT_SECONDS = 5.0
+
+
+async def _await_pending_writes(thread_id: str | None) -> None:
+    """Wait (bounded) for the previous turn's background writes to land.
+
+    A timeout is a safety valve, not an expected outcome — the writes are
+    small JSON-extraction calls that normally finish in well under a second,
+    long before the user reads and replies to the previous turn.
+    """
+    if not thread_id:
+        return
+    pending = _pending_writes_by_thread.get(thread_id)
+    if not pending:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True),
+            timeout=_WRITE_BEFORE_COMPACT_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        logger.warning(
+            "write-before-compact: timed out after %.1fs waiting for prior-turn writes (thread=%s)",
+            _WRITE_BEFORE_COMPACT_TIMEOUT_SECONDS,
+            thread_id,
+        )
 
 
 # Cold-path task extraction (spec Item 2, §4.2). Only the last exchange is
@@ -1484,6 +1381,7 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
                     manager = create_memory_store_manager(
                         model,
                         schemas=MEMORY_SCHEMAS,
+                        instructions=MEMORY_EXTRACTION_INSTRUCTIONS,
                         namespace=namespace,
                         store=store,
                         enable_deletes=True,
@@ -1565,7 +1463,7 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
                     logger.exception("Background memory consolidation failed; continuing.")
                     break
 
-        _spawn_background_task(_run_consolidation(), f"consolidation-{user_id}")
+        _spawn_background_task(_run_consolidation(), f"consolidation-{user_id}", thread_id=thread_id or None)
     else:
         logger.info(
             "Skipping background consolidation — agent wrote memories during hot path (user=%s)",
@@ -1608,7 +1506,7 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
             except Exception:
                 logger.debug("Background session memory extraction failed; continuing.", exc_info=True)
 
-        _spawn_background_task(_run_session_memory(), f"session-mem-{thread_id}")
+        _spawn_background_task(_run_session_memory(), f"session-mem-{thread_id}", thread_id=thread_id or None)
 
     # ---- 3. Cold-path task extraction (spec Item 2, §4.2) ----
     # Mutual exclusion mirrors memory consolidation: skip when the agent already
@@ -1628,7 +1526,7 @@ async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[
             except Exception:
                 logger.debug("Background cold-path task extraction failed; continuing.", exc_info=True)
 
-        _spawn_background_task(_run_task_extraction(), f"task-extract-{user_id}")
+        _spawn_background_task(_run_task_extraction(), f"task-extract-{user_id}", thread_id=thread_id or None)
 
     return {}
 

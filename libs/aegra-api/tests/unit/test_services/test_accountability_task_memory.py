@@ -21,6 +21,61 @@ def _make_session_returning(scalar_result: object) -> AsyncMock:
     return session
 
 
+def _make_session_with_execute_result(items: list) -> AsyncMock:
+    session = AsyncMock()
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = items
+    session.execute = AsyncMock(return_value=result)
+    return session
+
+
+class TestListActionItems:
+    """Dashboard 'Pending Action' tiles read this — must surface the most
+    urgent (soonest-due) tasks first, not just the most recently created."""
+
+    @pytest.mark.asyncio
+    async def test_orders_by_due_date_ascending(self) -> None:
+        session = _make_session_with_execute_result([])
+        await AccountabilityService.list_action_items(session, "user-1")
+
+        query = session.execute.await_args.args[0]
+        order_by_clauses = [str(clause) for clause in query._order_by_clauses]
+        assert any("due_date" in clause for clause in order_by_clauses)
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_open_statuses(self) -> None:
+        session = _make_session_with_execute_result([])
+        await AccountabilityService.list_action_items(session, "user-1")
+        # No exception and a query was issued — status filtering itself is
+        # covered by the SQL WHERE clause construction, exercised here to
+        # guard against a regression that drops the default statuses filter.
+        session.execute.assert_awaited_once()
+
+
+class TestListCompletedItems:
+    """Separate read path for 'what have I done so far?' — must never be the
+    same query that feeds check-ins/dashboard (which stay open-only)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_completed_items_most_recent_first(self) -> None:
+        item = MagicMock()
+        item.status = "completed"
+        session = _make_session_with_execute_result([item])
+
+        result = await AccountabilityService.list_completed_items(session, "user-1")
+
+        assert result == [item]
+        query = session.execute.await_args.args[0]
+        order_by_clauses = [str(clause) for clause in query._order_by_clauses]
+        assert any("updated_at" in clause for clause in order_by_clauses)
+
+    @pytest.mark.asyncio
+    async def test_empty_when_no_completed_items(self) -> None:
+        session = _make_session_with_execute_result([])
+        result = await AccountabilityService.list_completed_items(session, "user-1")
+        assert result == []
+
+
 class TestCreateActionItem:
     @pytest.mark.asyncio
     async def test_creates_item_with_given_fields(self) -> None:

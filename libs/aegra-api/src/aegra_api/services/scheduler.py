@@ -366,6 +366,7 @@ class SchedulerService:
                     if notif:
                         item.reminder_sent_count += 1
                         item.last_reminder_sent = now
+                        item.last_reminder_tier = tier
                         logger.info(
                             "deadline_reminder_sent",
                             item_id=item.id,
@@ -378,13 +379,31 @@ class SchedulerService:
             logger.error("check_deadlines error", error=str(e), exc_info=True)
 
     async def _should_send_reminder(self, item: ActionItem, tier: str, now: datetime) -> bool:
+        """Send once per tier crossing; only overdue tiers may repeat, and only with restraint.
+
+        check_deadlines runs every 15 minutes, so gating on elapsed time alone
+        (the previous behaviour) resent the SAME tier's identical email every
+        ~4h for as long as the task sat in that tier — up to a dozen "Due
+        This Week" emails before the task ever reached "3d". A tier is a
+        one-time milestone crossing, not a recurring state to keep notifying.
+        """
         if item.reminder_sent_count == 0:
             return True
+        if item.last_reminder_tier != tier:
+            return True  # escalated (or moved) to a different tier — worth a fresh nudge
+
+        # Same tier as last time: 7d/3d/24h/2h never repeat within themselves.
+        # Only overdue tiers keep chasing, and even then at most once a day,
+        # capped at 5 total sends.
+        if not tier.startswith("overdue"):
+            return False
+        if item.reminder_sent_count >= 5:
+            return False
         if item.last_reminder_sent:
             hours_since = (now - item.last_reminder_sent).total_seconds() / 3600
-            if hours_since < 2:
+            if hours_since < 24:
                 return False
-        return not (tier.startswith("overdue") and item.reminder_sent_count >= 5)
+        return True
 
     # ------------------------------------------------------------------
     # Inactivity detection
@@ -512,6 +531,12 @@ class SchedulerService:
                         if exists.scalars().first():
                             continue
 
+                        # Resolve the student's actual advisor so the email
+                        # sign-off matches their track instead of silently
+                        # falling through to create_notification's own
+                        # DEFAULT_PERSONA ("Alexandra") for every student.
+                        advisor_name = await self._resolve_advisor_first_name(user_id)
+
                         await notification_engine.create_notification(
                             session=session,
                             user_id=user_id,
@@ -520,6 +545,7 @@ class SchedulerService:
                             category="celebration",
                             priority=cel.get("priority", "normal"),
                             metadata={"celebration_type": cel["type"]},
+                            persona=advisor_name,
                             check_frequency=True,
                         )
 
@@ -753,9 +779,11 @@ class SchedulerService:
             # Named tasks, not just counts (spec Item 7) — [{description, due_date, miss_count}, ...]
             "overdue_task_details": [],
             "pending_task_details": [],
-            # Advisor memory (spec Item 7) — shared history + learned tone
+            # Advisor memory (spec Item 7) — shared history + learned tone +
+            # durable facts, all via context_assembly (shared with live chat)
             "relevant_episode": "",
             "behavior_profile": "",
+            "semantic_context": "",
             "first_name": "",
             "primary_goal": "",
             # Course progress fields — populated from MongoDB enrollment data

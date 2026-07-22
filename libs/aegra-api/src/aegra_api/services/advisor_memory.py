@@ -2,8 +2,18 @@
 
 Proactive outreach (agent optimisation spec Item 7, sections 9.1/9.3) must read
 the SAME memory stack the live advisor uses — episodic memory for shared
-history and the procedural behavior profile for tone — without running a live
-agent turn. This module is that read-only assembly path; it never writes.
+history, the procedural behavior profile for tone, and durable semantic facts
+(career goal, background) — without running a live agent turn. This module is
+that read-only assembly path; it never writes.
+
+Structural unification: the AdvisorBehaviorProfile fetch/selection and the
+general semantic-memory fetch/rendering are NOT reimplemented here — they're
+imported from ``react_agent.context_assembly``, the exact same functions
+``call_model`` calls for live chat, so outreach can never silently drift from
+what the live agent would actually say. Only the episodic-memory fetch has no
+live-agent equivalent to share (the live agent recalls episodes on demand via
+its own ``search_memory`` tool call, which outreach — having no live agent
+turn — cannot do; it fetches one proactively instead).
 """
 
 from __future__ import annotations
@@ -47,14 +57,16 @@ async def _search_kind(store: Any, namespace: tuple[str, str], kind: str, *, que
 
 
 async def fetch_advisor_memory_context(user_id: str, *, query: str | None = None) -> dict[str, str]:
-    """Return ``{"relevant_episode", "behavior_profile"}`` for outreach personalisation.
+    """Return advisor memory context for outreach personalisation.
+
+    Keys: ``relevant_episode``, ``behavior_profile``, ``semantic_context``.
 
     ``query`` (e.g. overdue task descriptions + goal) drives semantic selection
     of the single most relevant episode — never the whole event log (the spec's
     isolation principle). Best-effort: empty strings when the store is
-    unavailable or the student has no episodic/procedural memories yet.
+    unavailable or the student has no memories of a given type yet.
     """
-    result = {"relevant_episode": "", "behavior_profile": ""}
+    result = {"relevant_episode": "", "behavior_profile": "", "semantic_context": ""}
     if not user_id:
         return result
 
@@ -64,20 +76,26 @@ async def fetch_advisor_memory_context(user_id: str, *, query: str | None = None
         logger.debug("LangGraph store unavailable; outreach proceeds without advisor memory.")
         return result
 
+    # Lazy import: graphs/ is only added to sys.path by aegra's dependency
+    # loader (aegra.json `dependencies`), which may not have run yet at this
+    # module's own import time — deferring avoids an import-order race.
+    from react_agent.context_assembly import fetch_advisor_behavior_profile, fetch_semantic_memory_block
+
     namespace = (user_id, MEMORY_NAMESPACE_LABEL)
 
     episodes = await _search_kind(store, namespace, "EpisodicMemory", query=query, limit=1)
     if episodes:
         result["relevant_episode"] = _render_memory_content(episodes[0].value.get("content", {}), _EPISODE_CHAR_LIMIT)
 
-    # Most recent profile wins — same selection rule as the live agent's
-    # proactive load in graphs/react_agent/graph.py.
-    profiles = await _search_kind(store, namespace, "AdvisorBehaviorProfile", query=None, limit=5)
-    if profiles:
-        latest = max(
-            profiles,
-            key=lambda item: getattr(item, "updated_at", None) or getattr(item, "created_at", None) or "",
-        )
-        result["behavior_profile"] = _render_memory_content(latest.value.get("content", {}), _PROFILE_CHAR_LIMIT)
+    behavior_content = await fetch_advisor_behavior_profile(store, user_id)
+    if behavior_content:
+        result["behavior_profile"] = _render_memory_content(behavior_content, _PROFILE_CHAR_LIMIT)
+
+    # Durable facts (CareerGoal/StudentContext/FeedbackMemory/ReferenceMemory)
+    # the live agent has learned — previously unavailable to outreach, which
+    # only had the static onboarding-form goal from Mongo, so a goal the
+    # agent updated mid-conversation could never reach an email.
+    _, semantic_block = await fetch_semantic_memory_block(store, user_id, limit=20)
+    result["semantic_context"] = semantic_block
 
     return result
