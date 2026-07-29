@@ -110,13 +110,30 @@ async def _enrich_run_context_with_user_data(context: dict[str, Any] | None, use
             )
             runtime_context["enrolled_course_ids"] = []
 
-    roadmap_generated = await get_roadmap_generated_flag_for_user(user.identity)
+    # Best-effort like the Mongo lookup above — a DB hiccup here must not take
+    # down run creation. Defaults to False, the same as a genuinely new user.
+    try:
+        roadmap_generated = await get_roadmap_generated_flag_for_user(user.identity)
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve roadmap_generated flag",
+            user_id=user.identity,
+            error=str(exc),
+        )
+        roadmap_generated = False
     runtime_context["roadmap_generated"] = roadmap_generated
 
     # A/B variant only matters once there's a roadmap to vary — assigning one
     # before a student's first roadmap would have nothing to govern yet.
     if roadmap_generated and "roadmap_variant" not in runtime_context:
-        runtime_context["roadmap_variant"] = await get_or_assign_roadmap_variant_for_user(user.identity)
+        try:
+            runtime_context["roadmap_variant"] = await get_or_assign_roadmap_variant_for_user(user.identity)
+        except Exception as exc:
+            logger.warning(
+                "Failed to resolve roadmap_variant assignment",
+                user_id=user.identity,
+                error=str(exc),
+            )
 
     return runtime_context
 

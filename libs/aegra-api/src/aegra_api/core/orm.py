@@ -29,7 +29,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Dialect
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -263,15 +263,9 @@ async_session_maker: async_sessionmaker[AsyncSession] | None = None
 
 
 def get_session_maker() -> async_sessionmaker[AsyncSession]:
-    """Return a cached async_sessionmaker bound to db_manager.engine."""
-    global async_session_maker
+    """Return the session maker initialized by initialize_session_maker() at app startup."""
     if async_session_maker is None:
-        from aegra_api.core.database import db_manager
-
-        # Ensure database is initialized before getting engine
-        if not db_manager.engine:
-            raise RuntimeError("Database not initialized. Call db_manager.initialize() during app startup.")
-        async_session_maker = async_sessionmaker(db_manager.engine, expire_on_commit=False)
+        raise RuntimeError("Database not initialized. Call db_manager.initialize() during app startup.")
     return async_session_maker
 
 
@@ -279,9 +273,19 @@ def get_session_maker() -> async_sessionmaker[AsyncSession]:
 _get_session_maker = get_session_maker
 
 
-def initialize_session_maker() -> None:
-    """Initialize the session maker during app startup."""
-    get_session_maker()
+def initialize_session_maker(engine: AsyncEngine) -> None:
+    """Bind the session maker to ``engine`` during app startup.
+
+    Takes the engine explicitly rather than re-importing the
+    aegra_api.core.database.db_manager singleton and reading its .engine —
+    that implicit coupling only worked because exactly one DatabaseManager
+    is ever constructed in production. Tests that build an isolated
+    DatabaseManager() for isolation (correctly) never touch that global, so
+    this would raise "Database not initialized" even after their own
+    instance's .initialize() had set up its own engine fine.
+    """
+    global async_session_maker
+    async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 
 
 def reset_session_maker() -> None:

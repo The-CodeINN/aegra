@@ -169,7 +169,7 @@ class DatabaseManager:
         # Initialize the session maker for ORM operations
         from .orm import initialize_session_maker
 
-        initialize_session_maker()
+        initialize_session_maker(self.engine)
 
         logger.info("✅ Database and LangGraph components initialized")
 
