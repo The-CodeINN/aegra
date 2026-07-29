@@ -54,59 +54,88 @@ def _httpx_status_error(status: int) -> MagicMock:
 
 
 class TestLinkedInRouting:
-    """LinkedIn URLs must never attempt a direct HTTP fetch — Brave Search only."""
+    """LinkedIn URLs try Jina Reader first (tier 1); once that's blocked by a
+    login wall or fails outright, they fall back to Brave Search (tiers 2/3).
+    These tests simulate a login-walled Jina response so the fallback path is
+    exercised deterministically — leaving Jina unmocked hit the real network
+    and made these tests flaky/order-dependent on whatever r.jina.ai returned
+    for a blocked LinkedIn profile at test-run time.
+    """
+
+    @staticmethod
+    def _login_wall_client() -> MagicMock:
+        """A mock httpx.AsyncClient whose Jina Reader response looks like LinkedIn's login wall."""
+        login_wall_resp = _make_httpx_response(200, "Sign in to LinkedIn to continue.")
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get = AsyncMock(return_value=login_wall_resp)
+        return mock_client
 
     @pytest.mark.asyncio
     async def test_linkedin_profile_routes_to_brave_search(self):
-        """A /in/<username> URL should call brave_search with site:linkedin.com <slug>."""
+        """A /in/<username> URL should fall through to brave_search with the exact URL quoted."""
         from react_agent import tools
 
-        with patch.object(
-            tools, "brave_search", new=AsyncMock(return_value="John Smith | Data Scientist at Acme")
-        ) as mock_brave:
-            result = await tools.read_webpage("https://www.linkedin.com/in/john-smith/")
+        url = "https://www.linkedin.com/in/john-smith/"
+        with (
+            patch("react_agent.tools.httpx.AsyncClient", return_value=self._login_wall_client()),
+            patch.object(
+                tools, "brave_search", new=AsyncMock(return_value="John Smith | Data Scientist at Acme")
+            ) as mock_brave,
+        ):
+            result = await tools.read_webpage(url)
 
         mock_brave.assert_called_once()
         call_arg = mock_brave.call_args[0][0]
-        assert "site:linkedin.com" in call_arg
-        assert "john-smith" in call_arg
+        assert call_arg == f'"{url}"'
 
         assert result["source"] == "brave_search_linkedin"
         assert "John Smith" in result["content"]
 
     @pytest.mark.asyncio
     async def test_linkedin_post_routes_to_brave_search(self):
-        """/posts/<id> URL should also use Brave Search, not httpx."""
+        """/posts/<id> URL should also fall through to Brave Search once Jina is blocked."""
         from react_agent import tools
 
         url = "https://www.linkedin.com/posts/john-smith-abc123_ai-data-science-xyz"
-        with patch.object(tools, "brave_search", new=AsyncMock(return_value="Post snippet here")) as mock_brave:
+        with (
+            patch("react_agent.tools.httpx.AsyncClient", return_value=self._login_wall_client()),
+            patch.object(tools, "brave_search", new=AsyncMock(return_value="Post snippet here")) as mock_brave,
+        ):
             result = await tools.read_webpage(url)
 
         mock_brave.assert_called_once()
         call_arg = mock_brave.call_args[0][0]
-        assert "site:linkedin.com" in call_arg
+        assert call_arg == f'"{url}"'
         assert result["source"] == "brave_search_linkedin"
 
     @pytest.mark.asyncio
     async def test_linkedin_company_routes_to_brave_search(self):
-        """/company/<slug> URL should use Brave Search."""
+        """/company/<slug> URL should fall through to Brave Search once Jina is blocked."""
         from react_agent import tools
 
-        with patch.object(tools, "brave_search", new=AsyncMock(return_value="Acme Corp on LinkedIn")) as mock_brave:
-            result = await tools.read_webpage("https://linkedin.com/company/acme-corp")
+        url = "https://linkedin.com/company/acme-corp"
+        with (
+            patch("react_agent.tools.httpx.AsyncClient", return_value=self._login_wall_client()),
+            patch.object(tools, "brave_search", new=AsyncMock(return_value="Acme Corp on LinkedIn")) as mock_brave,
+        ):
+            result = await tools.read_webpage(url)
 
         mock_brave.assert_called_once()
         call_arg = mock_brave.call_args[0][0]
-        assert "acme-corp" in call_arg
+        assert call_arg == f'"{url}"'
         assert result["source"] == "brave_search_linkedin"
 
     @pytest.mark.asyncio
     async def test_linkedin_fallback_when_brave_fails(self):
-        """If Brave Search fails entirely, return linkedin_unavailable error."""
+        """If Jina is blocked and Brave Search fails entirely, return linkedin_unavailable."""
         from react_agent import tools
 
-        with patch.object(tools, "brave_search", new=AsyncMock(side_effect=RuntimeError("api key missing"))):
+        with (
+            patch("react_agent.tools.httpx.AsyncClient", return_value=self._login_wall_client()),
+            patch.object(tools, "brave_search", new=AsyncMock(side_effect=RuntimeError("api key missing"))),
+        ):
             result = await tools.read_webpage("https://linkedin.com/in/someone")
 
         assert result["error"] == "linkedin_unavailable"
@@ -114,10 +143,13 @@ class TestLinkedInRouting:
 
     @pytest.mark.asyncio
     async def test_linkedin_fallback_when_brave_returns_empty(self):
-        """If Brave Search returns 'Search failed', return linkedin_unavailable."""
+        """If Jina is blocked and Brave Search returns 'Search failed', return linkedin_unavailable."""
         from react_agent import tools
 
-        with patch.object(tools, "brave_search", new=AsyncMock(return_value="Search failed: 429")):
+        with (
+            patch("react_agent.tools.httpx.AsyncClient", return_value=self._login_wall_client()),
+            patch.object(tools, "brave_search", new=AsyncMock(return_value="Search failed: 429")),
+        ):
             result = await tools.read_webpage("https://linkedin.com/in/someone")
 
         assert result["error"] == "linkedin_unavailable"
