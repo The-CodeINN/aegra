@@ -1558,6 +1558,16 @@ class OpportunityDiscoveryEngine:
         )
         seen_urls: set[str] = {r[0] for r in existing.all() if r[0]}
 
+        # Release the pooled connection before the slow external-API/LLM work
+        # below (event/job board searches + strategy generation can take
+        # several seconds). Without this, a connection sat checked out from
+        # the SQLAlchemy pool for the full duration of that work — with
+        # _DISCOVERY_CONCURRENCY concurrent users against a small pool, that
+        # exhausted it constantly (174 "QueuePool ... timeout" failures in
+        # 48h on prod). `session` remains usable — SQLAlchemy transparently
+        # checks out a fresh connection on the next execute()/add()/commit().
+        await session.close()
+
         event_results: list[dict[str, Any]] = []
         job_results: list[dict[str, Any]] = []
         if opportunity_type in {"all", "event"}:
