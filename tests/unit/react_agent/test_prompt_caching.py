@@ -57,6 +57,21 @@ def test_build_dynamic_prompt_block_includes_all_volatile_sections() -> None:
     assert "<proactive_memory_recall>baz</proactive_memory_recall>" in block
 
 
+def test_dynamic_prompt_block_anchors_date_arithmetic_to_a_human_readable_date() -> None:
+    """Observed on prod: the model miscalculated a deadline despite the correct ISO
+    timestamp being in context, then self-corrected once challenged. A raw ISO string
+    is easy to under-weight during date arithmetic; the plain-language date + explicit
+    anchoring instruction should be harder to miss."""
+    block = prompts.build_dynamic_prompt_block(system_time="2026-07-26T14:32:01.123456+00:00")
+
+    assert "Sunday, July 26, 2026" in block
+    assert "Anchor ALL relative-date reasoning" in block
+
+
+def test_format_human_date_falls_back_to_raw_string_on_unparseable_input() -> None:
+    assert prompts._format_human_date("not-a-timestamp") == "not-a-timestamp"
+
+
 def test_resolve_provider_kind() -> None:
     assert prompt_caching.resolve_provider_kind("bedrock/eu.anthropic.claude-sonnet-4-5-20250929-v1:0") == "bedrock"
     assert prompt_caching.resolve_provider_kind("anthropic/claude-sonnet-4-5-20250929") == "anthropic"

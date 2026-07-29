@@ -20,6 +20,9 @@ ExecutionEventType = Literal[
     # Guardrails
     "output_guardrail_blocked",
     "hallucination_detected",
+    "hallucination_correction_applied",
+    "hallucination_correction_skipped",
+    "hallucination_correction_failed",
     "grounding_violation_detected",
     # Document processing
     "document_extraction_failed",

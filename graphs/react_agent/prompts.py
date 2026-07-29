@@ -3,6 +3,7 @@
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 
 # Base system prompt template with placeholders for dynamic advisor info
 SYSTEM_PROMPT = """<identity>
@@ -1630,6 +1631,26 @@ than reciting the list verbatim; see the per-task guidance below and the
 </open_tasks>"""
 
 
+def _format_human_date(system_time: str) -> str:
+    """Render an ISO timestamp as a plain-language date for date-arithmetic anchoring.
+
+    Observed on prod: the model miscalculated a task deadline by a month
+    despite the correct ISO timestamp being present in context, then
+    self-corrected once explicitly challenged — a raw ISO string is easy for
+    a model to under-weight during date arithmetic. Falls back to the raw
+    string if parsing fails, since that's still strictly more information
+    than omitting the line.
+    """
+    try:
+        dt = datetime.fromisoformat(system_time)
+        # `.day` (plain int, no leading zero) instead of a %-d/%#d strftime
+        # directive — those are platform-specific (Unix vs Windows) and this
+        # code runs in both a Linux prod container and Windows dev/test.
+        return f"{dt:%A, %B} {dt.day}, {dt:%Y}"
+    except (ValueError, TypeError):
+        return system_time
+
+
 def build_dynamic_prompt_block(
     *,
     system_time: str,
@@ -1646,7 +1667,14 @@ def build_dynamic_prompt_block(
     the learned advisor-behavior profile — so it must never be folded into
     the cached static block (see ``build_runtime_system_prompt``).
     """
-    parts = [f"<context>\nSystem Time: {system_time}\n</context>"]
+    parts = [
+        "<context>\n"
+        f"System Time: {system_time}\n"
+        f"Today's date is {_format_human_date(system_time)}. Anchor ALL relative-date "
+        'reasoning (deadlines, "in N weeks", roadmap timelines) to THIS date — never to a '
+        "date mentioned elsewhere in the conversation or session notes.\n"
+        "</context>"
+    ]
     if tool_limit_notice:
         parts.append(tool_limit_notice)
     if session_block:

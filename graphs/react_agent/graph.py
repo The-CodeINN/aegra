@@ -553,6 +553,87 @@ async def _invoke_integrated_agent(
     )
 
 
+async def _correct_hallucinated_response(
+    response: AIMessage,
+    hallucination_details: str,
+    prepared_messages: list[AnyMessage],
+    runtime: Runtime[Context],
+    system_message: str | SystemMessage,
+    session_cost: SessionCost,
+    execution_events: list[dict[str, Any]],
+) -> tuple[AIMessage, SessionCost]:
+    """Give the model one bounded chance to self-correct a flagged response.
+
+    Uses the model's FULL conversation context — not the narrow evidence
+    window the hallucination classifier saw. That distinction matters: a
+    fact established via a tool call many turns back can look "ungrounded"
+    to the classifier once compaction has pruned that ToolMessage, even
+    though the model itself still has it in context (memory, session notes,
+    or the compacted summary). Reuses _invoke_integrated_agent, mirroring
+    the max-output-recovery retry in call_model — same error handling, same
+    cost tracking. Mutates ``execution_events`` in place.
+
+    Fails open — returns the original response unchanged on any error, or
+    if the correction pass comes back empty or tries to call a tool instead
+    of replying, so a guardrail/infra failure never blocks the user.
+    """
+    correction_instruction = (
+        "An automated accuracy check flagged part of your response above as "
+        "potentially not grounded in evidence:\n\n"
+        f"{hallucination_details}\n\n"
+        "Review your response using everything you actually know from this "
+        "conversation (earlier tool calls, recalled memories, session notes). "
+        "If the flagged claim is something you can verify from earlier in this "
+        "conversation, reissue your response exactly as it was. If it is NOT "
+        "something you can verify — you don't actually have grounds for it — "
+        "issue a corrected version that fixes ONLY that claim, keeping "
+        "everything else the same.\n\n"
+        "Reply with ONLY the response to show the student. No preamble, no "
+        "explanation of what you checked or changed."
+    )
+    correction_messages = prepared_messages + [response, HumanMessage(content=correction_instruction)]
+    try:
+        corrected, correction_events, correction_usage, _ = await _invoke_integrated_agent(
+            correction_messages, runtime, system_message
+        )
+        execution_events.extend(correction_events)
+        if correction_usage:
+            session_cost = track_llm_usage(session_cost, runtime.context.model, correction_usage)
+        corrected_text = get_message_text(corrected)
+        if corrected_text.strip() and not corrected.tool_calls:
+            response = AIMessage(content=corrected_text, id=response.id)
+            execution_events.append(
+                serialize_event(
+                    ExecutionEvent(
+                        event_type="hallucination_correction_applied",
+                        message="Model reviewed and reissued its response after hallucination screening.",
+                    )
+                )
+            )
+        else:
+            execution_events.append(
+                serialize_event(
+                    ExecutionEvent(
+                        event_type="hallucination_correction_skipped",
+                        level="warning",
+                        message="Correction pass returned empty content or tool calls; kept original response.",
+                    )
+                )
+            )
+    except Exception:
+        logger.warning("Hallucination correction pass failed; keeping original response.", exc_info=True)
+        execution_events.append(
+            serialize_event(
+                ExecutionEvent(
+                    event_type="hallucination_correction_failed",
+                    level="warning",
+                    message="Correction pass raised an exception; kept original response.",
+                )
+            )
+        )
+    return response, session_cost
+
+
 async def _load_session_notes_into_state(result: dict[str, Any], runtime: Runtime[Context]) -> None:
     """Load persisted session notes from the store into the state dict.
 
@@ -1060,10 +1141,15 @@ conversation and greet the student without time references.
                     )
                 )
             )
-            # Log only — do not modify the response shown to the user.
-            # The guardrail is still too aggressive with proactive-memory
-            # paraphrases, so we keep it as an observability signal while
-            # we tune precision.
+            response, session_cost = await _correct_hallucinated_response(
+                response,
+                hallucination_details,
+                prepared_messages,
+                runtime,
+                system_message,
+                session_cost,
+                execution_events,
+            )
 
     # Cost threshold warning
     if is_over_cost_threshold(session_cost):
