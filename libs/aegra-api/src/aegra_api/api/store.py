@@ -77,17 +77,8 @@ async def get_store_item(
         if "key" in filters:
             key = filters["key"]
 
-    # Accept SDK-style dotted namespaces or list
-    ns_list: list[str]
-    if isinstance(namespace, str):
-        ns_list = [part for part in namespace.split(".") if part]
-    elif isinstance(namespace, list):
-        ns_list = namespace
-    else:
-        ns_list = []
-
     # Apply user namespace scoping
-    scoped_namespace = apply_user_namespace_scoping(user.identity, ns_list)
+    scoped_namespace = apply_user_namespace_scoping(user.identity, _normalize_namespace(namespace))
 
     store = db_manager.get_store()
 
@@ -115,12 +106,12 @@ async def delete_store_item(
     ns = None
     k = None
     if body is not None:
-        ns = body.namespace
+        ns = _normalize_namespace(body.namespace)
         k = body.key
     else:
         if key is None:
             raise HTTPException(422, "Missing 'key' parameter")
-        ns = namespace or []
+        ns = _normalize_namespace(namespace)
         k = key
 
     # Authorization check
@@ -233,16 +224,26 @@ async def list_namespaces(
     return StoreListNamespacesResponse(namespaces=[list(ns) for ns in result])
 
 
-def apply_user_namespace_scoping(user_id: str, namespace: list[str]) -> list[str]:
-    """Apply user-based namespace scoping for data isolation"""
+def _normalize_namespace(value: str | list[str] | None) -> list[str]:
+    """Normalize namespace input to a clean list, filtering out empty parts."""
+    if isinstance(value, str):
+        return [part for part in value.split(".") if part]
+    if isinstance(value, list):
+        return [part for part in value if part]
+    return []
 
+
+def apply_user_namespace_scoping(user_id: str, namespace: list[str]) -> list[str]:
+    """Apply user-based namespace scoping for data isolation.
+
+    All store operations are scoped to the authenticated user's namespace.
+    Users can only access namespaces under ["users", <their_user_id>].
+    """
     if not namespace:
-        # Default to user's private namespace
         return ["users", user_id]
 
-    # Allow explicit user namespaces
     if namespace[0] == "users" and len(namespace) >= 2 and namespace[1] == user_id:
         return namespace
 
-    # For development, allow all namespaces (remove this for production)
-    return namespace
+    # Scope any other namespace under the user's prefix
+    return ["users", user_id] + namespace

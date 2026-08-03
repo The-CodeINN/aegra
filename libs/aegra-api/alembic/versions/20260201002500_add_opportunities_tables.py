@@ -27,7 +27,7 @@ def upgrade() -> None:
         sa.Column(
             "id",
             sa.Text(),
-            server_default=sa.text("public.uuid_generate_v4()::text"),
+            server_default=sa.text("gen_random_uuid()::text"),
             nullable=False,
         ),
         sa.Column("user_id", sa.Text(), nullable=False),

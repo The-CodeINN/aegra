@@ -4,7 +4,8 @@
 [project]
 name = "aegra-workspace"
 version = "0.0.0"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
+dependencies = []
 
 [tool.uv]
 package = false
@@ -15,6 +16,12 @@ members = ["libs/aegra-api", "libs/aegra-cli"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+
+[tool.ruff.format]
+# Docs contain deliberately-wrong examples (see the "# WRONG" blocks in
+# CLAUDE.md). Formatting markdown rewrites them into correct style and destroys
+# the point. Ruff only began picking up .md in 0.15; this keeps prior behavior.
+exclude = ["**/*.md"]
 
 [tool.ruff.lint]
 select = [

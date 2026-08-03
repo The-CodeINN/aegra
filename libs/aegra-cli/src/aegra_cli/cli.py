@@ -1,5 +1,7 @@
 """Aegra CLI - Command-line interface for managing self-hosted agent deployments."""
 
+import importlib.util
+import ipaddress
 import json
 import os
 import shutil
@@ -15,6 +17,7 @@ from rich.table import Table
 
 from aegra_cli import __version__
 from aegra_cli.commands import init
+from aegra_cli.commands.db import db
 from aegra_cli.env import load_env_file
 from aegra_cli.templates import (
     get_docker_compose,
@@ -24,6 +27,45 @@ from aegra_cli.templates import (
 from aegra_cli.utils.docker import ensure_postgres_running
 
 console = Console()
+
+# Default values for server options (single source of truth)
+_DEFAULT_DEV_HOST = "127.0.0.1"
+_DEFAULT_SERVE_HOST = "0.0.0.0"  # noqa: S104  # nosec B104 - intentional for Docker
+_DEFAULT_PORT = 2026
+
+
+def _resolve_server_option(
+    ctx: click.Context,
+    param_name: str,
+    cli_value: str | int,
+    *,
+    env_var: str,
+    default: str | int,
+) -> str | int:
+    """Resolve a server option with precedence: CLI flag > env var > default.
+
+    Args:
+        ctx: Click context to check parameter source.
+        param_name: Name of the Click parameter.
+        cli_value: Value from Click (may be the default).
+        env_var: Environment variable name to check.
+        default: The hardcoded default value.
+
+    Returns:
+        The resolved value with correct precedence.
+    """
+    source = ctx.get_parameter_source(param_name)
+    if source == click.core.ParameterSource.COMMANDLINE:
+        return cli_value
+    env_val = os.environ.get(env_var)
+    if env_val:
+        try:
+            return type(default)(env_val)
+        except (ValueError, TypeError):
+            msg = f"Invalid value for {env_var}: {env_val!r} (expected {type(default).__name__})"
+            raise click.ClickException(msg) from None
+    return default
+
 
 # Attempt to get aegra-api version
 try:
@@ -125,13 +167,13 @@ def ensure_docker_files(project_path: Path, slug: str) -> Path:
 @cli.command()
 @click.option(
     "--host",
-    default="127.0.0.1",
+    default=_DEFAULT_DEV_HOST,
     help="Host to bind the server to.",
     show_default=True,
 )
 @click.option(
     "--port",
-    default=8000,
+    default=_DEFAULT_PORT,
     type=int,
     help="Port to bind the server to.",
     show_default=True,
@@ -172,7 +214,34 @@ def ensure_docker_files(project_path: Path, slug: str) -> Path:
     type=click.Path(exists=True, path_type=Path),
     help="Path to docker-compose.yml file for PostgreSQL.",
 )
+@click.option(
+    "--debug-port",
+    default=None,
+    type=int,
+    help="Port for debugger to listen on (no debugger if not specified).",
+    show_default=True,
+)
+@click.option(
+    "--debug-host",
+    default=None,
+    help="Host for debugger to bind to (127.0.0.1 if not specified).",
+    show_default=True,
+)
+@click.option(
+    "--wait-for-client",
+    is_flag=True,
+    default=False,
+    help="Break and wait for a debugger client to attach before starting.",
+)
+@click.option(
+    "--no-reload",
+    is_flag=True,
+    default=None,
+    help="Disable auto-reload",
+)
+@click.pass_context
 def dev(
+    ctx: click.Context,
     host: str,
     port: int,
     app: str,
@@ -180,11 +249,16 @@ def dev(
     env_file: Path | None,
     no_db_check: bool,
     compose_file: Path | None,
-):
-    """Run the development server with hot reload.
+    debug_port: int | None,
+    debug_host: str | None,
+    wait_for_client: bool,
+    no_reload: bool | None,
+) -> None:
+    """Run the development server with optional hot reload.
 
-    Starts uvicorn with --reload flag for development.
-    The server will automatically restart when code changes are detected.
+    Starts uvicorn with auto-reload enabled by default for development.
+    The server will automatically restart when code changes are detected unless
+    --no-reload is specified.
 
     Aegra auto-discovers aegra.json in the current directory, so you
     should run 'aegra dev' from your project root.
@@ -202,6 +276,12 @@ def dev(
 
         aegra dev --no-db-check          # Start without database check
     """
+    # Validate debug options: --wait-for-client only makes sense with --debug-port
+    if wait_for_client and debug_port is None:
+        raise click.UsageError("--wait-for-client requires --debug-port to be set")
+    if debug_host is not None and debug_port is None:
+        raise click.UsageError("--debug-host requires --debug-port to be set")
+
     # Discover or validate config file
     if config_file is not None:
         # User specified a config file explicitly
@@ -246,6 +326,10 @@ def dev(
         # User specified a file but it doesn't exist (shouldn't happen due to click validation)
         console.print(f"[yellow]Warning: .env file not found: {env_file}[/yellow]")
 
+    # Resolve host/port with precedence: CLI flag > env var > default
+    host = _resolve_server_option(ctx, "host", host, env_var="HOST", default=_DEFAULT_DEV_HOST)
+    port = _resolve_server_option(ctx, "port", port, env_var="PORT", default=_DEFAULT_PORT)
+
     # Check and start PostgreSQL unless disabled
     if not no_db_check:
         console.print()
@@ -278,6 +362,14 @@ def dev(
     ]
     if loaded_env:
         info_lines.append(f"[cyan]Env:[/cyan] {loaded_env}")
+    if debug_port is not None:
+        info_lines.append(f"[cyan]Debug port:[/cyan] {debug_port}")
+        if debug_host is not None:
+            info_lines.append(f"[cyan]Debug host:[/cyan] {debug_host}")
+        if wait_for_client:
+            info_lines.append("[cyan]Wait for client to attach:[/cyan] True")
+    if no_reload:
+        info_lines.append("\n[dim]Auto-reload is disabled[/dim]")
     info_lines.append("\n[dim]Press Ctrl+C to stop the server[/dim]")
 
     console.print(
@@ -288,17 +380,64 @@ def dev(
         )
     )
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "uvicorn",
-        app,
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--reload",
-    ]
+    # Build command. If debug_port is provided, wrap uvicorn with debugpy.
+    cmd_uvicorn = ["-m", "uvicorn", app, "--host", host, "--port", str(port)]
+    if not no_reload:
+        cmd_uvicorn.append("--reload")
+
+    if debug_port is not None:
+        if importlib.util.find_spec("debugpy") is None:
+            console.print(
+                "[bold red]Error:[/bold red] debugpy is not installed.\n"
+                "Install it with: [cyan]pip install 'aegra-cli[debug]'[/cyan]"
+            )
+            sys.exit(1)
+
+        if not no_reload:
+            console.print(
+                "[yellow]Note:[/yellow] debugpy is active. Hot-reload will disconnect the debugger "
+                "on each file change — reattach after every reload."
+            )
+
+        # Always bind debugpy to the debug host (default loopback) regardless of --host
+        listen = str(debug_port)
+        is_loopback = True
+
+        # If debug_host is specified, warn if it's not loopback. Also handle ip v4 and v6 addresses
+        if debug_host is not None:
+            try:
+                address = ipaddress.ip_address(debug_host)
+                if address.version == 4:
+                    listen = f"{debug_host}:{debug_port}"
+                else:
+                    listen = f"[{debug_host}]:{debug_port}"
+                is_loopback = address.is_loopback
+            except ValueError:
+                if debug_host in ("localhost"):
+                    listen = f"{debug_host}:{debug_port}"
+                else:
+                    console.print(
+                        "[yellow]Warning:[/yellow] Invalid debug host specified. "
+                        "Falling back to loopback binding for debugpy."
+                    )
+
+        if not is_loopback:
+            console.print(
+                Panel(
+                    "[bold red]Warning:[/bold red] Debug host is non-loopback and exposes an "
+                    "unauthenticated debug server!\n"
+                    "[dim]Binding debugpy to a non-loopback address can allow remote code "
+                    "execution. Use only if you understand the risk.[/dim]",
+                    title="[bold red]Debug Exposure Warning[/bold red]",
+                    border_style="red",
+                )
+            )
+        cmd = [sys.executable, "-m", "debugpy", "--listen", listen]
+        if wait_for_client:
+            cmd.append("--wait-for-client")
+        cmd.extend(cmd_uvicorn)
+    else:
+        cmd = [sys.executable] + cmd_uvicorn
 
     process = None
     try:
@@ -346,13 +485,13 @@ def dev(
 @cli.command()
 @click.option(
     "--host",
-    default="0.0.0.0",  # noqa: S104  # nosec B104 - intentional for Docker
+    default=_DEFAULT_SERVE_HOST,
     help="Host to bind the server to.",
     show_default=True,
 )
 @click.option(
     "--port",
-    default=8000,
+    default=_DEFAULT_PORT,
     type=int,
     help="Port to bind the server to.",
     show_default=True,
@@ -371,7 +510,8 @@ def dev(
     type=click.Path(exists=True, path_type=Path),
     help="Path to aegra.json config file (auto-discovered if not specified).",
 )
-def serve(host: str, port: int, app: str, config_file: Path | None) -> None:
+@click.pass_context
+def serve(ctx: click.Context, host: str, port: int, app: str, config_file: Path | None) -> None:
     """Run the production server.
 
     Starts uvicorn without --reload for production use.
@@ -404,6 +544,10 @@ def serve(host: str, port: int, app: str, config_file: Path | None) -> None:
     # Load .env file from config directory (same logic as dev command)
     config_dir_env = resolved_config.parent / ".env"
     loaded_env = load_env_file(config_dir_env if config_dir_env.exists() else None)
+
+    # Resolve host/port with precedence: CLI flag > env var > default
+    host = _resolve_server_option(ctx, "host", host, env_var="HOST", default=_DEFAULT_SERVE_HOST)
+    port = _resolve_server_option(ctx, "port", port, env_var="PORT", default=_DEFAULT_PORT)
 
     info_lines = [
         "[bold green]Starting Aegra production server[/bold green]\n",
@@ -617,6 +761,7 @@ def down(compose_file: Path | None, volumes: bool):
 
 # Register command groups and commands from the commands package
 cli.add_command(init)
+cli.add_command(db)
 
 
 def main():

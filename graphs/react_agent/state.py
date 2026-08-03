@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Annotated
+from typing import Annotated, Any
 
 from langchain_core.messages import AnyMessage
 from langgraph.graph import add_messages
 from langgraph.managed import IsLastStep
+from langmem.short_term import RunningSummary
+
+from react_agent.cost_tracker import SessionCost, merge_session_cost
 
 
 def merge_tool_counts(existing: dict[str, int], new: dict[str, int]) -> dict[str, int]:
@@ -81,4 +84,88 @@ class State(InputState):
     AI-generated short title for this conversation thread.
     Set once after the first complete exchange and never changed again.
     Exposed to the frontend via the thread state values.
+    """
+
+    context: dict[str, RunningSummary] = field(default_factory=dict)
+    """
+    LangMem short-term memory context.  Written by the ``summarize`` node and
+    read on subsequent turns so the SummarizationNode can incrementally update
+    the running summary rather than re-summarising already-condensed messages.
+
+    Shape: ``{"running_summary": RunningSummary}``
+    """
+
+    summarized_messages: list[AnyMessage] = field(default_factory=list)
+    """
+    Token-bounded message window produced by the ``summarize`` node (LangMem
+    SummarizationNode).  This is what ``call_model`` actually sends to the LLM
+    each turn — it may contain a summary message prepended to recent messages.
+
+    Not annotated with ``add_messages`` because SummarizationNode always
+    overwrites the entire window rather than appending to it.
+    """
+
+    guardrail_blocked: bool = field(default=False)
+    """
+    Set to ``True`` by the ``screen_input`` node when a prompt-injection or
+    jailbreak attempt is detected.  Causes the graph to short-circuit to
+    ``__end__`` without invoking the main model.
+    """
+
+    summarization_failure_count: int = field(default=0)
+    """
+    Consecutive summarization failures tracked by the ``summarize`` node.
+    When this reaches 3 (``_SUMMARIZATION_CIRCUIT_BREAKER_LIMIT``), the node
+    skips compression and passes the full message list straight to ``call_model``,
+    preventing the 3,000+ failure-per-session spiral seen in production.
+    Reset to 0 on any successful summarization.
+    """
+
+    session_cost: Annotated[SessionCost, merge_session_cost] = field(default_factory=SessionCost)
+    """
+    Accumulated cost and token usage for this session.
+    Updated after every LLM invocation via the cost tracker.
+    Uses a merge reducer that always takes the latest (cumulative) value.
+    """
+
+    execution_events: list[dict[str, Any]] = field(default_factory=list)
+    """
+    Structured runtime events emitted by the execution layer.
+
+    These events make fallback decisions, retry exhaustion, and compaction
+    behavior visible to observability and tests without changing the user-
+    facing message stream.
+    """
+
+    # --- Session memory (ported from Claude-code's SESSIONMEMORY.md) --------
+
+    session_notes: str = field(default="")
+    """
+    Structured session notes maintained across turns.  Updated by the
+    ``update_session_memory`` node after each final AI response.  Injected
+    into the system prompt so the agent retains context after compaction.
+    """
+
+    session_memory_token_count: int = field(default=0)
+    """
+    Token count at the time of the last session memory extraction.
+    Used by ``should_extract_session_memory`` to throttle extraction.
+    """
+
+    # --- Mutual exclusion for memory consolidation --------------------------
+
+    agent_wrote_memory: bool = field(default=False)
+    """
+    Set to ``True`` when the agent called ``manage_memory`` during the hot
+    path.  When set, ``consolidate_memories`` skips background extraction
+    to avoid duplication (ported from Claude-code's mutual exclusion pattern).
+    Reset to ``False`` at the start of each turn.
+    """
+
+    agent_wrote_task: bool = field(default=False)
+    """
+    Set to ``True`` when the agent called ``manage_task`` during the hot path
+    (spec Item 2). Mirrors ``agent_wrote_memory``: when set, the cold-path
+    task extraction in ``consolidate_memories`` is skipped so a task the agent
+    already logged explicitly is never double-written. Reset each turn.
     """

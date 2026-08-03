@@ -1,0 +1,210 @@
+[
+  {
+    "provider": "greenhouse",
+    "company": "paystack",
+    "label": "Paystack",
+    "country": "Nigeria",
+    "regions": ["Nigeria", "Africa", "EMEA"],
+    "url": "https://boards.greenhouse.io/paystack"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "monzo",
+    "label": "Monzo",
+    "country": "United Kingdom",
+    "regions": ["UK", "EMEA"],
+    "url": "https://boards.greenhouse.io/monzo"
+  },
+  {
+    "provider": "ashby",
+    "company": "synthesia",
+    "label": "Synthesia",
+    "country": "United Kingdom",
+    "regions": ["UK", "EMEA"],
+    "url": "https://jobs.ashbyhq.com/synthesia"
+  },
+  {
+    "provider": "ashby",
+    "company": "faculty",
+    "label": "Faculty",
+    "country": "United Kingdom",
+    "regions": ["UK", "EMEA"],
+    "url": "https://jobs.ashbyhq.com/faculty"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "scaleai",
+    "label": "Scale AI",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://boards.greenhouse.io/scaleai"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "stripe",
+    "label": "Stripe",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://boards.greenhouse.io/stripe"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "datadog",
+    "label": "Datadog",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://boards.greenhouse.io/datadog"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "flexport",
+    "label": "Flexport",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://boards.greenhouse.io/flexport"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "robinhood",
+    "label": "Robinhood",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://boards.greenhouse.io/robinhood"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "reddit",
+    "label": "Reddit",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://boards.greenhouse.io/reddit"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "coinbase",
+    "label": "Coinbase",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://boards.greenhouse.io/coinbase"
+  },
+  {
+    "provider": "lever",
+    "company": "plaid",
+    "label": "Plaid",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://jobs.lever.co/plaid"
+  },
+  {
+    "provider": "ashby",
+    "company": "notion",
+    "label": "Notion",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://jobs.ashbyhq.com/notion"
+  },
+  {
+    "provider": "ashby",
+    "company": "openai",
+    "label": "OpenAI",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://jobs.ashbyhq.com/openai"
+  },
+  {
+    "provider": "ashby",
+    "company": "cursor",
+    "label": "Cursor",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://jobs.ashbyhq.com/cursor"
+  },
+  {
+    "provider": "ashby",
+    "company": "mercor",
+    "label": "Mercor",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://jobs.ashbyhq.com/mercor"
+  },
+  {
+    "provider": "ashby",
+    "company": "linear",
+    "label": "Linear",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://jobs.ashbyhq.com/linear"
+  },
+  {
+    "provider": "ashby",
+    "company": "raycast",
+    "label": "Raycast",
+    "country": "United Kingdom",
+    "regions": ["UK", "EMEA"],
+    "url": "https://jobs.ashbyhq.com/raycast"
+  },
+  {
+    "provider": "rippling",
+    "board_token": "rippling",
+    "label": "Rippling",
+    "country": "United States",
+    "regions": ["US", "North America"],
+    "url": "https://www.rippling.com/careers"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "stackadapt",
+    "label": "StackAdapt",
+    "country": "Canada",
+    "regions": ["Canada", "North America"],
+    "url": "https://boards.greenhouse.io/stackadapt"
+  },
+  {
+    "provider": "ashby",
+    "company": "1password",
+    "label": "1Password",
+    "country": "Canada",
+    "regions": ["Canada", "North America"],
+    "url": "https://jobs.ashbyhq.com/1password"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "n26",
+    "label": "N26",
+    "country": "Germany",
+    "regions": ["EU", "EMEA"],
+    "url": "https://boards.greenhouse.io/n26"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "celonis",
+    "label": "Celonis",
+    "country": "Germany",
+    "regions": ["EU", "EMEA"],
+    "url": "https://boards.greenhouse.io/celonis"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "hellofresh",
+    "label": "HelloFresh",
+    "country": "Germany",
+    "regions": ["EU", "EMEA"],
+    "url": "https://boards.greenhouse.io/hellofresh"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "careem",
+    "label": "Careem",
+    "country": "United Arab Emirates",
+    "regions": ["UAE", "EMEA"],
+    "url": "https://boards.greenhouse.io/careem"
+  },
+  {
+    "provider": "greenhouse",
+    "company": "wave",
+    "label": "Wave Mobile Money",
+    "country": "Senegal",
+    "regions": ["Africa", "EMEA"],
+    "url": "https://boards.greenhouse.io/wavemm1"
+  }
+]

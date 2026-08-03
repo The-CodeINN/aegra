@@ -52,6 +52,24 @@ class TestDatabaseManager:
             # Mock the static/class method check_connection
             mock_pool_cls.check_connection = MagicMock()
 
+            # pool.connection() and conn.cursor() are sync calls returning async
+            # context managers (psycopg style) — not coroutines. AsyncMock's
+            # default child-attribute behaviour makes every call return a
+            # coroutine instead, which breaks `async with pool.connection()`.
+            # Wired to fetchone() -> None so _migrate_vector_column's
+            # store_vectors-not-found early-return path is exercised: that's
+            # the correct outcome for a fresh/mocked DB, and this fixture only
+            # needs to get initialize() past that method, not test it.
+            mock_cursor = AsyncMock()
+            mock_cursor.fetchone.return_value = None
+            mock_cursor_cm = AsyncMock()
+            mock_cursor_cm.__aenter__.return_value = mock_cursor
+            mock_conn = AsyncMock()
+            mock_conn.cursor = MagicMock(return_value=mock_cursor_cm)
+            mock_connection_cm = AsyncMock()
+            mock_connection_cm.__aenter__.return_value = mock_conn
+            mock_pool_instance.connection = MagicMock(return_value=mock_connection_cm)
+
             # 3. Setup Saver and Store Mocks
             mock_saver_instance = AsyncMock()
             mock_saver_cls.return_value = mock_saver_instance
@@ -101,14 +119,17 @@ class TestDatabaseManager:
 
         # Verify pool options inside kwargs
         inner_kwargs = lg_kwargs["kwargs"]
-        assert inner_kwargs["prepare_threshold"] == 0
+        assert inner_kwargs["prepare_threshold"] is None
         assert inner_kwargs["autocommit"] is True
 
         # Verify explicit open was awaited
         mock_db_deps["pool_instance"].open.assert_awaited_once()
 
         # 3. Verify Components initialization
-        mock_db_deps["saver_cls"].assert_called_with(conn=mock_db_deps["pool_instance"])
+        mock_db_deps["saver_cls"].assert_called_once()
+        saver_kwargs = mock_db_deps["saver_cls"].call_args.kwargs
+        assert saver_kwargs["conn"] == mock_db_deps["pool_instance"]
+        assert "serde" in saver_kwargs  # JsonPlusSerializer instance; identity isn't worth asserting on
         mock_db_deps["saver_instance"].setup.assert_awaited_once()
 
         # Store is initialized with index=None when no store config is provided

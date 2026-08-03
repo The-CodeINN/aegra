@@ -1,9 +1,9 @@
 [project]
 name = "aegra-api"
-version = "0.7.4"
+version = "0.10.0"
 description = "Aegra core API - Self-hosted Agent Protocol server"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
 authors = [{ name = "Muhammad Ibrahim", email = "mibrahim37612@gmail.com" }]
 keywords = ["langgraph", "agents", "llm", "fastapi", "agent-protocol"]
@@ -21,42 +21,40 @@ dependencies = [
     "fastapi>=0.110.1",
     "uvicorn[standard]>=0.35.0",
     "pydantic>=2.11.7",
-    "pydantic-settings>=2.12.0",
-
+    "pydantic-settings>=2.14.2",
+    "sse-starlette>=3.3.4,<4.0.0",
     # LangGraph
     "langgraph>=1.0.3",
     "langgraph-sdk>=0.3.5",
     "langgraph-checkpoint-postgres>=2.0.23",
-
     # Database
     "sqlalchemy>=2.0.0",
     "greenlet>=3.1.0",
     "asyncpg>=0.30.0",
     "psycopg[binary]>=3.2.9",
     "alembic>=1.16.4",
-
     # Observability (OpenTelemetry)
     "opentelemetry-api>=1.39.1",
     "opentelemetry-sdk>=1.39.1",
     "opentelemetry-exporter-otlp>=1.39.1",
     "openinference-instrumentation-langchain>=0.1.58",
-
+    # Metrics
+    # >=8.0.2: 7.x reads route.path on FastAPI >=0.137's _IncludedRouter (which has
+    # no .path), 500ing every request when metrics are on. 8.0.2 handles the new tree.
+    "prometheus-fastapi-instrumentator>=8.0.2",
     # Utils
     "structlog>=25.4.0",
     "asgi-correlation-id>=4.3.4",
     "pyjwt>=2.10.1",
-
     # Scheduling & Push Notifications
     "apscheduler>=3.11.2",
     "python-dateutil>=2.9.0.post0",
     "pywebpush>=2.0.0",
-
     # Discovery & AI
-    "langchain>=0.3.0",
-    "langchain-anthropic>=0.3.0",
+    "langchain>=1.2.10",
+    "langchain-anthropic>=1.3.4",
     "langchain-openai>=0.3.0",
     "httpx>=0.28.1",
-
     # RAG
     "langchain-text-splitters>=0.3.0",
     "langchain-community>=0.3.31",
@@ -64,26 +62,35 @@ dependencies = [
     "pypdf>=5.1.0",
     "python-docx>=1.1.2",
     "openpyxl>=3.1.5",
-
     # Email
     "aiosmtplib>=3.0.0",
+    # Redis (optional broker backend for multi-instance streaming)
+    "redis[hiredis]>=5.0.0",
 
-    # Redis
-    "redis>=5.0.0",
+    # Cron expression parsing
+    "croniter>=6.0.0",
 
     # Langfuse
     "langfuse>=3.3.4",
+    "pymongo[srv]>=4.16.0",
+    "langchain-aws>=1.4.1",
+    "langmem>=0.0.30",
+    "python-jobspy @ git+https://github.com/speedyapply/JobSpy.git@main",
+    "pycountry>=24.6.1",
 ]
 
 [project.urls]
-Homepage = "https://github.com/ibbybuilds/aegra"
-Documentation = "https://github.com/ibbybuilds/aegra#readme"
-Repository = "https://github.com/ibbybuilds/aegra"
-Issues = "https://github.com/ibbybuilds/aegra/issues"
+Homepage = "https://github.com/aegra/aegra"
+Documentation = "https://github.com/aegra/aegra#readme"
+Repository = "https://github.com/aegra/aegra"
+Issues = "https://github.com/aegra/aegra/issues"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aegra_api"]
@@ -95,6 +102,11 @@ packages = ["src/aegra_api"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+
+[tool.ruff.format]
+# This package's [tool.ruff] overrides the root config for files beneath it, so
+# the markdown exclusion has to be repeated here. See the root pyproject.toml.
+exclude = ["**/*.md"]
 
 [tool.ruff.lint]
 select = [
@@ -127,6 +139,7 @@ testpaths = ["tests"]
 markers = [
     "unit: unit tests",
     "e2e: end-to-end tests requiring a running server",
+    "prod_only: tests that require Redis workers (skipped in dev mode)",
 ]
 
 [dependency-groups]
@@ -135,11 +148,11 @@ dev = [
     "pytest-asyncio>=1.3.0",
     "pytest-mock>=3.15.1",
     "pytest-cov>=6.0.0",
-    "ruff>=0.13.0",
+    "ruff>=0.16.0",
     "ty>=0.0.17,<0.1.0",
     "bandit>=1.8.0",
     "pre-commit>=4.0.1",
-    "langchain-openai>=1.0.3",
-    "langchain>=1.0.0",
+    "langchain-openai>=1.1.14",
+    "langchain>=1.3.9",
     "langchain-mcp-adapters>=0.1.0",
 ]

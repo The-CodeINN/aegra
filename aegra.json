@@ -1,11 +1,14 @@
 {
   "dependencies": ["./graphs"],
   "graphs": {
-    "agent": "./graphs/react_agent/graph.py:graph",
-    "agent_hitl": "./examples/react_agent_hitl/graph.py:graph",
-    "subgraph_agent": "./examples/subgraph_agent/graph.py:graph",
-    "subgraph_hitl_agent": "./examples/subgraph_hitl_agent/graph.py:graph",
-    "factory": "./examples/factory/graph.py:graph"
+    "agent": "./graphs/react_agent/graph.py:graph"
+  },
+  "store": {
+    "index": {
+      "embed": "bedrock:cohere.embed-english-v3",
+      "dims": 1024,
+      "fields": ["$"]
+    }
   },
   "auth": {
     "path": "./auth.py:auth"
@@ -16,8 +19,10 @@
       "allow_origins": [
         "https://testing.dedatahub.io",
         "https://dedatahub.io",
+        "https://www.dedatahub.io",
         "http://localhost:3000",
-        "http://127.0.0.1:3000"
+        "http://127.0.0.1:3000",
+        "https://dedatahub-api.vercel.app"
       ],
       "allow_credentials": true,
       "allow_methods": ["*"],

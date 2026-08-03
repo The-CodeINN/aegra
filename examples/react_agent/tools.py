@@ -121,7 +121,7 @@ async def _cached_lms_get(
     return data
 
 
-# Import RAG course retriever
+# Import local-first course content service
 try:
     import sys
     from pathlib import Path
@@ -132,13 +132,13 @@ try:
     if src_path.exists() and str(src_path) not in sys.path:
         sys.path.insert(0, str(src_path))
 
-    from aegra_api.tools.rag import CourseRetriever
+    from aegra_api.tools.course_content import CourseContentService
 
-    RAG_AVAILABLE = True
-    logger.info("RAG course search module loaded successfully")
+    COURSE_CONTENT_AVAILABLE = True
+    logger.info("Course content service loaded successfully")
 except ImportError as e:
-    RAG_AVAILABLE = False
-    logger.warning(f"RAG CourseRetriever not available: {e}. Course search will be disabled.")
+    COURSE_CONTENT_AVAILABLE = False
+    logger.warning(f"Course content service not available: {e}. Course search will be disabled.")
 
 
 async def brave_search(query: str) -> str:
@@ -364,7 +364,7 @@ async def get_student_onboarding() -> dict[str, Any]:
 
     # Get LMS API URL from context
     lms_url = runtime.context.lms_api_url
-    onboarding_endpoint = f"{lms_url}/api/v1/onboarding"
+    onboarding_endpoint = f"{lms_url}/api/v1/ai-mentor/onboarding/me"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -492,10 +492,11 @@ async def search_course_content(
     course_id: str | None = None,
     max_results: int = 5,
 ) -> dict[str, Any]:
-    """Search for relevant course content using semantic similarity.
+    """Search for relevant course content using hybrid BM25 full-text ranking.
 
-    This tool searches through indexed course materials, lessons, and descriptions
-    to find the most relevant information based on your query. Use this when:
+    This tool searches through indexed course materials, lessons, and transcript
+    segments using full-text retrieval and BM25-style ranking fused with lexical
+    exact-match signals. Use this when:
     - Students ask about specific course topics or concepts
     - Looking for explanations from course materials
     - Finding relevant lessons or modules
@@ -517,12 +518,12 @@ async def search_course_content(
             - metadata: Additional context (level, module, etc.)
         - error: Error message if search fails
     """
-    if not RAG_AVAILABLE:
-        logger.error("RAG system not available")
+    if not COURSE_CONTENT_AVAILABLE:
+        logger.error("Course content service not available")
         return {
             "query": query,
             "results": [],
-            "error": "Course search is not available. RAG system not initialized.",
+            "error": "Course search is not available. Local course content service not initialized.",
         }
 
     try:
@@ -530,22 +531,15 @@ async def search_course_content(
         if course_id:
             logger.info(f"Filtering by course_id: {course_id}")
 
-        # Initialize retriever
-        retriever = CourseRetriever()
-
-        # Perform semantic search
-        results = await retriever.search(
-            query=query,
-            course_id=course_id,
-            k=max_results,
-        )
+        service = CourseContentService()
+        results = await asyncio.to_thread(service.search, query, course_id, max_results)
 
         if not results:
             logger.info(f"No course content found for query: {query}")
             return {
                 "query": query,
                 "results": [],
-                "message": "No relevant course content found. The course may not be indexed yet.",
+                "message": "No relevant local course content found. The course may not be synced yet.",
             }
 
         logger.info(f"Found {len(results)} relevant course content chunks")
@@ -577,7 +571,7 @@ TOOLS: list[Callable[..., Any]] = [
     search_user_memories,
 ]
 
-# Add RAG tool if available
-if RAG_AVAILABLE:
+# Add course search tool if available
+if COURSE_CONTENT_AVAILABLE:
     TOOLS.append(search_course_content)
-    logger.info("RAG course search tool enabled")
+    logger.info("Course search tool enabled")

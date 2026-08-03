@@ -1,174 +1,263 @@
-"""Long-term memory tools for the agent.
+"""Long-term memory schemas and constants for the agent.
 
-This module provides tools for reading and writing user-specific long-term memories
-using LangGraph's persistence layer.
+Typed Pydantic schemas are shared between the hot-path tools
+(create_manage_memory_tool / create_search_memory_tool) and the background
+extraction node (create_memory_store_manager) so all three write to the same
+structured store.
+
+Memory type taxonomy (ported from Claude-code):
+  - CareerGoal     — target roles the student is working toward
+  - StudentContext — persistent facts about the student
+  - FeedbackMemory — corrections and guidance the student has given the agent
+  - ReferenceMemory — pointers to external resources the student has shared
 """
 
 import logging
-from typing import Any
+from datetime import UTC, datetime
+from typing import Literal
 
-from langgraph.runtime import get_runtime
-
-from react_agent.context import Context
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MEMORY_NAMESPACE = "memories"
 
-async def get_user_memory(memory_key: str) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Memory freshness — ported from Claude-code's memoryAge.ts
+# ---------------------------------------------------------------------------
+# Models are poor at date arithmetic. A raw ISO timestamp does not trigger
+# staleness reasoning the way "47 days ago" does.  We attach a human-readable
+# age note to recalled memories so the agent knows to verify before asserting.
+#
+# Per-schema windows (spec Item 3) — a blanket 1-day threshold wrongly ages
+# career goals and background facts that are stable for months. Different
+# schemas age at different rates:
+#   - CareerGoal / StudentContext: stable over months; re-confirm occasionally.
+#   - FeedbackMemory: the student's stated preferences can shift as they improve.
+#   - ReferenceMemory: not time-based at all — a URL either still works or it
+#     doesn't; that's checked when read_webpage() actually uses it, not here.
+#     ``None`` here means "never flag by age".
+#   - EpisodicMemory: a past event stays a valid piece of history forever —
+#     surfaced by semantic relevance to the current topic (search_memory),
+#     not by recency. ``None`` — never flagged by age.
+#   - AdvisorBehaviorProfile: a learned behavioral trait is as stable as
+#     CareerGoal/StudentContext; same window.
+# Unknown/unrecognised kinds fall back to the original conservative 1-day
+# window rather than silently going stale-free.
+_FRESHNESS_WINDOWS_DAYS: dict[str, int | None] = {
+    "CareerGoal": 75,
+    "StudentContext": 75,
+    "FeedbackMemory": 30,
+    "ReferenceMemory": None,
+    "EpisodicMemory": None,
+    "AdvisorBehaviorProfile": 75,
+}
+_DEFAULT_FRESHNESS_THRESHOLD_DAYS = 1
+
+# Maximum number of memories per user before pruning kicks in.
+MAX_MEMORIES_PER_USER = 200
+
+
+def memory_age_days(updated_at: datetime | str | None) -> int:
+    """Return floor-rounded days since the memory was last updated."""
+    if updated_at is None:
+        return 0
+    if isinstance(updated_at, str):
+        try:
+            updated_at = datetime.fromisoformat(updated_at)
+        except (ValueError, TypeError):
+            return 0
+    now = datetime.now(tz=UTC)
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    delta = (now - updated_at).days
+    return max(0, delta)
+
+
+def memory_freshness_note(updated_at: datetime | str | None, kind: str | None = None) -> str:
+    """Return a staleness caveat for memories older than their schema's freshness window.
+
+    ``kind`` selects the window from ``_FRESHNESS_WINDOWS_DAYS`` (e.g.
+    "CareerGoal"); unrecognised or omitted kinds use the original 1-day
+    default. A ``None`` window (currently only ``ReferenceMemory``) means
+    this schema is never flagged by age — returns "" unconditionally.
     """
-    Retrieve user-specific long-term memory from the store.
+    threshold = _FRESHNESS_WINDOWS_DAYS.get(kind, _DEFAULT_FRESHNESS_THRESHOLD_DAYS)
+    if threshold is None:
+        return ""
 
-    This tool allows the agent to recall information about the user that has been
-    saved in previous conversations, such as:
-    - User preferences and settings
-    - Learning goals and progress
-    - Communication style preferences
-    - Personal context and background
+    days = memory_age_days(updated_at)
+    if days <= threshold:
+        return ""
+    return (
+        f"<system-reminder>This memory is {days} days old. "
+        "Memories are point-in-time observations — the student's situation "
+        "may have changed. Verify with the student before asserting as current fact."
+        "</system-reminder>"
+    )
 
-    Common memory keys: "preferences", "goals", "notes"
 
-    Args:
-        memory_key: The specific memory to retrieve (e.g., "preferences", "goals", "notes")
+# ---------------------------------------------------------------------------
+# Memory schemas
+# ---------------------------------------------------------------------------
+
+
+class CareerGoal(BaseModel):
+    """A career goal or target role the student is actively working toward."""
+
+    role: str = Field(description="The target job title or career role.")
+    industry: str | None = Field(
+        default=None,
+        description="Industry or domain (e.g. 'fintech', 'healthcare AI').",
+    )
+    timeline: str | None = Field(
+        default=None,
+        description="Student's stated timeline or urgency (e.g. '6 months', 'as soon as possible').",
+    )
+    priority: Literal["high", "medium", "low"] = Field(
+        default="medium",
+        description="Relative priority of this goal compared to other goals.",
+    )
+
+
+class StudentContext(BaseModel):
+    """A persistent fact about the student's background, preferences, or constraints."""
+
+    fact: str = Field(description="The specific fact to remember, written concisely.")
+    category: Literal[
+        "experience",
+        "education",
+        "skill",
+        "preference",
+        "constraint",
+        "location",
+        "motivation",
+    ] = Field(description="The type of information this fact represents.")
+    confidence: Literal["stated", "inferred"] = Field(
+        default="stated",
+        description="Whether the student stated this directly or the agent inferred it.",
+    )
+
+
+class FeedbackMemory(BaseModel):
+    """Guidance the student has given about how the agent should approach work.
+
+    Both corrections ("don't do X") and confirmations ("yes, keep doing that").
+    Ported from Claude-code's feedback memory type with Why/HowToApply structure.
     """
-    runtime = get_runtime(Context)
-    store = runtime.store
 
-    if not store:
-        logger.warning("No store available for memory retrieval")
-        return {
-            "error": "Memory store not configured",
-            "message": "Long-term memory is not available",
-        }
-
-    # Get user_id from the runtime context (injected from JWT token)
-    user_id = runtime.context.user_id
-
-    if not user_id:
-        logger.warning("No user_id in context, user not authenticated")
-        return {
-            "error": "User not authenticated",
-            "message": "Cannot retrieve memory without authentication",
-        }
-
-    namespace = (user_id, "memories")
-
-    try:
-        logger.info(f"Retrieving memory for user {user_id}, key: {memory_key}")
-        memory_item = await store.aget(namespace, memory_key)
-
-        if memory_item:
-            logger.info(f"Found memory for {user_id}/{memory_key}")
-            return memory_item.value
-        else:
-            logger.info(f"No memory found for {user_id}/{memory_key}")
-            return {}
-
-    except Exception as e:
-        logger.error(f"Error retrieving memory: {e}", exc_info=True)
-        return {"error": "Failed to retrieve memory", "message": str(e)}
+    rule: str = Field(
+        description="The core guidance or rule. E.g. 'Never fabricate CV content'.",
+    )
+    why: str | None = Field(
+        default=None,
+        description="The reason the student gave — often a past incident or strong preference.",
+    )
+    how_to_apply: str | None = Field(
+        default=None,
+        description="When and where this guidance kicks in. Helps judge edge cases.",
+    )
+    source: Literal["correction", "confirmation"] = Field(
+        default="correction",
+        description="Whether the student corrected a mistake or confirmed a good approach.",
+    )
 
 
-async def save_user_memory(memory_key: str, memory_data: dict[str, Any]) -> str:
+class ReferenceMemory(BaseModel):
+    """A pointer to where information can be found in external systems.
+
+    Stores locations of external resources the student has shared so the agent
+    remembers where to look for up-to-date information.
     """
-    Save user-specific information to long-term memory.
 
-    This tool allows the agent to remember important information about the user
-    across conversations. Use this when the user shares:
-    - Preferences (communication style, learning preferences, etc.)
-    - Goals (career goals, learning objectives, milestones)
-    - Personal context (background, interests, constraints)
-    - Important notes from the conversation
+    resource: str = Field(
+        description="What the resource is. E.g. 'LinkedIn profile', 'portfolio site'.",
+    )
+    location: str = Field(
+        description="URL, path, or identifier for the resource.",
+    )
+    purpose: str | None = Field(
+        default=None,
+        description="Why this resource is relevant or when to consult it.",
+    )
 
-    Args:
-        memory_key: The category/key for this memory (e.g., "preferences", "goals", "notes")
-        memory_data: The information to save (must be a dictionary)
+
+class EpisodicMemory(BaseModel):
+    """A specific past event and how it felt — shared history, not a static fact.
+
+    Distinct from ``StudentContext`` (durable background facts): this
+    captures discrete moments — breakthroughs, setbacks, decisions — with
+    situational and emotional context, so the advisor can reference "when
+    you struggled with joins last month" rather than only ever recalling
+    static profile facts. Extracted cold-path only (spec Item 4) — the agent
+    doesn't log these itself mid-conversation; a background pass identifies
+    which parts of the conversation were actually notable events.
     """
-    runtime = get_runtime(Context)
-    store = runtime.store
 
-    if not store:
-        logger.warning("No store available for memory storage")
-        return "Error: Memory store not configured. Long-term memory is not available."
-
-    # Get user_id from runtime context (injected from JWT token)
-    user_id = runtime.context.user_id
-
-    if not user_id:
-        logger.warning("No user_id in context, user not authenticated")
-        return "Error: User not authenticated. Cannot save memory without authentication."
-
-    namespace = (user_id, "memories")
-
-    try:
-        logger.info(f"Saving memory for user {user_id}, key: {memory_key}")
-        logger.debug(f"Memory data: {memory_data}")
-
-        # Save to store
-        await store.aput(namespace, memory_key, memory_data)
-
-        logger.info(f"Successfully saved memory for {user_id}/{memory_key}")
-        return f"Successfully saved {memory_key} to your long-term memory."
-
-    except Exception as e:
-        logger.error(f"Error saving memory: {e}", exc_info=True)
-        return f"Error: Failed to save memory. {str(e)}"
+    event: str = Field(description="What happened. E.g. 'Failed module 3 SQL assessment, 2nd attempt'.")
+    emotional_context: str | None = Field(
+        default=None,
+        description="How the student felt or reacted. E.g. 'Felt discouraged, considered pausing'.",
+    )
+    outcome: str | None = Field(
+        default=None,
+        description="What was decided or what helped. E.g. 'Agreed to redo joins practice before retrying'.",
+    )
 
 
-async def search_user_memories(query: str) -> list[dict[str, Any]]:
+class AdvisorBehaviorProfile(BaseModel):
+    """A learned pattern in how to mentor THIS specific student — procedural memory.
+
+    Not who the student is (that's ``StudentContext``) and not an explicit
+    correction they gave (that's ``FeedbackMemory``) — this is inferred from
+    how the student has actually responded across conversations, e.g.
+    "responds well to direct challenge" vs "shuts down under pressure".
+    Extracted cold-path; injected proactively each turn (unlike episodic
+    memory, which is recalled on demand via search_memory) so tone adapts
+    from the very first message of a conversation.
     """
-    Search through user's long-term memories using semantic search.
 
-    This tool allows the agent to find relevant information from past conversations
-    by searching through all stored memories for the user.
+    trait: str = Field(
+        description="The behavioral pattern observed. E.g. 'Responds well to direct challenge, not gentle framing'.",
+    )
+    evidence: str | None = Field(
+        default=None,
+        description="What in past conversations suggested this — keeps it grounded, not guessed.",
+    )
+    how_to_apply: str | None = Field(
+        default=None,
+        description="How this should shape tone or approach going forward.",
+    )
 
-    Args:
-        query: Natural language query to search for (e.g., "user's career goals", "learning preferences")
-    """
-    runtime = get_runtime(Context)
-    store = runtime.store
 
-    if not store:
-        logger.warning("No store available for memory search")
-        return [
-            {
-                "error": "Memory store not configured",
-                "message": "Long-term memory search is not available",
-            }
-        ]
+# Shared schema list consumed by hot-path tools and background extractor.
+MEMORY_SCHEMAS: list[type[BaseModel]] = [
+    CareerGoal,
+    StudentContext,
+    FeedbackMemory,
+    ReferenceMemory,
+    EpisodicMemory,
+    AdvisorBehaviorProfile,
+]
 
-    user_id = runtime.context.user_id
+# Passed as `instructions` to create_memory_store_manager (background extraction).
+# The identity carve-out exists because a name mentioned anywhere in a
+# conversation — the student's own, a friend's, a hypothetical — was
+# previously getting captured as a StudentContext "fact" and then used to
+# address the student on later turns instead of get_student_profile()'s
+# actual name. Extraction must never write identity to memory at all; the
+# live agent's own Identity rule (prompts.py) is the only place that governs
+# how the student is addressed.
+MEMORY_EXTRACTION_INSTRUCTIONS = """You are extracting durable memories about a student from a career-advising
+conversation, structured into the provided schemas (career goals, background facts, feedback the
+student gave about your approach, and references to external resources they've shared).
 
-    if not user_id:
-        logger.warning("No user_id in context, user not authenticated")
-        return [
-            {
-                "error": "User not authenticated",
-                "message": "Cannot search memories without authentication",
-            }
-        ]
+Extract only what is clearly stated or directly implied — do not speculate. Consolidate and update
+existing memories rather than duplicating them. Prefer dense, specific facts over vague ones.
 
-    namespace = (user_id, "memories")
-
-    try:
-        logger.info(f"Searching memories for user {user_id}, query: {query}")
-
-        # Search memories using semantic search
-        results = await store.asearch(namespace, query=query, limit=5)
-
-        memories = []
-        for item in results:
-            memories.append(
-                {
-                    "key": item.key,
-                    "value": item.value,
-                    "created_at": item.created_at.isoformat() if item.created_at else None,
-                    "updated_at": item.updated_at.isoformat() if item.updated_at else None,
-                }
-            )
-
-        logger.info(f"Found {len(memories)} matching memories")
-        return memories
-
-    except Exception as e:
-        logger.error(f"Error searching memories: {e}", exc_info=True)
-        return [{"error": "Failed to search memories", "message": str(e)}]
+CRITICAL — never extract identity:
+Do NOT create or update any memory whose content is a name — the student's own name, a name they
+mention for someone else (a friend, colleague, recruiter), or a name from a hypothetical or story.
+This applies regardless of which schema or category it might otherwise fit under. The student's
+name is never durable-memory content; it comes exclusively from get_student_profile() at read time,
+not from anything extracted here. If an existing memory already contains a name as fact, delete it."""

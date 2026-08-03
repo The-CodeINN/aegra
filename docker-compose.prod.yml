@@ -1,0 +1,110 @@
+# Production Docker Compose - Single EC2 Deployment
+# Usage: docker compose -f docker-compose.prod.yml up -d
+
+services:
+  # ─── PostgreSQL with pgvector ──────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg18
+    container_name: aegra-postgres
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:5432:5432" # Only expose to localhost
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-aegra} -d ${POSTGRES_DB:-aegra}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - aegra-net
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # ─── Redis ─────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: aegra-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:6379:6379" # Only expose to localhost
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aegra-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # ─── AI Service (Aegra) ────────────────────────────────────────
+  aegra:
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile
+    container_name: aegra-app
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      - POSTGRES_HOST=postgres
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - ENV_MODE=PRODUCTION
+      - DEBUG=false
+      - REDIS_BROKER_ENABLED=true
+      - WORKER_COUNT=3
+      - N_JOBS_PER_WORKER=10
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - aegra-net
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    ports:
+      - "127.0.0.1:8000:8000" # Exposed to localhost for system Nginx
+    # System Nginx handles SSL and reverse proxy
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  aegra-net:
+    driver: bridge

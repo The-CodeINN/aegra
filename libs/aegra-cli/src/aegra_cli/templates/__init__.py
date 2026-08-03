@@ -169,14 +169,15 @@ def get_docker_compose(slug: str) -> str:
         docker-compose.yml content string.
     """
     return f"""\
-# Docker Compose - PostgreSQL + API
-# aegra dev  -> docker compose up postgres -d  (database only)
-# aegra up   -> docker compose up --build      (full stack)
+# Docker Compose - PostgreSQL + Redis + API
+# aegra dev  -> docker compose up postgres -d  (database only, in-memory broker)
+# aegra up   -> docker compose up --build      (full stack, Redis broker)
 
 services:
   postgres:
     image: pgvector/pgvector:pg18
     container_name: {slug}-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${{POSTGRES_USER:-{slug}}}
       POSTGRES_PASSWORD: ${{POSTGRES_PASSWORD:-{slug}_secret}}
@@ -191,11 +192,26 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    container_name: {slug}-redis
+    restart: unless-stopped
+    ports:
+      - "${{REDIS_PORT:-6379}}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   {slug}:
     build: .
     container_name: {slug}-api
+    restart: unless-stopped
     ports:
-      - "${{PORT:-8000}}:8000"
+      - "${{PORT:-2026}}:${{PORT:-2026}}"
     env_file:
       - .env
     environment:
@@ -205,13 +221,19 @@ services:
       - POSTGRES_DB=${{POSTGRES_DB:-{slug}}}
       - AEGRA_CONFIG=aegra.json
       - AUTH_TYPE=${{AUTH_TYPE:-noop}}
-      - PORT=${{PORT:-8000}}
+      - PORT=${{PORT:-2026}}
+      - REDIS_BROKER_ENABLED=true
+      - REDIS_URL=redis://redis:6379/0
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:${{PORT:-2026}}/health || exit 1"]
       interval: 30s
+      timeout: 10s
+      retries: 3
       start_period: 10s
     volumes:
       - ./src:/app/src:ro
@@ -219,6 +241,7 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:
 """
 
 
@@ -229,7 +252,7 @@ def get_dockerfile() -> str:
         Dockerfile content string.
     """
     return """\
-FROM python:3.11-slim-bookworm AS base
+FROM python:3.12-slim-bookworm AS base
 
 ENV PYTHONUNBUFFERED=1 \\
     PYTHONDONTWRITEBYTECODE=1
@@ -267,17 +290,19 @@ FROM base AS final
 
 RUN apt-get update && apt-get install -y --no-install-recommends \\
     ca-certificates \\
+    curl \\
     libpq5 \\
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/.venv /app/.venv
 COPY aegra.json .
+COPY src/ ./src/
 
 ENV PATH="/app/.venv/bin:$PATH"
 
-EXPOSE 8000
+EXPOSE 2026
 
 USER app
 
-CMD ["aegra", "serve", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["aegra", "serve"]
 """

@@ -4,6 +4,7 @@ from typing import Any
 
 import structlog
 from langchain.chat_models import init_chat_model
+from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from aegra_api.settings import settings
@@ -73,10 +74,13 @@ async def generate_thread_title(user_message: str, model_name: str | None = None
         if "/" in model_name:
             provider, model = model_name.split("/", maxsplit=1)
         else:
-            provider = "openai"
+            provider = "bedrock"
             model = model_name
 
-        llm = init_chat_model(model, model_provider=provider)
+        if provider == "bedrock":
+            llm = ChatBedrockConverse(model=model, region_name=settings.aws.AWS_REGION_NAME, temperature=0)
+        else:
+            llm = init_chat_model(model, model_provider=provider)
 
         system_prompt = """You are a title generator. Given a user's message, generate a very short,
 concise title (3-6 words, max 50 characters) that captures the main topic or intent.

@@ -4,30 +4,31 @@ Caches LMS endpoint responses to reduce redundant API calls.
 Uses the existing redis_manager for distributed caching and falls
 back to an in-memory TTL cache when Redis is unavailable.
 
-TTL Strategy (endpoints that rarely change get longer TTLs):
-- Onboarding sections (section-1..8, /onboarding)  → 24 hours
-- User profile (/user/profile)                      → 1 hour
-- Enrollment/blackboard (/enrollment/*)              → 15 minutes
+TTL Strategy:
+- Onboarding and profile endpoints                   → 120 seconds
+- Enrollment overview                                → 45 seconds
+- Critical progress/structure/subscription/attempts  → live only (no cache)
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from typing import Any
 
 import httpx
 import structlog
 
-from aegra_api.core.redis import redis_manager
+from aegra_api.core.redis_manager import redis_manager
 
 logger = structlog.get_logger()
 
 # TTL constants (seconds)
-TTL_ONBOARDING = 86400  # 24 hours — onboarding data rarely changes
-TTL_PROFILE = 3600  # 1 hour — name/email rarely change
-TTL_ENROLLMENT = 900  # 15 minutes — progress changes more often
+TTL_ONBOARDING = 120
+TTL_PROFILE = 120
+TTL_ENROLLMENT = 45
 
 # In-memory fallback: key → (json_str, expiry_ts)
 _mem_cache: dict[str, tuple[str, float]] = {}
@@ -36,6 +37,11 @@ _cache_lock = asyncio.Lock()
 
 def _ttl_for_path(path: str) -> int:
     """Return the appropriate TTL based on the endpoint path."""
+    # Critical user-state endpoints should always be fetched live.
+    if path.endswith("/subscription/me"):
+        return 0
+    if path.endswith("/structure") or path.endswith("/progress") or "/attempts" in path:
+        return 0
     if "/onboarding" in path or "/ai-mentor/" in path:
         return TTL_ONBOARDING
     if "/user/profile" in path:
@@ -51,8 +57,6 @@ def _cache_key(user_id: str, path: str) -> str:
 
 
 async def _redis_get(key: str) -> str | None:
-    if not redis_manager.is_available():
-        return None
     try:
         client = redis_manager.get_client()
         val = await client.get(key)
@@ -63,8 +67,6 @@ async def _redis_get(key: str) -> str | None:
 
 
 async def _redis_set(key: str, value: str, ttl: int) -> None:
-    if not redis_manager.is_available():
-        return
     try:
         client = redis_manager.get_client()
         await client.setex(key, ttl, value)
@@ -110,6 +112,20 @@ async def cached_lms_fetch(
     path = urlparse(url).path  # e.g. /api/v1/user/profile
     key = _cache_key(user_id, path)
     ttl = _ttl_for_path(path)
+
+    if ttl <= 0:
+        try:
+            resp = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            data: dict[str, Any] = resp.json()
+            return data
+        except Exception as exc:
+            logger.debug("lms_fetch_failed", url=url, error=str(exc))
+            return {}
 
     # 1. Redis
     cached = await _redis_get(key)
@@ -159,30 +175,64 @@ async def invalidate_lms_cache(user_id: str, paths: list[str] | None = None) -> 
         paths = [
             "/api/v1/user/profile",
             "/api/v1/enrollment/student/blackboard",
-            "/api/v1/onboarding",
+            "/api/v1/enrollment/active",
+            "/api/v1/enrollment/{courseId}/structure",
+            "/api/v1/enrollment/{courseId}/progress",
+            "/api/v1/enrollment/{studentId}/attempts",
+            "/api/v1/ai-mentor/onboarding/me",
+            "/api/v1/ai-mentor/onboarding/status",
+            "/api/v1/ai-mentor/onboarding/mentor-payload",
+            "/api/v1/subscription/me",
             "/api/v1/ai-mentor/onboarding/section-1",
             "/api/v1/ai-mentor/onboarding/section-2",
+            "/api/v1/ai-mentor/onboarding/section-3",
             "/api/v1/ai-mentor/onboarding/section-4",
             "/api/v1/ai-mentor/onboarding/section-5",
             "/api/v1/ai-mentor/onboarding/section-6",
+            "/api/v1/ai-mentor/onboarding/section-track",
             "/api/v1/ai-mentor/onboarding/section-7",
             "/api/v1/ai-mentor/onboarding/section-8",
-            "/api/v1/ai-mentor/onboarding/me",
+            "/api/v1/ai-mentor/onboarding/track",
         ]
 
     keys = [_cache_key(user_id, p) for p in paths]
+    template_patterns = []
+    for p in paths:
+        escaped = re.escape(p)
+        # Convert template placeholders like {courseId} into segment wildcards.
+        escaped = re.sub(r"\\\{[^\\}]+\\\}", r"[^/]+", escaped)
+        template_patterns.append(re.compile(rf"^{escaped}$"))
+
+    user_prefix = f"lms:{user_id}:"
+
+    def _key_matches_templates(cache_key: str) -> bool:
+        if not cache_key.startswith(user_prefix):
+            return False
+        endpoint_path = cache_key[len(user_prefix) :]
+        return any(pattern.match(endpoint_path) for pattern in template_patterns)
 
     # Redis
-    if redis_manager.is_available():
-        try:
-            client = redis_manager.get_client()
-            await client.delete(*keys)
-        except Exception as exc:
-            logger.debug("lms_cache_invalidate_redis_error", error=str(exc))
+    try:
+        client = redis_manager.get_client()
+        await client.delete(*keys)
+
+        # Also clear concrete keys that match templated paths (e.g. {courseId}).
+        dynamic_keys: list[str] = []
+        async for raw_key in client.scan_iter(match=f"{user_prefix}*"):
+            key_str = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else str(raw_key)
+            if _key_matches_templates(key_str):
+                dynamic_keys.append(key_str)
+        if dynamic_keys:
+            await client.delete(*dynamic_keys)
+    except Exception as exc:
+        logger.debug("lms_cache_invalidate_redis_error", error=str(exc))
 
     # Memory
     async with _cache_lock:
         for k in keys:
             _mem_cache.pop(k, None)
+        for mem_key in list(_mem_cache.keys()):
+            if _key_matches_templates(mem_key):
+                _mem_cache.pop(mem_key, None)
 
     logger.info("lms_cache_invalidated", user_id=user_id, paths=paths)

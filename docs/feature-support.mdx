@@ -41,7 +41,19 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 | Sync wait | Supported | Block until run completes and return final output. |
 | Subgraph streaming | Supported | Stream events from nested subgraphs. |
 | Stateless runs | Supported | Execute without persisting thread state. |
-| Cron / scheduled jobs | Coming soon | Trigger runs on a schedule. |
+| Cron / scheduled jobs | Supported | Trigger runs on a schedule. Standard and seconds-level cron expressions. IANA timezone support. |
+
+### Scaling and reliability
+
+| Feature | Status | Notes |
+|:--|:--|:--|
+| Worker job queue | Supported | Redis BLPOP with configurable worker count and concurrency. |
+| Concurrent execution | Supported | Up to `N_JOBS_PER_WORKER` (default 10) concurrent runs per worker. |
+| Lease-based crash recovery | Supported | Automatic re-execution of runs from crashed workers via checkpoint resumption. |
+| Cross-instance cancel | Supported | Cancel propagates via Redis pub/sub to any instance. |
+| Job timeout | Supported | Configurable max execution time (default 1 hour). |
+| Postgres fallback | Supported | Workers fall back to DB polling when Redis is unavailable. |
+| Multi-instance SSE | Supported | SSE streams work across instances via Redis broker. |
 
 ### Human-in-the-loop
 
@@ -93,6 +105,7 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 | PaaS deployment | Supported | Railway, Render, Fly.io — any platform that runs Docker. |
 | Kubernetes | Supported | Helm chart or raw manifests. |
 | Dev server with hot reload | Supported | `aegra dev` with auto-reload and managed PostgreSQL. |
+| Multi-instance scaling | Supported | Scale horizontally with shared Redis + PostgreSQL. |
 
 ### Frontends
 
@@ -114,4 +127,4 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 
 ## Request a feature
 
-Missing something? Open an issue on [GitHub](https://github.com/ibbybuilds/aegra/issues) or start a discussion on [Discord](https://discord.com/invite/D5M3ZPS25e).
+Missing something? Open an issue on [GitHub](https://github.com/aegra/aegra/issues) or start a discussion on [Discord](https://discord.com/invite/D5M3ZPS25e).

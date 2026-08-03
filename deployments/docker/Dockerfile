@@ -19,11 +19,12 @@ RUN addgroup --system app && adduser --system --ingroup app app
 FROM base AS builder
 
 # Retrieve the uv binary directly from the official image.
-COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.10.0 /uv /bin/uv
 
 # Install system build dependencies required for compiling Python extensions.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    git \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -49,9 +50,11 @@ RUN uv pip install --system --compile-bytecode --no-deps .
 # -----------------------------
 FROM base AS final
 
-# Install only minimal runtime libs
+# Install only minimal runtime libs (curl needed for health checks)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
+    libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed Python packages from the builder stage.
@@ -62,12 +65,21 @@ COPY --from=builder /usr/local/bin/ /usr/local/bin/
 COPY libs/aegra-api/alembic.ini ./alembic.ini
 COPY libs/aegra-api/alembic/ ./alembic/
 COPY aegra.json ./aegra.json
+COPY auth.py ./auth.py
 COPY examples/ ./examples/
+COPY graphs/ ./graphs/
 
-EXPOSE 8000
+# Add entrypoint for migrations (strip Windows CRLF in case file was edited on Windows)
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && chmod +x /usr/local/bin/docker-entrypoint.sh
+
+EXPOSE 2026
 
 # Run as non-root
 USER app
 
-# Default command - can be overridden by docker-compose
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["uvicorn", "aegra_api.main:app", "--host", "0.0.0.0", "--port", "8000"]

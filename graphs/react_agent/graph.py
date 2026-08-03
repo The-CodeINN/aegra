@@ -1,52 +1,1188 @@
 """Define a custom Reasoning and Action agent.
 
 Works with a chat model with tool calling support.
+
+Memory architecture (LangMem):
+  Short-term  — SummarizationNode runs before every call_model turn. When the
+                message history exceeds _SUMMARY_TRIGGER_TOKENS, older messages
+                are compressed into a running summary and replaced.  The model
+                always operates within the _TRIM_MAX_TOKENS budget.
+
+  Long-term   — create_manage_memory_tool / create_search_memory_tool give the
+                agent native tools to persist and retrieve durable facts about
+                the user across ALL threads.  The agent decides proactively when
+                to store or search — no keyword heuristics are required.
+
+Compaction (spec Item 5, §7.2 — one clean path, not four):
+  1. Write  — before ``summarize`` compresses anything, it awaits any
+              still-in-flight ``consolidate_memories`` background write from
+              the previous turn (``_await_pending_writes``), so durable facts
+              and open tasks are never summarized away before they've
+              survived elsewhere.
+  2. Summarize — LangMem's SummarizationNode compresses the older prefix once
+              history exceeds ``_SUMMARY_TRIGGER_TOKENS``.
+  3. Keep    — SummarizationNode always keeps the most recent messages
+              verbatim; immediate context is never lossy.
+  4. Circuit breaker — after 3 consecutive summarization failures, skip
+              compression and pass the full history through rather than
+              retrying with more compaction mechanisms.
 """
 
+import asyncio
+import json
+import logging
+import re
 from datetime import UTC, datetime
-from typing import Literal, cast
+from typing import Any, Literal
 
-from langchain_core.messages import AIMessage, HumanMessage
-from langgraph.config import get_stream_writer
+from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages.utils import count_tokens_approximately
+from langchain_core.runnables import RunnableConfig
+from langgraph.config import get_config, get_stream_writer
 from langgraph.graph import StateGraph
-from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
+from langmem import create_manage_memory_tool, create_memory_store_manager, create_search_memory_tool
+from langmem.short_term import SummarizationNode
 
+from aegra_api.services.career_advisor_activation import (
+    FIRST_TIME_ROADMAP_REDIRECT_MESSAGE,
+    is_career_roadmap_trigger,
+)
+from react_agent import prompt_caching as _prompt_caching
+from react_agent import prompts as _prompts
 from react_agent.context import Context
+from react_agent.context_assembly import fetch_advisor_behavior_profile, fetch_semantic_memory_block
+from react_agent.cost_tracker import (
+    SessionCost,
+    extract_usage_from_message,
+    is_over_cost_threshold,
+    track_llm_usage,
+)
+from react_agent.execution import ExecutionEvent, build_runtime_tools, build_tool_limit_notice, serialize_event
+from react_agent.guardrails import (
+    INJECTION_BLOCKED_RESPONSE,
+    LEAK_SAFE_RESPONSE,
+    screen_input_for_injection,
+    screen_output_for_hallucination,
+    screen_output_for_leak,  # also used to validate session notes
+)
+from react_agent.memory import (
+    DEFAULT_MEMORY_NAMESPACE,
+    MAX_MEMORIES_PER_USER,
+    MEMORY_EXTRACTION_INSTRUCTIONS,
+    MEMORY_SCHEMAS,
+)
+from react_agent.message_utils import (
+    apply_tool_result_budget as _apply_tool_result_budget,
+)
+from react_agent.message_utils import (
+    sanitize_messages_for_anthropic as _sanitize_messages,
+)
+from react_agent.message_utils import (
+    snip_old_tool_results as _snip_old_tool_results,
+)
+from react_agent.retry import CannotRetryError, with_retry
+from react_agent.sanitization import sanitize_unicode as _sanitize_unicode
+from react_agent.sanitized_anthropic import SanitizedChatAnthropic
+from react_agent.session_memory import (
+    SESSION_MEMORY_TEMPLATE,
+    build_session_context_block,
+    extract_session_memory,
+    get_session_namespace,
+    should_extract_session_memory,
+)
 from react_agent.state import InputState, State
-from react_agent.tools import TOOLS
+from react_agent.tools import TOOLS, fetch_open_task_group_for_prompt, persist_extracted_tasks
 from react_agent.utils import get_message_text, load_chat_model
 
-# Define the function that calls the model
+logger = logging.getLogger(__name__)
+
+# Short-term memory token budgets (LangMem SummarizationNode)
+_TRIM_MAX_TOKENS = 8000  # max tokens returned to call_model each turn
+# Spec Item 5: 6k was very aggressive against Sonnet 4.5's 200k window — it
+# compressed normal conversations mid-flow, exactly when a advising chat needs
+# its recent thread intact. Raised so a normal single sitting is never
+# compressed; deliberately not raised further (100k+) since a bigger live
+# window isn't how the agent remembers — long-term memory (Items 2, 4) is.
+_SUMMARY_TRIGGER_TOKENS = 16000  # summarise when history exceeds this
+_MAX_SUMMARY_TOKENS = 512  # budget for the generated summary itself
+
+# Module-level cache: one SummarizationNode per model string to avoid
+# rebuilding the LLM client on every graph turn.
+_summarization_node_cache: dict[str, SummarizationNode] = {}
+
+# Fallback model map: primary model → cheaper fallback for overload recovery.
+# Ported from Claude-code's fallback model system.
+# Bedrock-only (EU cross-region inference profiles + Kimi K2.5).
+_FALLBACK_MODELS: dict[str, str] = {
+    "bedrock/eu.anthropic.claude-sonnet-4-5-20250929-v1:0": "bedrock/moonshotai.kimi-k2.5",
+    "bedrock/moonshotai.kimi-k2.5": "bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+}
+
+# Max output token recovery: retry count when model hits max_tokens stop reason.
+_MAX_OUTPUT_RECOVERY_RETRIES = 3
+
+# LangChain/LangMem formatting artifacts that can bleed into model responses.
+# These patterns appear when the model echoes the conversation-format injected
+# by LangMem's get_conversation() (used internally by SummarizationNode and
+# create_memory_store_manager).  We strip them defensively before storing the
+# response in state so they can never pollute session notes or future turns.
+_LANGCHAIN_MSG_HEADER_RE = re.compile(
+    r"={20,}\s+\w[\w\s]*Message[\w\s]*=*\s*\n?",
+    re.IGNORECASE,
+)
+_SESSION_UUID_TAG_RE = re.compile(r"</?session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}>")
 
 
-async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, list[AIMessage]]:
-    """Call the LLM powering our "agent".
+class _StringContentModel:
+    """Thin wrapper around a chat model that normalises `.content` to a plain string.
 
-    This function prepares the prompt, initializes the model, and processes the response.
+    Anthropic and Bedrock both return `AIMessage.content` as a list of content
+    blocks (e.g. ``[{'type': 'text', 'text': '...'}]``).  LangMem's
+    ``SummarizationNode`` stores the raw ``.content`` value directly in
+    ``RunningSummary.summary`` which is declared as ``str``.  When the summary
+    is later injected into the next context window (via ``DEFAULT_FINAL_SUMMARY_PROMPT``
+    / ``DEFAULT_EXISTING_SUMMARY_PROMPT``), Python's ``str.format()`` calls
+    ``str()`` on the list − producing the Python-repr form
+    ``[{'type': 'text', 'text': '...'}]`` with single quotes.  That repr leaks
+    into the agent's visible system context and ultimately into streamed output.
 
-    Args:
-        state (State): The current state of the conversation.
-        config (RunnableConfig): Configuration for the model run.
-
-    Returns:
-        dict: A dictionary containing the model's response message.
+    This wrapper intercepts the model response and replaces list content with
+    the extracted plain text before returning, so ``RunningSummary.summary``
+    is always a ``str``.
     """
-    # Initialize the model with tool binding. Change the model or add more tools here.
-    model = load_chat_model(
+
+    def __init__(self, model: Any) -> None:
+        self._model = model
+
+    def _normalise(self, response: Any) -> Any:
+        """Replace list content with extracted plain text."""
+        if isinstance(getattr(response, "content", None), list):
+            response.content = get_message_text(response)
+        return response
+
+    def invoke(self, messages: Any, **kwargs: Any) -> Any:
+        return self._normalise(self._model.invoke(messages, **kwargs))
+
+    async def ainvoke(self, messages: Any, **kwargs: Any) -> Any:
+        return self._normalise(await self._model.ainvoke(messages, **kwargs))
+
+    def __getattr__(self, name: str) -> Any:  # forward everything else
+        return getattr(self._model, name)
+
+
+_COHERE_MAX_CHARS = 1800  # Cohere embedding API hard limit is 2048 chars; leave headroom
+
+
+def _truncate_for_embedding(text: str) -> str:
+    """Truncate *text* to fit within Cohere's embedding character limit."""
+    if len(text) <= _COHERE_MAX_CHARS:
+        return text
+    return text[:_COHERE_MAX_CHARS]
+
+
+def _strip_lc_artifacts(text: str) -> str:
+    """Strip LangChain/LangMem formatting artifacts from a model response.
+
+    Removes LangChain ``msg.pretty_repr()`` headers (e.g.
+    ``=== Ai Message ===``) and LangMem session XML tags
+    (e.g. ``</session_b0e5d31c-...>``) that can bleed into the model's
+    output when these patterns appear in the summarized context window.
+    """
+    cleaned = _LANGCHAIN_MSG_HEADER_RE.sub("", text)
+    cleaned = _SESSION_UUID_TAG_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def _normalize_messages_for_memory(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """Return a copy of *messages* where every AIMessage has plain-string content.
+
+    ``langmem.utils.get_conversation()`` calls ``msg.pretty_repr()`` on each
+    message.  For AIMessages whose ``.content`` is a list of content blocks,
+    ``pretty_repr()`` renders the Python repr of that list (single quotes,
+    dict format) rather than the actual text.  This raw repr then appears
+    inside the ``<session_…>`` XML tags sent to the memory-extraction LLM and
+    can bleed into streamed output when the agent echoes context back.
+
+    Converting list content to a plain string here ensures that only readable
+    text flows into the memory pipeline.  All message texts are also truncated
+    to stay within Cohere's 2048-character embedding limit.
+    """
+    normalized: list[AnyMessage] = []
+    for msg in messages:
+        if isinstance(msg, AIMessage) and isinstance(msg.content, list):
+            text = _truncate_for_embedding(get_message_text(msg))
+            new_msg = AIMessage(
+                content=text,
+                id=msg.id,
+                tool_calls=getattr(msg, "tool_calls", []),
+                response_metadata=getattr(msg, "response_metadata", {}),
+            )
+            normalized.append(new_msg)
+        elif isinstance(msg, AIMessage) and isinstance(msg.content, str):
+            truncated = _truncate_for_embedding(msg.content)
+            if truncated != msg.content:
+                new_msg = AIMessage(
+                    content=truncated,
+                    id=msg.id,
+                    tool_calls=getattr(msg, "tool_calls", []),
+                    response_metadata=getattr(msg, "response_metadata", {}),
+                )
+                normalized.append(new_msg)
+            else:
+                normalized.append(msg)
+        elif isinstance(msg, HumanMessage) and isinstance(msg.content, list):
+            # Frontend sends multimodal blocks: [{'type': 'text', 'text': '...'}]
+            # get_message_text extracts the plain text from these blocks
+            text = _truncate_for_embedding(get_message_text(msg))
+            normalized.append(HumanMessage(content=text, id=msg.id))
+        elif isinstance(msg, HumanMessage) and isinstance(msg.content, str):
+            truncated = _truncate_for_embedding(msg.content)
+            if truncated != msg.content:
+                normalized.append(HumanMessage(content=truncated, id=msg.id))
+            else:
+                normalized.append(msg)
+        else:
+            # ToolMessages and other types — truncate content to stay within
+            # Cohere's 2048-character embedding limit.
+            if hasattr(msg, "content") and isinstance(msg.content, str) and len(msg.content) > 1900:
+                from copy import copy  # noqa: PLC0415
+
+                truncated_msg = copy(msg)
+                truncated_msg.content = _truncate_for_embedding(msg.content)
+                normalized.append(truncated_msg)
+            else:
+                normalized.append(msg)
+    return normalized
+
+
+def _is_anthropic_model(model_name: str) -> bool:
+    return model_name.split("/", maxsplit=1)[0].lower() == "anthropic"
+
+
+def _is_bedrock_model(model_name: str) -> bool:
+    return model_name.split("/", maxsplit=1)[0].lower() == "bedrock"
+
+
+def _extract_provider_model(model_name: str) -> str:
+    return model_name.split("/", maxsplit=1)[1]
+
+
+def _get_summarization_node(runtime: Runtime[Context]) -> SummarizationNode:
+    """Return a cached SummarizationNode for the current model.
+
+    Nodes are cached by model name so the LLM client is only built once per
+    unique model string, not on every graph turn.
+    """
+    model_key = runtime.context.model
+    if model_key not in _summarization_node_cache:
+        # Wrap with _StringContentModel so that RunningSummary.summary is always a
+        # plain str.  Without this, Anthropic/Bedrock returns content blocks
+        # ([{'type':'text','text':'...'}]) which LangMem stores verbatim; the list
+        # is later str()-formatted into the summary SystemMessage, producing the
+        # Python repr with single quotes that leaks into the agent's context.
+        model = _StringContentModel(_build_runtime_model(runtime))
+        _summarization_node_cache[model_key] = SummarizationNode(
+            model=model,
+            max_tokens=_TRIM_MAX_TOKENS,
+            max_tokens_before_summary=_SUMMARY_TRIGGER_TOKENS,
+            max_summary_tokens=_MAX_SUMMARY_TOKENS,
+            token_counter=count_tokens_approximately,
+            input_messages_key="messages",
+            output_messages_key="summarized_messages",
+        )
+    return _summarization_node_cache[model_key]
+
+
+def _build_langmem_tools(runtime: Runtime[Context]) -> list[Any]:
+    """Return LangMem manage_memory + search_memory tools scoped to this user.
+
+    Each tool is scoped to ``(user_id, "memories")`` in the runtime store so
+    memories from different users never bleed into each other.  Returns an
+    empty list when the store or user_id is unavailable.
+    """
+    store = runtime.store
+    user_id = runtime.context.user_id
+    if not store or not user_id:
+        return []
+    namespace = (user_id, DEFAULT_MEMORY_NAMESPACE)
+    return [
+        create_manage_memory_tool(
+            namespace=namespace,
+            store=store,
+            actions_permitted=("create", "update", "delete"),
+        ),
+        create_search_memory_tool(namespace=namespace, store=store),
+    ]
+
+
+def _resolve_runtime_tooling(runtime: Runtime[Context]) -> tuple[list[Any], dict[str, Any]]:
+    """Return provider-ready runtime tools plus the effective policy registry."""
+
+    all_tools: list[Any] = list(TOOLS) + _build_langmem_tools(runtime)
+    return build_runtime_tools(
+        tools=all_tools,
+        model_name=runtime.context.model,
+        anthropic_tool_search_enabled=runtime.context.anthropic_tool_search_enabled,
+        anthropic_tool_search_variant=runtime.context.anthropic_tool_search_variant,
+        anthropic_programmatic_tool_calling_enabled=runtime.context.anthropic_programmatic_tool_calling_enabled,
+    )
+
+
+def _build_runtime_model(runtime: Runtime[Context]) -> Any:
+    if _is_bedrock_model(runtime.context.model):
+        model = load_chat_model(
+            runtime.context.model,
+            enable_thinking=runtime.context.enable_thinking,
+            thinking_budget=runtime.context.thinking_budget,
+        )
+        # cache_control triggers ChatBedrockConverse._apply_cache_points, which
+        # caches the tool list and the last conversation turn — the system-prompt
+        # breakpoint itself is placed manually (see prompt_caching.py) since this
+        # kwarg alone would cache the whole (still-volatile) system block as one
+        # unit. Only bind for Claude-on-Bedrock — see resolve_provider_kind's
+        # docstring on why the Kimi fallback must not get this.
+        if (
+            runtime.context.anthropic_prompt_caching_enabled
+            and _prompt_caching.resolve_provider_kind(runtime.context.model) == "bedrock"
+        ):
+            model = model.bind(cache_control={"ttl": runtime.context.anthropic_prompt_caching_ttl})
+        return model
+
+    if _is_anthropic_model(runtime.context.model):
+        model_kwargs: dict[str, Any] = {
+            "model": _extract_provider_model(runtime.context.model),
+            "temperature": 0,
+        }
+
+        betas: list[str] = []
+        if runtime.context.anthropic_programmatic_tool_calling_enabled:
+            betas.append("advanced-tool-use-2025-11-20")
+            model_kwargs["reuse_last_container"] = True
+
+        if betas:
+            model_kwargs["betas"] = betas
+
+        return SanitizedChatAnthropic(**model_kwargs)
+
+    return load_chat_model(
         runtime.context.model,
         enable_thinking=runtime.context.enable_thinking,
         thinking_budget=runtime.context.thinking_budget,
-    ).bind_tools(TOOLS)
-
-    # Format the system prompt. Customize this to change the agent's behavior.
-    system_message = runtime.context.system_prompt.format(system_time=datetime.now(tz=UTC).isoformat())
-
-    # Get the model's response
-    response = cast(
-        "AIMessage",
-        await model.ainvoke([{"role": "system", "content": system_message}, *state.messages]),
     )
+
+
+def _build_runtime_middleware(runtime: Runtime[Context]) -> list[Any]:
+    # No client middleware for either provider: prompt caching is applied
+    # manually (system-prompt block construction in prompt_caching.py, plus
+    # tool tagging / the Bedrock cache_control bind kwarg) rather than via
+    # AnthropicPromptCachingMiddleware, which tags the *last* system-message
+    # content block — the wrong end once the prompt is split into a static
+    # block followed by a volatile one. See prompt_caching.py's module
+    # docstring for the full rationale.
+    return []
+
+
+def _build_runtime_tools(runtime: Runtime[Context]) -> list[Any]:
+    runtime_tools, _ = _resolve_runtime_tooling(runtime)
+    return runtime_tools
+
+
+def _latest_human_text(messages: list[AnyMessage]) -> str:
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            return get_message_text(message).strip()
+    return ""
+
+
+async def _invoke_integrated_agent(
+    messages: list[AnyMessage], runtime: Runtime[Context], system_message: str | SystemMessage
+) -> tuple[AIMessage, list[dict[str, Any]], dict[str, Any], list[str]]:
+    """Invoke a single integrated LangChain agent runtime for all providers.
+
+    ``system_message`` may be a plain string (no caching wired for this
+    provider) or a multi-block ``SystemMessage`` with a cache breakpoint
+    already placed (see ``prompt_caching.build_cached_system_prompt``) —
+    ``create_agent`` accepts either.
+
+    Returns:
+        (ai_message, execution_events, usage_metadata, tool_result_texts) —
+        the final AI response, any execution events emitted during invocation,
+        token usage metadata from the LLM response for cost tracking, and
+        the text content of all ToolMessages from the agent's internal
+        tool-calling loop (used for hallucination grounding).
+    """
+    runtime_tools, _ = _resolve_runtime_tooling(runtime)
+    provider_kind = _prompt_caching.resolve_provider_kind(runtime.context.model)
+    if runtime.context.anthropic_prompt_caching_enabled:
+        runtime_tools = _prompt_caching.tag_last_tool_for_caching(
+            runtime_tools,
+            provider=provider_kind,
+            cache_ttl=runtime.context.anthropic_prompt_caching_ttl,
+        )
+    agent = create_agent(
+        model=_build_runtime_model(runtime),
+        tools=runtime_tools,
+        middleware=_build_runtime_middleware(runtime),
+        system_prompt=system_message,
+    )
+
+    # Always normalise frontend multimodal content blocks (image/file/text-plain) into
+    # the provider-specific format, and strip Anthropic beta incompatibilities from AIMessages.
+    provider = "bedrock" if _is_bedrock_model(runtime.context.model) else "anthropic"
+    messages = _sanitize_messages(messages, provider=provider)
+
+    @with_retry(max_retries=3)
+    async def _run() -> dict[str, Any]:
+        return await agent.ainvoke({"messages": messages})
+
+    try:
+        result = await _run()
+    except CannotRetryError as exc:
+        # Check if we should try a fallback model (overload scenario)
+        if getattr(exc, "context", None) and getattr(exc.context, "last_status_code", None) == 529:
+            fallback_model = _FALLBACK_MODELS.get(runtime.context.model)
+            if fallback_model:
+                logger.warning(
+                    "Primary model overloaded (529) — falling back to %s",
+                    fallback_model,
+                )
+                # Temporarily swap model for fallback invocation
+                original_model = runtime.context.model
+                runtime.context.model = fallback_model
+                try:
+                    # The system_message was built with a cache breakpoint for the
+                    # primary (caching-capable) model. If the fallback doesn't
+                    # support caching (e.g. Kimi), strip the marker so its baked-in
+                    # cachePoint block can't turn the 529 recovery into a hard error.
+                    fallback_system = system_message
+                    if _prompt_caching.resolve_provider_kind(fallback_model) == "other":
+                        fallback_system = _prompt_caching.flatten_system_message(system_message)
+                    fallback_agent = create_agent(
+                        model=_build_runtime_model(runtime),
+                        tools=runtime_tools,
+                        middleware=_build_runtime_middleware(runtime),
+                        system_prompt=fallback_system,
+                    )
+
+                    @with_retry(max_retries=2)
+                    async def _run_fallback() -> dict[str, Any]:
+                        return await fallback_agent.ainvoke({"messages": messages})
+
+                    result = await _run_fallback()
+
+                    final_messages = result.get("messages", [])
+                    fb_tool_texts = [
+                        msg.content if isinstance(msg.content, str) else str(msg.content)
+                        for msg in final_messages
+                        if isinstance(msg, ToolMessage)
+                    ]
+                    for msg in reversed(final_messages):
+                        if isinstance(msg, AIMessage):
+                            usage = extract_usage_from_message(msg)
+                            events = [
+                                serialize_event(
+                                    ExecutionEvent(
+                                        event_type="fallback_model_activated",
+                                        level="warning",
+                                        message=f"Switched to fallback model {fallback_model} after primary overload.",
+                                        metadata={
+                                            "primary_model": original_model,
+                                            "fallback_model": fallback_model,
+                                        },
+                                    )
+                                )
+                            ]
+                            return msg, events, usage, fb_tool_texts
+                finally:
+                    # Restore original model
+                    runtime.context.model = original_model
+
+        logger.exception("Agent invocation failed after retries")
+        events = [
+            serialize_event(
+                ExecutionEvent(
+                    event_type="retry_exhausted",
+                    level="error",
+                    message="Model invocation failed after retry exhaustion.",
+                    metadata={"component": "model"},
+                )
+            ),
+            serialize_event(
+                ExecutionEvent(
+                    event_type="fallback_mode",
+                    level="warning",
+                    message="Returned fallback model response after retry exhaustion.",
+                    metadata={"component": "model"},
+                )
+            ),
+        ]
+        return (
+            AIMessage(content="I'm having trouble reaching my AI model right now. Please try again in a moment."),
+            events,
+            {},
+            [],
+        )
+
+    final_messages = result.get("messages", [])
+    agent_tool_texts = [
+        msg.content if isinstance(msg.content, str) else str(msg.content)
+        for msg in final_messages
+        if isinstance(msg, ToolMessage)
+    ]
+    for msg in reversed(final_messages):
+        if isinstance(msg, AIMessage):
+            usage = extract_usage_from_message(msg)
+            return msg, [], usage, agent_tool_texts
+
+    return (
+        AIMessage(content="I was unable to produce a response from the agent runtime."),
+        [
+            serialize_event(
+                ExecutionEvent(
+                    event_type="fallback_mode",
+                    level="warning",
+                    message="Agent runtime returned no AIMessage; fallback response emitted.",
+                    metadata={"component": "model"},
+                )
+            )
+        ],
+        {},
+        [],
+    )
+
+
+async def _correct_hallucinated_response(
+    response: AIMessage,
+    hallucination_details: str,
+    prepared_messages: list[AnyMessage],
+    runtime: Runtime[Context],
+    system_message: str | SystemMessage,
+    session_cost: SessionCost,
+    execution_events: list[dict[str, Any]],
+) -> tuple[AIMessage, SessionCost]:
+    """Give the model one bounded chance to self-correct a flagged response.
+
+    Uses the model's FULL conversation context — not the narrow evidence
+    window the hallucination classifier saw. That distinction matters: a
+    fact established via a tool call many turns back can look "ungrounded"
+    to the classifier once compaction has pruned that ToolMessage, even
+    though the model itself still has it in context (memory, session notes,
+    or the compacted summary). Reuses _invoke_integrated_agent, mirroring
+    the max-output-recovery retry in call_model — same error handling, same
+    cost tracking. Mutates ``execution_events`` in place.
+
+    Fails open — returns the original response unchanged on any error, or
+    if the correction pass comes back empty or tries to call a tool instead
+    of replying, so a guardrail/infra failure never blocks the user.
+    """
+    correction_instruction = (
+        "An automated accuracy check flagged part of your response above as "
+        "potentially not grounded in evidence:\n\n"
+        f"{hallucination_details}\n\n"
+        "Review your response using everything you actually know from this "
+        "conversation (earlier tool calls, recalled memories, session notes). "
+        "If the flagged claim is something you can verify from earlier in this "
+        "conversation, reissue your response exactly as it was. If it is NOT "
+        "something you can verify — you don't actually have grounds for it — "
+        "issue a corrected version that fixes ONLY that claim, keeping "
+        "everything else the same.\n\n"
+        "Reply with ONLY the response to show the student. No preamble, no "
+        "explanation of what you checked or changed."
+    )
+    correction_messages = prepared_messages + [response, HumanMessage(content=correction_instruction)]
+    try:
+        corrected, correction_events, correction_usage, _ = await _invoke_integrated_agent(
+            correction_messages, runtime, system_message
+        )
+        execution_events.extend(correction_events)
+        if correction_usage:
+            session_cost = track_llm_usage(session_cost, runtime.context.model, correction_usage)
+        corrected_text = get_message_text(corrected)
+        if corrected_text.strip() and not corrected.tool_calls:
+            response = AIMessage(content=corrected_text, id=response.id)
+            execution_events.append(
+                serialize_event(
+                    ExecutionEvent(
+                        event_type="hallucination_correction_applied",
+                        message="Model reviewed and reissued its response after hallucination screening.",
+                    )
+                )
+            )
+        else:
+            execution_events.append(
+                serialize_event(
+                    ExecutionEvent(
+                        event_type="hallucination_correction_skipped",
+                        level="warning",
+                        message="Correction pass returned empty content or tool calls; kept original response.",
+                    )
+                )
+            )
+    except Exception:
+        logger.warning("Hallucination correction pass failed; keeping original response.", exc_info=True)
+        execution_events.append(
+            serialize_event(
+                ExecutionEvent(
+                    event_type="hallucination_correction_failed",
+                    level="warning",
+                    message="Correction pass raised an exception; kept original response.",
+                )
+            )
+        )
+    return response, session_cost
+
+
+async def _load_session_notes_into_state(result: dict[str, Any], runtime: Runtime[Context]) -> None:
+    """Load persisted session notes from the store into the state dict.
+
+    Called from ``screen_input`` so that ``call_model`` has access to session
+    notes for injection into the system prompt on every turn — not just on
+    turns where extraction runs.
+    """
+    store = runtime.store
+    user_id = runtime.context.user_id
+    config = get_config()
+    thread_id = config.get("configurable", {}).get("thread_id", "")
+    if not store or not user_id or not thread_id:
+        return
+    try:
+        session_ns = get_session_namespace(user_id, thread_id)
+        existing = await store.asearch(session_ns, limit=1)
+        if existing:
+            notes = existing[0].value.get("notes", "")
+            if notes:
+                notes = _strip_lc_artifacts(notes)
+                # Discard notes that contain leaked system-prompt / operational
+                # directive content — these pollute the agent's context and cause
+                # the model to echo instructions back to the user.
+                if screen_output_for_leak(notes):
+                    logger.warning("Discarding session notes — leak patterns detected; notes will regenerate next turn")
+                else:
+                    result["session_notes"] = notes
+    except Exception:
+        logger.debug("Failed to load session notes from store.", exc_info=True)
+
+
+async def screen_input(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Pre-screen the latest user message for prompt-injection / jailbreak attempts.
+
+    Also normalises ``HumanMessage.content`` from the frontend's multimodal
+    content-block format (``[{'type': 'text', 'text': '...'}]``) to a plain
+    string.  Without this, every subsequent ``values`` stream event re-emits
+    the full state containing the list-format content, which the frontend
+    briefly renders as a raw Python repr — causing a visible flicker.
+
+    If guardrails are disabled or no injection is detected, returns an empty
+    dict (plus any normalised messages) so the graph proceeds to ``summarize``
+    unchanged.
+
+    If an injection is detected, adds a safe refusal ``AIMessage`` and sets
+    ``guardrail_blocked=True`` so the graph short-circuits to ``__end__``.
+    """
+    # Normalise HumanMessage list content → plain string so every values event
+    # emitted by downstream nodes (generate_thread_title, consolidate_memories)
+    # contains clean renderable content.
+    normalized_messages: list[AnyMessage] = []
+    needs_normalization = False
+    for msg in state.messages:
+        if isinstance(msg, HumanMessage) and isinstance(msg.content, list):
+            # Only flatten to a plain string when the list is text-only.
+            # Messages that include non-text blocks (images, PDFs, documents)
+            # must keep their list structure so the model receives the
+            # attachments.  Flattening those strips the file content and causes
+            # the AI to report that no document was attached.
+            has_non_text = any(isinstance(block, dict) and block.get("type") not in ("text",) for block in msg.content)
+            if has_non_text:
+                normalized_messages.append(msg)
+            else:
+                text = get_message_text(msg)
+                normalized_messages.append(HumanMessage(content=text, id=msg.id))
+                needs_normalization = True
+        else:
+            normalized_messages.append(msg)
+
+    if not runtime.context.guardrails_enabled:
+        result: dict[str, Any] = {"messages": normalized_messages} if needs_normalization else {}
+        # Load session notes from store if available (so call_model has them)
+        await _load_session_notes_into_state(result, runtime)
+        return result
+
+    user_text = _latest_human_text(list(state.messages))
+    if not user_text:
+        result = {"messages": normalized_messages} if needs_normalization else {}
+        await _load_session_notes_into_state(result, runtime)
+        return result
+
+    # Strip invisible/directional Unicode characters that could be used for
+    # prompt injection or bi-directional text spoofing before classification.
+    user_text = _sanitize_unicode(user_text)
+
+    guardrail_model = load_chat_model(runtime.context.guardrail_model)
+    is_injection = await screen_input_for_injection(user_text, guardrail_model)
+
+    if not is_injection:
+        result = {"messages": normalized_messages} if needs_normalization else {}
+        await _load_session_notes_into_state(result, runtime)
+        return result
+
+    logger.warning(
+        "Injection blocked — user_id=%s thread input screened and rejected",
+        runtime.context.user_id,
+        extra={"user_id": runtime.context.user_id, "input_preview": user_text[:120]},
+    )
+    result: dict[str, Any] = {
+        "messages": [AIMessage(content=INJECTION_BLOCKED_RESPONSE)],
+        "guardrail_blocked": True,
+    }
+    return result
+
+
+def route_after_screening(state: State) -> Literal["summarize", "__end__"]:
+    """Route to ``__end__`` when an injection was blocked, otherwise to ``summarize``."""
+    return "__end__" if state.guardrail_blocked else "summarize"
+
+
+_SUMMARIZATION_CIRCUIT_BREAKER_LIMIT = 3
+
+
+async def summarize(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Short-term memory node — compress long message history with LangMem.
+
+    Uses LangMem's ``SummarizationNode`` which:
+    - Passes messages through unchanged when history is short.
+    - Once the token count exceeds ``_SUMMARY_TRIGGER_TOKENS``, compresses
+      older messages into a concise summary message at the front of the list.
+    - Tracks already-summarised message IDs in the ``RunningSummary`` stored
+      under ``state.context`` to avoid re-summarising the same messages.
+
+    The resulting ``summarized_messages`` is what ``call_model`` sends to the
+    LLM, always within the ``_TRIM_MAX_TOKENS`` budget.
+
+    Circuit breaker: after ``_SUMMARIZATION_CIRCUIT_BREAKER_LIMIT`` consecutive
+    failures the node stops attempting compression (prevents the 3,000+
+    failure-per-session spiral observed in production).
+    """
+    if state.summarization_failure_count >= _SUMMARIZATION_CIRCUIT_BREAKER_LIMIT:
+        logger.warning(
+            "Summarization circuit breaker open (%d consecutive failures) — passing full message list to call_model",
+            state.summarization_failure_count,
+        )
+        return {
+            "summarized_messages": list(state.messages),
+            "summarization_failure_count": state.summarization_failure_count,
+        }
+
+    # Write-before-compact (spec Item 5, §7.2 step 1): only when this pass is
+    # actually about to compress history — waiting on every turn regardless
+    # would add latency for no benefit, since nothing is at risk of being
+    # summarized away until the trigger is crossed.
+    if count_tokens_approximately(state.messages) > _SUMMARY_TRIGGER_TOKENS:
+        config = get_config()
+        thread_id = config.get("configurable", {}).get("thread_id") if config else None
+        await _await_pending_writes(thread_id)
+
+    try:
+        node = _get_summarization_node(runtime)
+        result = await node.ainvoke(
+            {"messages": list(state.messages), "context": dict(state.context or {})},
+            config=RunnableConfig(callbacks=[]),
+        )
+        # Reset failure count on success
+        result["summarization_failure_count"] = 0
+        return result
+    except Exception:
+        new_count = state.summarization_failure_count + 1
+        logger.exception(
+            "Summarization failed (failure %d/%d) — passing full message list to call_model",
+            new_count,
+            _SUMMARIZATION_CIRCUIT_BREAKER_LIMIT,
+        )
+        # Passthrough on failure so call_model always has something to work with.
+        return {
+            "summarized_messages": list(state.messages),
+            "summarization_failure_count": new_count,
+        }
+
+
+async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Call the LLM powering the agent.
+
+    Uses ``state.summarized_messages`` (produced by the ``summarize`` node) as
+    the message window so the model always operates within its token budget.
+
+    Long-term memory is handled entirely by the agent's own ``manage_memory``
+    and ``search_memory`` tools (LangMem hot path).  No manual extraction,
+    keyword detection, or system-prompt injection is required here.
+
+    Enhanced with:
+    - Fallback model support (automatic model swap on overload)
+    - Hallucination screening (grounding verification)
+    - Cost/token tracking per session
+    - Max output token recovery
+    """
+    # runtime.context.system_prompt is fully static now — no per-turn
+    # interpolation. System time and all other volatile content live in the
+    # dynamic block assembled below, after the cache breakpoint (Item 1).
+    static_prompt = runtime.context.system_prompt
+
+    latest_human_text = _latest_human_text(list(state.messages))
+    if not runtime.context.roadmap_generated and latest_human_text and not is_career_roadmap_trigger(latest_human_text):
+        return {
+            "messages": [AIMessage(content=FIRST_TIME_ROADMAP_REDIRECT_MESSAGE)],
+            "tool_call_counts": dict(state.tool_call_counts),
+            "session_cost": state.session_cost or SessionCost(),
+            "execution_events": list(state.execution_events),
+            "agent_wrote_memory": state.agent_wrote_memory,
+            "agent_wrote_task": state.agent_wrote_task,
+        }
+
+    _, tool_policies = _resolve_runtime_tooling(runtime)
+    execution_events = list(state.execution_events)
+    session_cost = state.session_cost or SessionCost()
+    tool_limit_notice = build_tool_limit_notice(state.tool_call_counts, tool_policies)
+    if tool_limit_notice:
+        execution_events.append(
+            serialize_event(
+                ExecutionEvent(
+                    event_type="tool_limit_notice",
+                    message="One or more tools reached the configured call limit.",
+                    metadata={
+                        "tool_call_counts": dict(state.tool_call_counts),
+                    },
+                )
+            )
+        )
+
+    # Static block: persona/directives/roadmap structure/anti-fabrication
+    # rules/tool descriptions plus the static memory-instructions section.
+    # Byte-identical across turns within a session — this is the half of the
+    # prompt that gets cached (see prompt_caching.build_cached_system_prompt
+    # below). Nothing volatile may be appended to this value.
+    static_block = _prompts.build_runtime_system_prompt(static_prompt)
+
+    # --- Session context injection ---
+    # If we have session notes from a previous extraction, they go in the
+    # dynamic block (assembled below) so they never invalidate the cache.
+    session_block = build_session_context_block(state.session_notes)
+
+    # --- Proactive memory load ---
+    # On the first turn (no previous AI messages), pre-load relevant memories
+    # and inject them as a system reminder.  This ensures the agent has context
+    # before its first response without relying on it to call search_memory.
+    proactive_memory_text: str = ""
+    proactive_memory_block: str = ""
+    store = runtime.store
+    user_id = runtime.context.user_id
+    ai_count = sum(1 for m in state.messages if isinstance(m, AIMessage))
+
+    # AdvisorBehaviorProfile shapes tone for the whole conversation, not just
+    # a first-turn greeting (spec Item 4: injected "each turn") — fetched
+    # every turn, independent of the first-turn-only recall below. Placed
+    # after the cache breakpoint (dynamic block), so re-fetching it each turn
+    # does not affect prompt caching. Shared with outreach generation via
+    # context_assembly (spec Item 7, §9.1) — same selection rule everywhere.
+    behavior_content = await fetch_advisor_behavior_profile(store, user_id)
+    advisor_behavior_block = _prompts.build_advisor_behavior_block(behavior_content) if behavior_content else ""
+
+    if store and user_id and ai_count == 0:
+        # Shared with outreach generation via context_assembly (spec Item 7).
+        memory_block, clean_block = await fetch_semantic_memory_block(store, user_id, limit=20)
+        if memory_block:
+            # Grounding text for the hallucination screen (screen_output_for_hallucination),
+            # kept with freshness tags intact — see tool_result_texts below.
+            proactive_memory_text = memory_block
+            proactive_memory_block = f"""
+<proactive_memory_recall>
+The following memories were recalled for this student at the start of the conversation.
+Use them to personalize your response. Do NOT repeat these verbatim — weave them naturally.
+IMPORTANT: Do NOT make claims about when you last spoke, how long it has been, or when
+the student enrolled. You do not know this information. Treat every new thread as a fresh
+conversation and greet the student without time references.
+
+{clean_block}
+</proactive_memory_recall>"""
+
+    # --- Proactive task load (spec Item 2: conversation-start injection) ---
+    # Same trigger as proactive memory load (first turn of a new conversation)
+    # but doesn't require the LangGraph store — tasks live in the accountability
+    # Postgres table, keyed only on user_id.
+    open_tasks_block = ""
+    if user_id and ai_count == 0:
+        task_group = await fetch_open_task_group_for_prompt(user_id)
+        open_tasks_block = _prompts.build_open_tasks_block(task_group)
+
+    # Dynamic block: system time, tool-limit notices, session context,
+    # proactive memory recall, open tasks, and the learned advisor-behavior
+    # profile — everything that changes turn to turn. Placed after the cache
+    # breakpoint so it never invalidates the static block.
+    dynamic_block = _prompts.build_dynamic_prompt_block(
+        system_time=datetime.now(tz=UTC).isoformat(),
+        tool_limit_notice=tool_limit_notice,
+        session_block=session_block,
+        proactive_memory_block=proactive_memory_block,
+        open_tasks_block=open_tasks_block,
+        advisor_behavior_block=advisor_behavior_block,
+    )
+    system_message = _prompt_caching.build_cached_system_prompt(
+        static_block,
+        dynamic_block,
+        provider=_prompt_caching.resolve_provider_kind(runtime.context.model),
+        cache_ttl=runtime.context.anthropic_prompt_caching_ttl,
+    )
+
+    # Use the token-bounded summarised messages from the previous node.
+    # Fall back to the full message list on the very first turn (before
+    # summarize has had a chance to produce output).
+    prepared_messages = list(state.summarized_messages) or list(state.messages)
+
+    # Budget tool results: truncate oversized individual results, then clear
+    # old ones to free context space.  Applied before every model call so the
+    # effective prompt never grows unboundedly with accumulated tool output.
+    prepared_messages = _apply_tool_result_budget(prepared_messages)
+    prepared_messages = _snip_old_tool_results(prepared_messages)
+
+    # Compaction is a single proactive path now (spec Item 5, §7.2): the
+    # `summarize` node already ran before this node and compressed history if
+    # it exceeded `_SUMMARY_TRIGGER_TOKENS`, with its own circuit breaker.
+    # There is deliberately no reactive retry chain here any more — if a
+    # model call still overflows context despite that, raising the trigger
+    # (16k of Sonnet's 200k window) is meant to make this unreachable in
+    # normal operation, so a single fallback response is enough.
+    agent_tool_results: list[str] = []
+    try:
+        response, invoke_events, usage_metadata, agent_tool_results = await _invoke_integrated_agent(
+            prepared_messages, runtime, system_message
+        )
+        execution_events.extend(invoke_events)
+        # Track cost from usage metadata
+        if usage_metadata:
+            session_cost = track_llm_usage(session_cost, runtime.context.model, usage_metadata)
+    except Exception as first_exc:
+        exc_str = str(first_exc).lower()
+        is_context_overflow = any(
+            marker in exc_str
+            for marker in (
+                "context_length_exceeded",
+                "too many tokens",
+                "prompt too long",
+                "input is too long",
+                "context window",
+            )
+        )
+        if not is_context_overflow:
+            raise
+        logger.error(
+            "Context overflow despite proactive compaction — returning fallback response: %s",
+            str(first_exc)[:200],
+        )
+        execution_events.append(
+            serialize_event(
+                ExecutionEvent(
+                    event_type="fallback_mode",
+                    level="error",
+                    message="Context overflow despite proactive compaction; returned fallback response.",
+                    metadata={"component": "model", "error": str(first_exc)[:200]},
+                )
+            )
+        )
+        response = AIMessage(content="I'm having trouble processing this conversation right now. Please try again.")
+
+    # --- Max output token recovery ---
+    # If the model hit its output token limit, retry with a continuation prompt.
+    stop_reason = getattr(response, "response_metadata", {}).get("stop_reason", "")
+    if stop_reason == "max_tokens" and not response.tool_calls:
+        for recovery_attempt in range(_MAX_OUTPUT_RECOVERY_RETRIES):
+            execution_events.append(
+                serialize_event(
+                    ExecutionEvent(
+                        event_type="max_output_recovery_attempted",
+                        level="warning",
+                        message=f"Max output tokens hit — recovery attempt {recovery_attempt + 1}/{_MAX_OUTPUT_RECOVERY_RETRIES}.",
+                    )
+                )
+            )
+            continuation_messages = prepared_messages + [
+                response,
+                HumanMessage(
+                    content=(
+                        "Your previous response was cut off mid-sentence. "
+                        "Continue EXACTLY from where you stopped. "
+                        "Do not repeat what you already said — pick up seamlessly."
+                    )
+                ),
+            ]
+            try:
+                continuation, cont_events, cont_usage, _ = await _invoke_integrated_agent(
+                    continuation_messages, runtime, system_message
+                )
+                execution_events.extend(cont_events)
+                if cont_usage:
+                    session_cost = track_llm_usage(session_cost, runtime.context.model, cont_usage)
+
+                # Merge the continuation into the original response
+                original_text = get_message_text(response)
+                continuation_text = get_message_text(continuation)
+                response = AIMessage(
+                    content=original_text + continuation_text,
+                    id=response.id,
+                    tool_calls=getattr(continuation, "tool_calls", []),
+                    response_metadata=getattr(continuation, "response_metadata", {}),
+                )
+
+                cont_stop = getattr(continuation, "response_metadata", {}).get("stop_reason", "")
+                if cont_stop != "max_tokens":
+                    execution_events.append(
+                        serialize_event(
+                            ExecutionEvent(
+                                event_type="max_output_recovery_succeeded",
+                                message=f"Max output recovery succeeded on attempt {recovery_attempt + 1}.",
+                            )
+                        )
+                    )
+                    break
+            except Exception:
+                logger.warning("Max output recovery attempt %d failed", recovery_attempt + 1)
+                execution_events.append(
+                    serialize_event(
+                        ExecutionEvent(
+                            event_type="max_output_recovery_failed",
+                            level="warning",
+                            message=f"Recovery attempt {recovery_attempt + 1} failed.",
+                        )
+                    )
+                )
+                break
+
+    # Anthropic/Bedrock return AIMessage.content as a list of content blocks
+    # (e.g. [{'type': 'text', 'text': '...'}]).  Normalise to a plain string
+    # so that every `values` stream event the frontend receives has clean,
+    # renderable content — preventing the raw Python repr from flashing on
+    # re-renders triggered by later graph nodes (e.g. generate_thread_title).
+    if isinstance(response.content, list):
+        response = AIMessage(
+            content=get_message_text(response),
+            id=response.id,
+            tool_calls=getattr(response, "tool_calls", []),
+            response_metadata=getattr(response, "response_metadata", {}),
+        )
+
+    # Strip LangChain/LangMem formatting artifacts (=== Ai Message === headers,
+    # </session_UUID> XML tags) that bleed in when the summarization context
+    # window contains LangMem-formatted conversation text.
+    _raw_text = get_message_text(response)
+    _cleaned_text = _strip_lc_artifacts(_raw_text)
+    if _cleaned_text != _raw_text:
+        logger.warning("Stripped LangChain/LangMem artifacts from model response (turn contained formatting bleed)")
+        response = AIMessage(
+            content=_cleaned_text,
+            id=response.id,
+            tool_calls=getattr(response, "tool_calls", []),
+            response_metadata=getattr(response, "response_metadata", {}),
+        )
+
+    # Output screening: replace the response if it leaks system-prompt content.
+    if runtime.context.guardrails_enabled and screen_output_for_leak(get_message_text(response)):
+        execution_events.append(
+            serialize_event(
+                ExecutionEvent(
+                    event_type="output_guardrail_blocked",
+                    level="warning",
+                    message="Output leak screening replaced the model response.",
+                )
+            )
+        )
+        response = AIMessage(content=LEAK_SAFE_RESPONSE, id=response.id)
+
+    # Hallucination screening: check if the response fabricates user facts.
+    # Only run on final responses (no tool calls) to avoid screening intermediate steps.
+    response_text = get_message_text(response)
+    if (
+        runtime.context.guardrails_enabled
+        and not response.tool_calls
+        and response_text
+        and response_text != LEAK_SAFE_RESPONSE
+    ):
+        # Collect tool results from the conversation for evidence grounding.
+        # Include both outer-graph ToolMessages (from previous turns) and
+        # the agent runtime's internal tool results (current turn) so the
+        # hallucination checker sees all evidence the model actually used.
+        tool_result_texts = [
+            msg.content if isinstance(msg.content, str) else str(msg.content)
+            for msg in state.messages
+            if isinstance(msg, ToolMessage)
+        ] + agent_tool_results
+        # Include proactive memory content as evidence — on the first turn
+        # the model personalizes from recalled memories, not tool calls.
+        if proactive_memory_text:
+            tool_result_texts.append(proactive_memory_text)
+        # Include session notes as evidence — these are injected into the
+        # system prompt and the model may reference them.
+        if session_block:
+            tool_result_texts.append(session_block)
+        user_text = _latest_human_text(list(state.messages))
+
+        guardrail_model = load_chat_model(runtime.context.guardrail_model)
+        is_hallucination, hallucination_details = await screen_output_for_hallucination(
+            response_text, tool_result_texts, user_text, guardrail_model
+        )
+        if is_hallucination:
+            execution_events.append(
+                serialize_event(
+                    ExecutionEvent(
+                        event_type="hallucination_detected",
+                        level="warning",
+                        message="Hallucination screening detected fabricated user facts.",
+                        metadata={
+                            "response_preview": response_text[:200],
+                            "details": hallucination_details,
+                        },
+                    )
+                )
+            )
+            response, session_cost = await _correct_hallucinated_response(
+                response,
+                hallucination_details,
+                prepared_messages,
+                runtime,
+                system_message,
+                session_cost,
+                execution_events,
+            )
+
+    # Cost threshold warning
+    if is_over_cost_threshold(session_cost):
+        execution_events.append(
+            serialize_event(
+                ExecutionEvent(
+                    event_type="cost_threshold_warning",
+                    level="warning",
+                    message=f"Session cost ${session_cost.total_cost_usd:.4f} exceeds threshold ${session_cost.cost_warning_threshold_usd:.2f}.",
+                    metadata={
+                        "total_cost_usd": session_cost.total_cost_usd,
+                        "threshold_usd": session_cost.cost_warning_threshold_usd,
+                    },
+                )
+            )
+        )
+
+    # Tally tool calls from the full message history so tool_call_counts state
+    # reflects cumulative usage across turns for the limit enforcement above.
+    updated_counts: dict[str, int] = {}
+    for msg in state.messages:
+        if isinstance(msg, AIMessage):
+            for tc in getattr(msg, "tool_calls", []) or []:
+                name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+                if name:
+                    updated_counts[name] = updated_counts.get(name, 0) + 1
+
+    # --- Mutual exclusion: detect if the agent called manage_memory / manage_task ---
+    # If the agent wrote during the hot path, consolidate_memories should skip
+    # the corresponding cold-path extraction to avoid duplication (Claude-code's
+    # mutual exclusion pattern).
+    _agent_wrote_memory = updated_counts.get("manage_memory", 0) > 0
+    _agent_wrote_task = updated_counts.get("manage_task", 0) > 0
 
     # Handle the case when it's the last step and the model still wants to use a tool
     if state.is_last_step and response.tool_calls:
@@ -56,11 +1192,22 @@ async def call_model(state: State, runtime: Runtime[Context]) -> dict[str, list[
                     id=response.id,
                     content="Sorry, I could not find an answer to your question in the specified number of steps.",
                 )
-            ]
+            ],
+            "tool_call_counts": updated_counts,
+            "session_cost": session_cost,
+            "execution_events": execution_events,
+            "agent_wrote_memory": _agent_wrote_memory,
+            "agent_wrote_task": _agent_wrote_task,
         }
 
-    # Return the model's response as a list to be added to existing messages
-    return {"messages": [response]}
+    return {
+        "messages": [response],
+        "tool_call_counts": updated_counts,
+        "session_cost": session_cost,
+        "execution_events": execution_events,
+        "agent_wrote_memory": _agent_wrote_memory,
+        "agent_wrote_task": _agent_wrote_task,
+    }
 
 
 async def generate_thread_title(state: State, runtime: Runtime[Context]) -> dict:
@@ -78,14 +1225,19 @@ async def generate_thread_title(state: State, runtime: Runtime[Context]) -> dict
     first_human = get_message_text(human_messages[0])[:400]
     first_ai = get_message_text(ai_messages[0])[:400] if ai_messages else ""
 
+    # Base the title on the user's message — it reflects their actual intent.
+    # Only supplement with the AI response when the user's message is too short
+    # to produce a meaningful title (pure greetings like "hi" or "hello").
+    # Never derive the title from the AI response alone — if the agent refused
+    # or gave an unexpected reply, we do not want that echoed as the thread title.
+    _human_is_greeting = len(first_human.strip()) <= 20
     exchange = f"User: {first_human}"
-    if first_ai:
+    if first_ai and _human_is_greeting:
         exchange += f"\nAssistant: {first_ai}"
 
     model = load_chat_model(
-        runtime.context.model,
-        enable_thinking=runtime.context.enable_thinking,
-        thinking_budget=runtime.context.thinking_budget,
+        # Use Haiku for title generation — cheap, fast, and available in EU.
+        "bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0",
     )
     response = await model.ainvoke(
         [
@@ -93,12 +1245,14 @@ async def generate_thread_title(state: State, runtime: Runtime[Context]) -> dict
                 "role": "system",
                 "content": (
                     "Generate a concise 4-6 word title for this conversation. "
-                    "Base it on the actual topic discussed, not on greetings. "
+                    "Base it on the user's message — it reflects their actual intent. "
+                    "Do not echo or paraphrase the assistant's response. "
                     "Return only the title text — no quotes, no punctuation, no explanation."
                 ),
             },
             {"role": "user", "content": exchange},
-        ]
+        ],
+        config=RunnableConfig(callbacks=[]),
     )
 
     title = get_message_text(response).strip()[:80]
@@ -112,24 +1266,19 @@ async def generate_thread_title(state: State, runtime: Runtime[Context]) -> dict
     return {"thread_name": title}
 
 
-def route_model_output(state: State) -> Literal["__end__", "tools", "generate_thread_title"]:
-    """Determine the next node based on the model's output.
-
-    This function checks if the model's last message contains tool calls.
-
-    Args:
-        state (State): The current state of the conversation.
-
-    Returns:
-        str: The name of the next node to call.
-    """
+def route_model_output(state: State) -> Literal["__end__", "consolidate_memories"]:
+    """Route to background memory consolidation on a final answer, or end immediately
+    when the model issued tool calls (already handled inside create_agent)."""
     last_message = state.messages[-1]
     if not isinstance(last_message, AIMessage):
         raise ValueError(f"Expected AIMessage in output edges, but got {type(last_message).__name__}")
-    # If there are tool calls, execute them
     if last_message.tool_calls:
-        return "tools"
-    # Generate a title once — only on the first complete exchange
+        return "__end__"
+    return "consolidate_memories"
+
+
+def route_after_consolidation(state: State) -> Literal["__end__", "generate_thread_title"]:
+    """Generate a thread title on the first complete exchange; otherwise finish."""
     if not state.thread_name:
         human_count = sum(1 for m in state.messages if isinstance(m, HumanMessage))
         if human_count == 1:
@@ -137,32 +1286,422 @@ def route_model_output(state: State) -> Literal["__end__", "tools", "generate_th
     return "__end__"
 
 
+# Set of background tasks — prevents garbage collection of fire-and-forget tasks.
+_background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+_MAX_BACKGROUND_TASKS = 100
+
+
+def _spawn_background_task(coro, label: str = "", *, thread_id: str | None = None) -> None:
+    """Create a fire-and-forget asyncio.Task with pool overflow protection.
+
+    When ``thread_id`` is given, the task is also tracked in
+    ``_pending_writes_by_thread`` so ``summarize`` can await it before
+    compacting that thread's history (write-before-compact, spec Item 5).
+    """
+    task = asyncio.create_task(coro)
+    if len(_background_tasks) >= _MAX_BACKGROUND_TASKS:
+        logger.warning(
+            "Background task pool full (%d tasks) — skipping %s",
+            _MAX_BACKGROUND_TASKS,
+            label,
+        )
+        task.cancel()
+        return
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    if thread_id:
+        pending = _pending_writes_by_thread.setdefault(thread_id, set())
+        pending.add(task)
+        task.add_done_callback(lambda _t, _pending=pending: _pending.discard(_t))
+
+
+# Tracks in-flight consolidate_memories background writes per thread, so the
+# summarize node can wait for the previous turn's write-before-compact writes
+# to land before compacting that turn's messages away (spec Item 5, §7.2).
+_pending_writes_by_thread: dict[str, set[asyncio.Task]] = {}
+_WRITE_BEFORE_COMPACT_TIMEOUT_SECONDS = 5.0
+
+
+async def _await_pending_writes(thread_id: str | None) -> None:
+    """Wait (bounded) for the previous turn's background writes to land.
+
+    A timeout is a safety valve, not an expected outcome — the writes are
+    small JSON-extraction calls that normally finish in well under a second,
+    long before the user reads and replies to the previous turn.
+    """
+    if not thread_id:
+        return
+    pending = _pending_writes_by_thread.get(thread_id)
+    if not pending:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True),
+            timeout=_WRITE_BEFORE_COMPACT_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        logger.warning(
+            "write-before-compact: timed out after %.1fs waiting for prior-turn writes (thread=%s)",
+            _WRITE_BEFORE_COMPACT_TIMEOUT_SECONDS,
+            thread_id,
+        )
+
+
+# Cold-path task extraction (spec Item 2, §4.2). Only the last exchange is
+# scanned — a task assigned in an earlier turn was already a candidate on its
+# own turn, so scanning the recent window (plus dedup in persist_extracted_tasks)
+# keeps this from re-extracting old tasks on every subsequent turn.
+_TASK_EXTRACTION_RECENT_MESSAGES = 6
+
+_TASK_EXTRACTION_PROMPT = """You are reviewing a finished exchange between an AI career advisor and a student.
+Extract ONLY concrete tasks the ADVISOR assigned to the student, or that the student explicitly committed to,
+in this exchange — specific, checkable actions expected to be done before a future session.
+
+Rules:
+- Only real assignments/commitments. Ignore vague suggestions ("you could look into X someday") and anything
+  already described as finished.
+- Each task must be specific and checkable: "Rebuild GitHub README with 3 pinned projects", NOT "work on portfolio".
+- NEVER invent a task. Every task must trace to something actually stated in the exchange.
+- If there is no such concrete task, return an empty array.
+
+Return ONLY a JSON array. Each element: {"description": string, "due_date": string|null, "priority": "high"|"normal"|"low"}.
+due_date is an ISO date (YYYY-MM-DD) ONLY when an explicit date was stated; otherwise null."""
+
+
+def _parse_extracted_tasks(raw: str) -> list[dict[str, Any]]:
+    """Parse the extraction model's reply into a list of task dicts. Tolerant of code fences."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL).strip()
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return []
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except (json.JSONDecodeError, ValueError):
+        return []
+    return [t for t in parsed if isinstance(t, dict) and t.get("description")]
+
+
+async def _extract_and_log_tasks(
+    messages: list[AnyMessage],
+    model: Any,
+    user_id: str,
+    thread_id: str | None,
+    advisor_persona: str | None,
+) -> None:
+    """Run the extraction model over the recent exchange and persist any new tasks."""
+    recent = messages[-_TASK_EXTRACTION_RECENT_MESSAGES:]
+    lines: list[str] = []
+    for msg in recent:
+        if isinstance(msg, HumanMessage):
+            lines.append(f"Student: {get_message_text(msg)[:800]}")
+        elif isinstance(msg, AIMessage):
+            text = get_message_text(msg)
+            if text.strip():
+                lines.append(f"Advisor: {text[:800]}")
+    if not lines:
+        return
+
+    response = await model.ainvoke(
+        [
+            {"role": "system", "content": _TASK_EXTRACTION_PROMPT},
+            {"role": "user", "content": "Exchange:\n\n" + "\n".join(lines)},
+        ],
+        config=RunnableConfig(callbacks=[]),
+    )
+    tasks = _parse_extracted_tasks(get_message_text(response))
+    if not tasks:
+        return
+    created = await persist_extracted_tasks(user_id, tasks, thread_id=thread_id, advisor_persona=advisor_persona)
+    if created:
+        logger.info("Cold-path task extraction created %d task(s) for user=%s", created, user_id)
+
+
+async def consolidate_memories(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Post-response background work node.
+
+    Dispatches fire-and-forget tasks so the graph reaches the next node
+    (or ``__end__``) without delay:
+
+    1. **Memory consolidation** — extracts durable facts into long-term store.
+    2. **Session memory extraction** — updates session notes for compaction.
+
+    Both run as ``asyncio.Task`` s to avoid blocking the response stream.
+    Thread title generation remains a separate graph node because it needs
+    to update graph state and send a custom event over the stream.
+    """
+    store = runtime.store
+    user_id = runtime.context.user_id
+    config = get_config()
+    thread_id = config.get("configurable", {}).get("thread_id", "")
+
+    if not store or not user_id:
+        return {}
+
+    # ---- 1. Memory consolidation (existing logic) ----
+    if not state.agent_wrote_memory:
+        namespace = (user_id, DEFAULT_MEMORY_NAMESPACE)
+        model = _build_runtime_model(runtime)
+        messages = _normalize_messages_for_memory(list(state.messages))
+
+        async def _run_consolidation() -> None:
+            for attempt in range(2):
+                try:
+                    before = await store.asearch(namespace)
+                    before_keys = {item.key for item in before}
+
+                    stale_keys = [item.key for item in before if "kind" not in item.value]
+                    if stale_keys:
+                        logger.info(
+                            "Purging %d old-format memory items for user=%s keys=%s",
+                            len(stale_keys),
+                            user_id,
+                            stale_keys,
+                        )
+                        for key in stale_keys:
+                            await store.adelete(namespace, key)
+                        before_keys -= set(stale_keys)
+
+                    manager = create_memory_store_manager(
+                        model,
+                        schemas=MEMORY_SCHEMAS,
+                        instructions=MEMORY_EXTRACTION_INSTRUCTIONS,
+                        namespace=namespace,
+                        store=store,
+                        enable_deletes=True,
+                    )
+                    await manager.ainvoke(
+                        {"messages": messages},
+                        config=RunnableConfig(callbacks=[]),
+                    )
+
+                    after = await store.asearch(namespace)
+                    after_keys = {item.key for item in after}
+                    created = after_keys - before_keys
+                    deleted = before_keys - after_keys
+                    updated = {
+                        item.key
+                        for item in after
+                        if item.key in before_keys
+                        and next((b.value for b in before if b.key == item.key), None) != item.value
+                    }
+                    logger.info(
+                        "Memory consolidation complete — user=%s total=%d created=%d updated=%d deleted=%d created_keys=%s deleted_keys=%s",
+                        user_id,
+                        len(after_keys),
+                        len(created),
+                        len(updated),
+                        len(deleted),
+                        sorted(created),
+                        sorted(deleted),
+                    )
+
+                    if len(after) > MAX_MEMORIES_PER_USER:
+                        sorted_items = sorted(
+                            after,
+                            key=lambda item: (
+                                getattr(item, "updated_at", None) or getattr(item, "created_at", None) or ""
+                            ),
+                        )
+                        excess = len(after) - MAX_MEMORIES_PER_USER
+                        pruned_keys = [item.key for item in sorted_items[:excess]]
+                        for key in pruned_keys:
+                            await store.adelete(namespace, key)
+                        logger.info(
+                            "Memory pruning — user=%s pruned=%d oldest keys=%s",
+                            user_id,
+                            excess,
+                            pruned_keys,
+                        )
+                    break
+                except Exception as exc:
+                    exc_str = str(exc).lower()
+                    is_connection_error = any(
+                        marker in exc_str
+                        for marker in (
+                            "ssl error",
+                            "eof detected",
+                            "closed connection",
+                            "connection reset",
+                            "operationalerror",
+                        )
+                    )
+                    is_bedrock_auth_error = (
+                        type(exc).__name__ in {"NoAuthTokenError", "NoCredentialsError"}
+                        or "unable to locate authorization token" in exc_str
+                    )
+                    if is_connection_error and attempt == 0:
+                        logger.warning(
+                            "Memory consolidation hit a transient connection error — retrying (attempt %d): %s",
+                            attempt + 1,
+                            str(exc)[:200],
+                        )
+                        await asyncio.sleep(1)
+                        continue
+                    if is_bedrock_auth_error:
+                        logger.warning(
+                            "Skipping background memory consolidation due to missing Bedrock auth token. "
+                            "Configure AWS credentials to enable embedding-based memory search.",
+                        )
+                        break
+                    logger.exception("Background memory consolidation failed; continuing.")
+                    break
+
+        _spawn_background_task(_run_consolidation(), f"consolidation-{user_id}", thread_id=thread_id or None)
+    else:
+        logger.info(
+            "Skipping background consolidation — agent wrote memories during hot path (user=%s)",
+            user_id,
+        )
+
+    # ---- 2. Session memory extraction (background) ----
+    if thread_id and should_extract_session_memory(
+        list(state.messages),
+        state.session_memory_token_count,
+    ):
+        _session_model_name = runtime.context.guardrail_model
+        _session_messages = list(state.messages)
+
+        async def _run_session_memory() -> None:
+            try:
+                _model = load_chat_model(_session_model_name)
+                session_ns = get_session_namespace(user_id, thread_id)
+                try:
+                    existing = await store.asearch(session_ns, limit=1)
+                    current_notes = (
+                        existing[0].value.get("notes", SESSION_MEMORY_TEMPLATE) if existing else SESSION_MEMORY_TEMPLATE
+                    )
+                except Exception:
+                    current_notes = SESSION_MEMORY_TEMPLATE
+
+                updated_notes = await extract_session_memory(
+                    _session_messages,
+                    current_notes,
+                    _model,
+                )
+                session_value: dict[str, Any] = {
+                    "notes": updated_notes,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+                if state.thread_name:
+                    session_value["thread_name"] = state.thread_name
+                await store.aput(session_ns, "session_notes", session_value)
+                logger.debug("Session memory extraction complete — thread=%s", thread_id)
+            except Exception:
+                logger.debug("Background session memory extraction failed; continuing.", exc_info=True)
+
+        _spawn_background_task(_run_session_memory(), f"session-mem-{thread_id}", thread_id=thread_id or None)
+
+    # ---- 3. Cold-path task extraction (spec Item 2, §4.2) ----
+    # Mutual exclusion mirrors memory consolidation: skip when the agent already
+    # logged a task via the manage_task hot path this turn, so a task is never
+    # double-written.
+    if not state.agent_wrote_task:
+        # Cheap model on purpose: this is a small JSON extraction, matching the
+        # session-memory extraction convention — not worth full-model price per turn.
+        _task_model = load_chat_model(runtime.context.guardrail_model)
+        _task_messages = _normalize_messages_for_memory(list(state.messages))
+        _advisor = runtime.context.advisor or {}
+        _advisor_persona = _advisor.get("name", "").split()[0] if _advisor.get("name") else None
+
+        async def _run_task_extraction() -> None:
+            try:
+                await _extract_and_log_tasks(_task_messages, _task_model, user_id, thread_id or None, _advisor_persona)
+            except Exception:
+                logger.debug("Background cold-path task extraction failed; continuing.", exc_info=True)
+
+        _spawn_background_task(_run_task_extraction(), f"task-extract-{user_id}", thread_id=thread_id or None)
+
+    return {}
+
+
+async def update_session_memory(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Update session notes after each final AI response.
+
+    Ported from Claude-code's ``SessionMemory`` post-sampling hook.
+
+    Session notes capture in-progress work state that survives context
+    compaction: what was being discussed, key decisions, errors encountered,
+    and the worklog of steps taken.  They are injected into the system prompt
+    via ``build_session_context_block``.
+
+    The extraction is throttled by token growth since the last extraction
+    to avoid excessive model calls.
+    """
+    store = runtime.store
+    user_id = runtime.context.user_id
+    config = get_config()
+    thread_id = config.get("configurable", {}).get("thread_id", "")
+    if not store or not user_id or not thread_id:
+        return {}
+
+    if not should_extract_session_memory(
+        list(state.messages),
+        state.session_memory_token_count,
+    ):
+        return {}
+
+    # Use the guardrail model for extraction — cheap and fast
+    model = load_chat_model(runtime.context.guardrail_model)
+
+    # Load existing session notes from the store (or use template)
+    session_ns = get_session_namespace(user_id, thread_id)
+    try:
+        existing = await store.asearch(session_ns, limit=1)
+        current_notes = existing[0].value.get("notes", SESSION_MEMORY_TEMPLATE) if existing else SESSION_MEMORY_TEMPLATE
+    except Exception:
+        current_notes = SESSION_MEMORY_TEMPLATE
+
+    try:
+        updated_notes = await extract_session_memory(
+            list(state.messages),
+            current_notes,
+            model,
+        )
+
+        # Persist to store
+        session_value: dict[str, Any] = {
+            "notes": updated_notes,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        if state.thread_name:
+            session_value["thread_name"] = state.thread_name
+        await store.aput(session_ns, "session_notes", session_value)
+
+        token_count = count_tokens_approximately(list(state.messages))
+        return {
+            "session_notes": updated_notes,
+            "session_memory_token_count": token_count,
+        }
+    except Exception:
+        logger.debug("Session memory extraction failed; continuing.", exc_info=True)
+        return {}
+
+
 # Define a new graph
 
 builder = StateGraph(State, input_schema=InputState, context_schema=Context)
 
 # Define the nodes
+builder.add_node(screen_input)
+builder.add_node(summarize)
 builder.add_node(call_model)
-builder.add_node("tools", ToolNode(TOOLS))
+builder.add_node(consolidate_memories)
 builder.add_node(generate_thread_title)
 
-# Set the entrypoint as `call_model`
-# This means that this node is the first one called
-builder.add_edge("__start__", "call_model")
+# Entry: screen for injection → compress messages → call model
+builder.add_edge("__start__", "screen_input")
+builder.add_conditional_edges("screen_input", route_after_screening)
+builder.add_edge("summarize", "call_model")
 builder.add_edge("generate_thread_title", "__end__")
 
-
-# Add a conditional edge to determine the next step after `call_model`
-builder.add_conditional_edges(
-    "call_model",
-    # After call_model finishes running, the next node(s) are scheduled
-    # based on the output from route_model_output
-    route_model_output,
-)
-
-# Add a normal edge from `tools` to `call_model`
-# This creates a cycle: after using tools, we always return to the model
-builder.add_edge("tools", "call_model")
+# call_model → consolidate_memories (final answer) or __end__ (tool call)
+builder.add_conditional_edges("call_model", route_model_output)
+# consolidate_memories dispatches memory + session extraction as background tasks,
+# then routes to generate_thread_title (first turn) or __end__.
+builder.add_conditional_edges("consolidate_memories", route_after_consolidation)
 
 # Compile the builder into an executable graph
 graph = builder.compile(name="ReAct Agent")

@@ -1,7 +1,5 @@
 """Integration tests for assistants CRUD operations"""
 
-from unittest.mock import AsyncMock, patch
-
 import pytest
 
 from aegra_api.services.assistant_service import get_assistant_service
@@ -11,22 +9,19 @@ from tests.fixtures.test_helpers import make_assistant
 
 @pytest.fixture
 def client(mock_assistant_service):
-    """Create test client with mocked service"""
+    """Create test client with a fully mocked service.
+
+    The service is overridden wholesale, so auth dispatch (which lives inside
+    the real service) never runs here — these tests cover the API layer only.
+    """
     app = create_test_app(include_runs=False, include_threads=False)
 
-    # Import and mount assistants router
     from aegra_api.api import assistants as assistants_module
 
     app.include_router(assistants_module.router)
 
-    # Override the service dependency
     app.dependency_overrides[get_assistant_service] = lambda: mock_assistant_service
-
-    # Mock authorization handlers to allow all requests in integration tests
-    # These tests focus on API layer, not authorization layer
-    with patch("aegra_api.api.assistants.handle_event", new_callable=AsyncMock) as mock_handle:
-        mock_handle.return_value = None  # Allow all requests
-        yield make_client(app)
+    yield make_client(app)
 
 
 class TestCreateAssistant:
@@ -246,7 +241,7 @@ class TestDeleteAssistant:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "deleted"
-        mock_assistant_service.delete_assistant.assert_called_once_with("test-assistant-123", "test-user")
+        mock_assistant_service.delete_assistant.assert_called_once_with("test-assistant-123")
 
     def test_delete_assistant_not_found(self, client, mock_assistant_service):
         """Test deleting non-existent assistant"""
@@ -484,6 +479,45 @@ class TestSearchAssistants:
         assert len(data) == 1
         assert data[0]["name"] == "Prod Assistant"
         assert data[0]["graph_id"] == "prod-graph"
+
+
+class TestSearchAssistantsSortAndAuth:
+    """Sort params + #333 regression: auth handlers returning filters must not 500."""
+
+    def test_search_with_sort_by_name_asc(self, client, mock_assistant_service):
+        mock_assistant_service.search_assistants.return_value = []
+
+        resp = client.post(
+            "/assistants/search",
+            json={"sort_by": "name", "sort_order": "asc"},
+        )
+
+        assert resp.status_code == 200
+        kwargs = mock_assistant_service.search_assistants.call_args.kwargs
+        assert kwargs.get("sort_asc") is True
+        sort_column = kwargs.get("sort_column")
+        assert getattr(sort_column, "key", None) == "name"
+
+    def test_search_with_sort_by_only_defaults_to_desc(self, client, mock_assistant_service):
+        mock_assistant_service.search_assistants.return_value = []
+
+        resp = client.post("/assistants/search", json={"sort_by": "updated_at"})
+
+        assert resp.status_code == 200
+        kwargs = mock_assistant_service.search_assistants.call_args.kwargs
+        assert kwargs.get("sort_asc") is False
+
+    def test_invalid_sort_by_returns_422(self, client, mock_assistant_service):
+        resp = client.post("/assistants/search", json={"sort_by": "; DROP TABLE"})
+        assert resp.status_code == 422
+
+    def test_invalid_sort_order_returns_422(self, client, mock_assistant_service):
+        resp = client.post("/assistants/search", json={"sort_by": "name", "sort_order": "sideways"})
+        assert resp.status_code == 422
+
+    # Auth-handler filter merging (#333 regression) and read-endpoint dispatch
+    # now live in the service layer; see tests/unit/test_services/
+    # test_assistant_service.py::TestAuthDispatch.
 
 
 class TestCountAssistants:

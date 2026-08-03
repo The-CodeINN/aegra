@@ -15,7 +15,7 @@ description: "Setup guide, code standards, and development workflow for Aegra co
 ### First time setup
 
 ```bash
-git clone https://github.com/ibbybuilds/aegra.git
+git clone https://github.com/aegra/aegra.git
 cd aegra
 
 # Option A: Using Make (installs dependencies + git hooks)
@@ -124,12 +124,12 @@ git commit -m "feat: add feature"
     docker compose up postgres -d
 
     # Start server (migrations run automatically on startup)
-    uv run --package aegra-api uvicorn aegra_api.main:app --reload
+    uv run --package aegra-api uvicorn aegra_api.main:app --port 2026 --reload
     ```
   </Tab>
 </Tabs>
 
-Visit `http://localhost:8000/docs` to see the API.
+Visit `http://localhost:2026/docs` to see the API.
 
 <Note>
   Migrations run automatically on server startup (`aegra dev`, Docker, or manual). You only need manual migration commands when **creating new migrations** or troubleshooting.
@@ -284,5 +284,5 @@ Before creating a PR:
 
 ## Get help
 
-- **GitHub** — [Open an issue](https://github.com/ibbybuilds/aegra/issues) for bugs or feature requests.
+- **GitHub** — [Open an issue](https://github.com/aegra/aegra/issues) for bugs or feature requests.
 - **Discord** — [Join the community](https://discord.com/invite/D5M3ZPS25e) for questions and discussion.

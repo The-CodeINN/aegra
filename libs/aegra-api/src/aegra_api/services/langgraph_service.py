@@ -8,6 +8,7 @@ Architecture:
 """
 
 import asyncio
+import copy
 import importlib.util
 import json
 import sys
@@ -38,9 +39,21 @@ from aegra_api.services.graph_factory import (
     invoke_factory,
     is_factory,
 )
+from aegra_api.utils.run_utils import strip_pinned_config_keys
 
 State = TypeVar("State")
 logger = structlog.get_logger(__name__)
+
+
+def _module_name_for(graph_id: str) -> str:
+    """Return a safe ``sys.modules`` key for a dynamically loaded graph.
+
+    Sanitises the *graph_id* so it cannot shadow real packages (e.g. ``os.path``,
+    ``json``) by replacing dots, slashes, and hyphens with underscores and
+    placing the result under a private ``aegra_graphs.`` namespace.
+    """
+    safe_id = graph_id.replace(".", "_").replace("/", "_").replace("-", "_")
+    return f"aegra_graphs.{safe_id}"
 
 
 class LangGraphService:
@@ -64,7 +77,7 @@ class LangGraphService:
         # invoked per-request with the appropriate ServerRuntime/config.
         self._graph_factories: dict[str, Callable] = {}
 
-    async def initialize(self):
+    async def initialize(self) -> None:
         """Load configuration file and setup graph registry.
 
         Resolution order:
@@ -98,13 +111,35 @@ class LangGraphService:
         # Load graph registry from config
         self._load_graph_registry()
 
+        # Eagerly load all graph modules so factory graphs are classified
+        # before the first request arrives.  This populates _graph_factories
+        # (and _base_graph_cache for static graphs) without calling factory
+        # functions with empty user/config — fixing the bug where the first
+        # request would fall through to the static path and get a graph
+        # compiled with user=None.
+        await self._load_all_graph_modules()
+
         # Pre-register assistants for each graph using deterministic UUIDs so
         # clients can pass graph_id directly.
         await self._ensure_default_assistants()
 
-    def _load_graph_registry(self):
+    def _load_graph_registry(self) -> None:
         """Load graph definitions from aegra.json"""
+        if self.config is None:
+            raise ValueError("Configuration not loaded")
         graphs_config = self.config.get("graphs", {})
+
+        # Detect graph_ids that collide after sanitisation (e.g. "a.b" and
+        # "a_b" both map to aegra_graphs.a_b in sys.modules).
+        seen_modules: dict[str, str] = {}
+        for graph_id in graphs_config:
+            mod_name = _module_name_for(graph_id)
+            if mod_name in seen_modules:
+                raise ValueError(
+                    f"Graph IDs '{seen_modules[mod_name]}' and '{graph_id}' "
+                    f"collide after sanitisation (both map to {mod_name})"
+                )
+            seen_modules[mod_name] = graph_id
 
         for graph_id, graph_path in graphs_config.items():
             # Parse path format: "./graphs/weather_agent.py:graph"
@@ -117,12 +152,31 @@ class LangGraphService:
                 "export_name": export_name,
             }
 
+    async def _load_all_graph_modules(self) -> None:
+        """Eagerly load all graph modules, classifying factories without calling them.
+
+        For static graphs, the compiled graph is cached in ``_base_graph_cache``.
+        For factory graphs, the callable is stored in ``_graph_factories`` for
+        per-request invocation — the factory is NOT called here, so no graph is
+        compiled with ``user=None``.
+        """
+        for graph_id, graph_info in self._graph_registry.items():
+            raw_graph = await self._load_graph_from_file(graph_id, graph_info)
+            if raw_graph is not None:
+                # Static graph — compile and cache
+                if isinstance(raw_graph, StateGraph):
+                    logger.info("compiling_graph", graph_id=graph_id)
+                    raw_graph = raw_graph.compile()
+                self._base_graph_cache[graph_id] = raw_graph
+
     def _setup_dependencies(self) -> None:
         """Add dependency paths to sys.path for graph imports.
 
         Supports paths from the 'dependencies' config key.
         Paths are resolved relative to the config file location.
         """
+        if self.config is None:
+            raise ValueError("Configuration not loaded")
         dependencies = self.config.get("dependencies", [])
         if not dependencies:
             return
@@ -201,6 +255,10 @@ class LangGraphService:
         the base graph is immutable - we create copies with checkpointer/store
         injected per-request.
 
+        For factory graphs whose modules were already loaded by
+        ``_load_all_graph_modules``, this lazily calls the factory with
+        default args to produce a base graph for schema extraction.
+
         @param graph_id: The graph identifier from aegra.json
         @returns: Compiled Pregel graph (without checkpointer/store)
         @raises ValueError: If graph_id not found or loading fails
@@ -212,10 +270,24 @@ class LangGraphService:
         if graph_id in self._base_graph_cache:
             return self._base_graph_cache[graph_id]
 
-        graph_info = self._graph_registry[graph_id]
+        # Factory graph that was classified but never called with defaults yet.
+        # Call now to produce a base graph for schema extraction.
+        if graph_id in self._graph_factories:
+            raw_graph = await self._call_factory_with_defaults(self._graph_factories[graph_id], graph_id)
+        else:
+            graph_info = self._graph_registry[graph_id]
+            # Load graph from file — may return None if the module turns out
+            # to be a factory (discovered during lazy loading).
+            raw_graph = await self._load_graph_from_file(graph_id, graph_info)
 
-        # Load graph from file
-        raw_graph = await self._load_graph_from_file(graph_id, graph_info)
+        # _load_graph_from_file returns None for factory graphs that were
+        # just discovered and stored in _graph_factories. Retry via the
+        # factory path now that the callable is registered.
+        if raw_graph is None and graph_id in self._graph_factories:
+            raw_graph = await self._call_factory_with_defaults(self._graph_factories[graph_id], graph_id)
+
+        if raw_graph is None:
+            raise ValueError(f"Failed to load graph '{graph_id}': module did not produce a graph")
 
         # Compile if it's a StateGraph
         if isinstance(raw_graph, StateGraph):
@@ -224,8 +296,10 @@ class LangGraphService:
         else:
             compiled_graph = raw_graph
 
-        # Cache the base compiled graph (without checkpointer/store)
-        self._base_graph_cache[graph_id] = compiled_graph
+        # Only cache static graphs — factory graphs must be re-invoked
+        # each time so their result reflects the current user/config context.
+        if graph_id not in self._graph_factories:
+            self._base_graph_cache[graph_id] = compiled_graph
         return compiled_graph
 
     @asynccontextmanager
@@ -279,9 +353,23 @@ class LangGraphService:
         checkpointer = db_manager.get_checkpointer()
         store = db_manager.get_store()
 
-        if graph_id in self._graph_factories:
+        # Resolve the factory callable. Normally populated by
+        # _load_all_graph_modules() at startup, but may be empty after
+        # invalidate_cache(). In that case we re-load the module to
+        # re-classify the factory without invoking it with user=None.
+        factory = self._graph_factories.get(graph_id)
+
+        if not factory and graph_id not in self._base_graph_cache:
+            # Neither factory nor cached static graph — re-load from file
+            # (post-invalidation path). This re-classifies factories without
+            # calling _call_factory_with_defaults(user=None).
+            graph_info = self._graph_registry.get(graph_id)
+            if graph_info:
+                await self._load_graph_from_file(graph_id, graph_info)
+            factory = self._graph_factories.get(graph_id)
+
+        if factory:
             # Factory path — invoke per-request with ServerRuntime
-            factory = self._graph_factories[graph_id]
             run_config = config or {"configurable": {}}
             coerced_context = coerce_context(context, graph_id)
             server_runtime = build_server_runtime(
@@ -311,14 +399,25 @@ class LangGraphService:
 
                 yield graph_to_use
         else:
-            # Static path — use cached base graph
+            # Static path — use cached base graph (already loaded above)
             base_graph = await self._get_base_graph(graph_id)
 
             # Try to create a copy with checkpointer/store injected.
             # NOTE: Do this BEFORE yield to avoid dual-yield when exceptions
             # occur in the context body.
+            # Deep-copy the graph's config to prevent astream from mutating
+            # the cached base graph's nested dicts (e.g. config.metadata).
+            # Pregel.copy() is shallow, so without this, all copies share
+            # the same metadata dict, and writes during execution pollute
+            # the base graph — breaking subsequent runs.
             try:
-                graph_to_use = base_graph.copy(update={"checkpointer": checkpointer, "store": store})
+                graph_to_use = base_graph.copy(
+                    update={
+                        "checkpointer": checkpointer,
+                        "store": store,
+                        "config": copy.deepcopy(base_graph.config),
+                    }
+                )
             except Exception as exc:
                 logger.warning(
                     "graph_checkpointer_injection_failed",
@@ -380,23 +479,26 @@ class LangGraphService:
 
         return await self._get_base_graph(graph_id)
 
-    async def _load_graph_from_file(self, graph_id: str, graph_info: dict[str, str]) -> Pregel | StateGraph:
+    async def _load_graph_from_file(self, graph_id: str, graph_info: dict[str, str]) -> Pregel | StateGraph | None:
         """Load graph from filesystem.
 
         Paths are resolved relative to the config file's directory.
 
         For callable exports, the function inspects the signature to detect
         factory patterns. 0-arg factories are called once at load time.
-        Config/runtime factories are registered for per-request invocation,
-        and called once with default args to produce a base graph for schema
-        extraction.
+        Config/runtime factories are registered in ``_graph_factories`` for
+        per-request invocation and ``None`` is returned — no default-args
+        call is made here, so factory graphs are never compiled with
+        ``user=None`` at startup.
 
         Args:
             graph_id: The graph identifier from aegra.json.
             graph_info: Dict with ``file_path`` and ``export_name`` keys.
 
         Returns:
-            A compiled ``Pregel`` or uncompiled ``StateGraph``.
+            A compiled ``Pregel`` or uncompiled ``StateGraph`` for static
+            graphs, or ``None`` for factory graphs (the factory is stored
+            in ``_graph_factories`` instead).
 
         Raises:
             ValueError: If the file or export is not found.
@@ -412,7 +514,7 @@ class LangGraphService:
             raise ValueError(f"Graph file not found: {file_path}")
 
         # Dynamic import of graph module
-        spec = importlib.util.spec_from_file_location(f"graphs.{graph_id}", str(file_path.resolve()))
+        spec = importlib.util.spec_from_file_location(_module_name_for(graph_id), str(file_path.resolve()))
         if spec is None or spec.loader is None:
             raise ValueError(f"Failed to load graph module: {file_path}")
 
@@ -446,18 +548,29 @@ class LangGraphService:
                 async with generate_graph(graph, graph_id) as resolved:
                     graph = resolved
             else:
-                # Config/runtime factory — store the callable for per-request invocation.
-                # Call once with defaults to get a base graph for schema extraction.
+                # Config/runtime factory — store the callable for per-request
+                # invocation.  Do NOT call with defaults here; the factory will
+                # be invoked with the real user/config on each request.  If a
+                # base graph is needed later for schema extraction, _get_base_graph
+                # will call _call_factory_with_defaults lazily.
                 self._graph_factories[graph_id] = graph
-                graph = await self._call_factory_with_defaults(graph, graph_id)
+                return
 
         return graph
 
     async def _call_factory_with_defaults(self, fn: Callable, graph_id: str) -> Pregel | StateGraph:
-        """Call a factory with default/empty args to get a base graph for schema extraction.
+        """Call a factory with minimal args to get a base graph for schema extraction.
 
-        Uses ``assistants.read`` access context to signal that the factory is
-        being called for introspection, not execution.
+        Intended **only** for introspection (schema extraction, graph
+        structure discovery) — never for the hot execution path. Uses
+        ``assistants.read`` access context and ``user=None``.
+
+        .. note::
+
+            ``build_server_runtime(user=None)`` may fall back to
+            ``get_auth_ctx()`` if called within an HTTP request context,
+            so the runtime may carry a real user. This is incidental,
+            not guaranteed — callers must not rely on it.
 
         Args:
             fn: The factory callable.
@@ -488,6 +601,14 @@ class LangGraphService:
 
         Clears both the base graph cache and the factory callable registry,
         as well as the factory dispatch hooks in the ``graph_factory`` module.
+        The module is also removed from ``sys.modules`` so the next import
+        re-executes the file.
+
+        After invalidation, ``_graph_factories`` is empty. The next call to
+        ``_get_base_graph`` will fall through to ``_load_graph_from_file``,
+        which re-discovers and re-classifies the factory, then retries via
+        the factory path — so callers do not need to re-run
+        ``_load_all_graph_modules`` after invalidation.
 
         Args:
             graph_id: Specific graph to invalidate, or ``None`` to clear all.
@@ -495,12 +616,12 @@ class LangGraphService:
         if graph_id:
             self._base_graph_cache.pop(graph_id, None)
             self._graph_factories.pop(graph_id, None)
-            sys.modules.pop(f"graphs.{graph_id}", None)
+            sys.modules.pop(_module_name_for(graph_id), None)
         else:
             self._base_graph_cache.clear()
             self._graph_factories.clear()
             for key in list(sys.modules.keys()):
-                if key.startswith("graphs."):
+                if key.startswith("aegra_graphs."):
                     sys.modules.pop(key, None)
         clear_factory_registry(graph_id)
 
@@ -560,19 +681,14 @@ def inject_user_context(user: Any | None, base_config: dict[str, Any] | None = N
         config["configurable"].setdefault("user_id", user.identity)
         config["configurable"].setdefault("user_display_name", getattr(user, "display_name", None) or user.identity)
 
-        # Full auth payload for graph nodes - includes ALL fields from auth handler
-        if "langgraph_auth_user" not in config["configurable"]:
-            try:
-                # user.to_dict() returns all fields including extras from auth handlers
-                config["configurable"]["langgraph_auth_user"] = user.to_dict()
-            except Exception:
-                # Fallback: minimal dict if to_dict unavailable or fails
-                config["configurable"]["langgraph_auth_user"] = {"identity": user.identity}
+        config["configurable"]["langgraph_auth_user"] = user
 
     return config
 
 
-def create_thread_config(thread_id: str, user, additional_config: dict = None) -> dict:
+def create_thread_config(
+    thread_id: str, user: User | BaseUser | None, *, additional_config: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Create LangGraph configuration for a specific thread with user context"""
     base_config = {"configurable": {"thread_id": thread_id}}
 
@@ -585,26 +701,25 @@ def create_thread_config(thread_id: str, user, additional_config: dict = None) -
 def create_run_config(
     run_id: str,
     thread_id: str,
-    user,
-    additional_config: dict = None,
-    checkpoint: dict | None = None,
-) -> dict:
+    user: User | BaseUser | None,
+    *,
+    additional_config: dict[str, Any] | None = None,
+    checkpoint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Create LangGraph configuration for a specific run with full context.
 
-    The function is *additive*: it never removes or renames anything the client
-    supplied.  We simply ensure a `configurable` dict exists and then merge a
-    few server-side keys so graph nodes can rely on them.
+    Additive for client keys, except thread_id/run_id which are forced: a
+    body-supplied configurable.thread_id would redirect execution to another
+    user's thread (the checkpointer keys on thread_id alone).
     """
     from copy import deepcopy
 
     cfg: dict = deepcopy(additional_config) if additional_config else {}
-
-    # Ensure a configurable section exists
     cfg.setdefault("configurable", {})
 
-    # Merge server-provided fields (do NOT overwrite if client already set)
-    cfg["configurable"].setdefault("thread_id", thread_id)
-    cfg["configurable"].setdefault("run_id", run_id)
+    # Server-authoritative — overwrite, never honor a client override.
+    cfg["configurable"]["thread_id"] = thread_id
+    cfg["configurable"]["run_id"] = run_id
 
     # Ensure the root run ID is set to match so that astream_events recognizes it
     cfg.setdefault("run_id", run_id)
@@ -626,9 +741,11 @@ def create_run_config(
     observability_metadata = get_tracing_metadata(run_id, thread_id, user_identity)
     cfg["metadata"].update(observability_metadata)
 
-    # Apply checkpoint parameters if provided
+    # Apply checkpoint parameters if provided. Strip pinned identity keys so a
+    # client checkpoint can't redirect execution to another user's thread.
     if checkpoint and isinstance(checkpoint, dict):
-        cfg["configurable"].update({k: v for k, v in checkpoint.items() if v is not None})
+        safe = strip_pinned_config_keys(checkpoint)
+        cfg["configurable"].update({k: v for k, v in safe.items() if v is not None})
 
     # Finally inject user context via existing helper
     return inject_user_context(user, cfg)

@@ -11,6 +11,8 @@ wheels/
 
 # env files
 .env
+.env.production
+!.env.production.template
 
 # Pycharm
 .idea/
@@ -30,3 +32,13 @@ htmlcov/
 
 # Pre-commit
 .pre-commit-cache/
+
+# Backup files
+*.bak
+*.pem
+
+# MacOS
+.DS_Store
+
+# Claude
+.claude/

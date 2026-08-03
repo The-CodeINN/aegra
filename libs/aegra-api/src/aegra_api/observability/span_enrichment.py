@@ -2,8 +2,9 @@
 
 Sets Langfuse-compatible span attributes (``langfuse.user.id``,
 ``langfuse.session.id``, ``langfuse.trace.name``) from per-request
-context variables on the **root span only**, enabling trace enrichment
-without requiring changes to graph code.
+context variables on **every span** in the trace, enabling the Langfuse
+v4 immutable observations model where each observation must carry its
+own context (no server-side join from trace to children).
 
 Also sets Phoenix/OpenInference-compatible aliases (``user.id``,
 ``session.id``) so that the same code works when ``OTEL_TARGETS``
@@ -17,13 +18,24 @@ Usage::
         session_id=thread_id,
         trace_name=graph_id,
     )
-    # The root OTEL span created in this task will carry the attributes.
+    # All OTEL spans created in this task will carry the attributes.
 """
 
 import contextvars
+import logging
+from typing import Any
 
+import structlog
 from opentelemetry.context import Context
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
+
+logger = logging.getLogger(__name__)
+
+# OTEL span attributes only accept primitive scalar types. The
+# observability SDK silently drops any other value at attribute-set
+# time, so we filter at this layer and emit an aegra-level warning
+# instead of letting drops happen invisibly inside the SDK.
+_PRIMITIVE_ATTR_TYPES: tuple[type, ...] = (str, int, float, bool)
 
 # Per-request context variable holding span attributes to inject.
 # None means no trace context is set; on_start() is a no-op in that case.
@@ -33,15 +45,13 @@ _trace_attrs: contextvars.ContextVar[dict[str, str | int | float | bool] | None]
 
 
 class SpanEnrichmentProcessor(SpanProcessor):
-    """Injects per-request trace attributes onto the root span of each trace.
+    """Injects per-request trace attributes onto every span in the trace.
 
     Reads from the ``aegra_otel_trace_attrs`` context variable and sets
-    each key/value pair as a span attribute on the **root span** only.
-    A span is considered a root if it has no parent OR if its parent is a
-    remote span (i.e. arrived via W3C ``traceparent`` from an upstream
-    service).  Langfuse reads trace-level properties (userId, sessionId,
-    name) exclusively from the root span, so enriching local child spans
-    is unnecessary and produces noise in per-observation metadata.
+    each key/value pair as a span attribute on **all spans** (root, child,
+    and grandchild).  The Langfuse v4 immutable observations model requires
+    each observation to carry its own userId, sessionId, and traceName — there
+    is no server-side join from trace to children.
 
     Call :func:`set_trace_context` inside the asyncio Task that runs
     graph execution to populate the context variable before any spans
@@ -49,10 +59,6 @@ class SpanEnrichmentProcessor(SpanProcessor):
     """
 
     def on_start(self, span: Span, parent_context: Context | None = None) -> None:
-        if span.parent is not None and span.parent.is_valid and not span.parent.is_remote:
-            # Skip local child spans only — spans whose parent arrived via
-            # a remote traceparent header are still local roots and must be enriched.
-            return
         attrs = _trace_attrs.get()
         if not attrs:
             return
@@ -118,24 +124,97 @@ def set_trace_context(
     _trace_attrs.set(attrs or None)
 
 
+def merge_run_metadata(
+    extra_metadata: dict[str, Any] | None,
+    system_metadata: dict[str, str | int | float | bool],
+) -> dict[str, str | int | float | bool]:
+    """Merge user-supplied metadata with system-injected runtime keys.
+
+    Any key already present in ``system_metadata`` (currently
+    ``run_id``, ``thread_id``, ``graph_id``, and ``original_request_id``
+    on the worker path) wins on collision: the system value is kept and
+    a warning is logged so the override is visible during debugging
+    without breaking the request. ``system_metadata`` is the single
+    source of truth for "what the runtime owns" — there is no separate
+    reserved-key registry to drift out of sync with caller behavior.
+
+    Non-primitive values (anything other than ``str``, ``int``, ``float``,
+    ``bool``) are dropped with a warning. OTEL span attributes accept
+    only primitives; passing a nested dict or list to ``span.set_attribute``
+    is a silent no-op at the SDK level. Filtering here surfaces the drop
+    with the offending key so callers can fix the payload upstream.
+    """
+    if not extra_metadata:
+        return dict(system_metadata)
+    merged: dict[str, str | int | float | bool] = {}
+    for key, value in extra_metadata.items():
+        if key in system_metadata:
+            logger.warning(
+                "User metadata key '%s' overridden by system value",
+                key,
+            )
+            continue
+        if not isinstance(value, _PRIMITIVE_ATTR_TYPES):
+            logger.warning(
+                "User metadata key '%s' has non-primitive type %s; dropping "
+                "(OTEL attributes accept str/int/float/bool only)",
+                key,
+                type(value).__name__,
+            )
+            continue
+        merged[key] = value
+    merged.update(system_metadata)
+    return merged
+
+
 def make_run_trace_context(
     run_id: str,
     thread_id: str,
     graph_id: str,
     user_identity: str | None,
+    *,
+    extra_metadata: dict[str, Any] | None = None,
 ) -> contextvars.Context:
-    """Return an isolated context copy with OTEL trace attributes pre-set for a run.
+    """Return an isolated context copy with trace context pre-set for a run.
 
-    Creates a copy of the current context and populates it with per-request
-    span attributes.  Pass the returned context to ``asyncio.create_task(...,
-    context=ctx)`` so the background task starts with the correct trace data.
+    Creates a copy of the current context and populates it with both the
+    per-request OTEL span attributes and the structlog context vars
+    (``run_id``, ``thread_id``, ``graph_id``, ``user_id``).  Pass the
+    returned context to ``asyncio.create_task(..., context=ctx)`` so the
+    background task starts with the correct trace data and every log line
+    it emits carries the run identifiers automatically — mirroring the
+    worker path's ``_restore_trace_context``.
+
+    User-supplied ``extra_metadata`` is merged with the system runtime keys
+    (``run_id``, ``thread_id``, ``graph_id``) for the OTEL attributes.
+    System keys win on collision — see :func:`merge_run_metadata`.
     """
+    system_metadata: dict[str, str | int | float | bool] = {
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "graph_id": graph_id,
+    }
+    metadata = merge_run_metadata(extra_metadata, system_metadata)
     ctx = contextvars.copy_context()
     ctx.run(
         set_trace_context,
         user_id=user_identity,
         session_id=thread_id,
         trace_name=graph_id,
-        metadata={"run_id": run_id, "thread_id": thread_id, "graph_id": graph_id},
+        metadata=metadata,
     )
+    # Bind structlog context vars inside the same isolated context so
+    # background-task logs include the run identifiers. Run via ``ctx.run``
+    # so the binding lands in the returned context, not the caller's.
+    # ``user_id`` is only bound when present, matching the OTEL path above
+    # (``set_trace_context`` guards on truthy ``user_id``) — anonymous runs
+    # omit the key rather than logging ``user_id=None``.
+    structlog_bindings: dict[str, str] = {
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "graph_id": graph_id,
+    }
+    if user_identity is not None:
+        structlog_bindings["user_id"] = user_identity
+    ctx.run(structlog.contextvars.bind_contextvars, **structlog_bindings)
     return ctx

@@ -1,7 +1,7 @@
 """Thread-related Pydantic models for Agent Protocol"""
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -71,7 +71,19 @@ class ThreadSearchRequest(BaseModel):
     status: str | None = Field(None, description="Thread status filter (idle, busy, interrupted, error)")
     limit: int | None = Field(20, le=100, ge=1, description="Maximum results")
     offset: int | None = Field(0, ge=0, description="Results offset")
-    order_by: str | None = Field("created_at DESC", description="Sort order")
+    order_by: str | None = Field(
+        "created_at DESC",
+        deprecated=True,
+        description="DEPRECATED: use sort_by + sort_order. Legacy single-field form, e.g. 'updated_at ASC'.",
+    )
+    sort_by: Literal["thread_id", "status", "created_at", "updated_at"] | None = Field(
+        None,
+        description="Field to sort by (SDK-compatible). Takes precedence over order_by.",
+    )
+    sort_order: Literal["asc", "desc"] | None = Field(
+        None,
+        description="Sort direction (SDK-compatible). Defaults to 'desc' when sort_by is set.",
+    )
 
     @field_validator("status")
     @classmethod
@@ -145,7 +157,10 @@ class ThreadHistoryRequest(BaseModel):
     """Request model for thread history endpoint"""
 
     limit: int | None = Field(10, ge=1, le=1000, description="Number of states to return")
-    before: str | None = Field(None, description="Return states before this checkpoint ID")
+    before: dict[str, Any] | str | None = Field(
+        None,
+        description="Return states before this checkpoint (checkpoint ID string, raw checkpoint dict, or RunnableConfig with 'configurable' key)",
+    )
     metadata: dict[str, Any] | None = Field(None, description="Filter by metadata")
     checkpoint: dict[str, Any] | None = Field(None, description="Checkpoint for subgraph filtering")
     subgraphs: bool | None = Field(False, description="Include states from subgraphs")

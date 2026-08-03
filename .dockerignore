@@ -28,4 +28,8 @@ docs/
 # Misc
 .DS_Store
 .env
+.env.production
+.env.production.template
 *.log
+*.pem
+deploy/

@@ -112,10 +112,48 @@ elif AUTH_TYPE == "custom":
             }
 
         except ExpiredSignatureError:
-            logger.warning("Token has expired")
+            # Decode without verification to extract user context for the log
+            try:
+                unverified = jwt.decode(token, options={"verify_signature": False}, algorithms=["HS256"])
+                uid = unverified.get("userId") or unverified.get("id") or "unknown"
+                exp = unverified.get("exp")
+                iat = unverified.get("iat")
+            except Exception:
+                uid, exp, iat = "unknown", None, None
+            logger.warning(
+                "Token has expired",
+                user_id=uid,
+                token_issued_at=iat,
+                token_expired_at=exp,
+                hint="User must log in again to obtain a fresh token.",
+            )
             raise Auth.exceptions.HTTPException(status_code=401, detail="Token has expired") from None
         except InvalidTokenError as e:
-            logger.warning(f"Invalid token: {e}")
+            # Decode without verification to expose which user is affected and
+            # whether this looks like a secret-mismatch (wrong environment token)
+            # vs a truly malformed token.
+            try:
+                unverified = jwt.decode(token, options={"verify_signature": False}, algorithms=["HS256"])
+                uid = unverified.get("userId") or unverified.get("id") or "unknown"
+                iat = unverified.get("iat")
+                exp = unverified.get("exp")
+            except Exception:
+                uid, iat, exp = "unknown", None, None
+            error_str = str(e)
+            is_sig_failure = "signature" in error_str.lower()
+            logger.warning(
+                "Token validation failed",
+                user_id=uid,
+                error=error_str,
+                token_issued_at=iat,
+                token_expired_at=exp,
+                likely_cause=(
+                    "JWT secret mismatch — user may have a token from a different "
+                    "environment or a pre-rotation session. Ask them to log out and back in."
+                    if is_sig_failure
+                    else "Malformed or tampered token."
+                ),
+            )
             raise Auth.exceptions.HTTPException(status_code=401, detail="Invalid authentication token") from e
         except Exception as e:
             logger.error(f"Token validation error: {e}", exc_info=True)
@@ -138,7 +176,10 @@ elif AUTH_TYPE == "custom":
             owner_filter = {"owner": user_id}
 
             # Add owner information to metadata for create/update operations
-            metadata = value.setdefault("metadata", {})
+            metadata = value.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                value["metadata"] = metadata
             metadata.update(owner_filter)
 
             # Return filter for database operations

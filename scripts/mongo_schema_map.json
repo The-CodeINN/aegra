@@ -1,0 +1,671 @@
+{
+  "database": "dedatahubDb",
+  "sample_size": 2,
+  "collections": {
+    "activitylogs": {
+      "estimated_docs": 4052,
+      "shape": {
+        "_id": "ObjectId",
+        "user": "ObjectId",
+        "action": "str",
+        "metadata": {
+          "method": "str",
+          "path": "str",
+          "body": "dict"
+        },
+        "createdAt": "datetime",
+        "__v": "int"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "user": "ObjectId",
+        "action": "str",
+        "metadata": {
+          "method": "str",
+          "path": "str",
+          "body": "dict"
+        },
+        "createdAt": "datetime",
+        "__v": "int"
+      }
+    },
+    "aimentoronboardings": {
+      "estimated_docs": 43,
+      "shape": {
+        "_id": "ObjectId",
+        "user": "ObjectId",
+        "s1": {
+          "learningStyle": "list",
+          "completed": "bool"
+        },
+        "s2": {
+          "workCountry": "list",
+          "completed": "bool"
+        },
+        "s3": {
+          "completed": "bool"
+        },
+        "s4": {
+          "completed": "bool"
+        },
+        "s5": {
+          "confidentSkills": "list",
+          "needHelpAreas": "list",
+          "completed": "bool"
+        },
+        "s6": {
+          "completed": "bool"
+        },
+        "s_track": {
+          "analytics": "dict",
+          "dataScience": "dict",
+          "dataEngineering": "dict",
+          "aiEngineering": "dict",
+          "completed": "bool"
+        },
+        "s7": {
+          "availability": "list",
+          "motivators": "list",
+          "riskTolerance": "list",
+          "completed": "bool"
+        },
+        "s8": {
+          "completed": "bool"
+        },
+        "completedSteps": [],
+        "completed": "bool",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "user": "ObjectId",
+        "s1": {
+          "learningStyle": "list",
+          "completed": "bool"
+        },
+        "s2": {
+          "workCountry": "list",
+          "completed": "bool"
+        },
+        "s3": {
+          "completed": "bool"
+        },
+        "s4": {
+          "completed": "bool"
+        },
+        "s5": {
+          "confidentSkills": "list",
+          "needHelpAreas": "list",
+          "completed": "bool"
+        },
+        "s6": {
+          "completed": "bool"
+        },
+        "s_track": {
+          "analytics": "dict",
+          "dataScience": "dict",
+          "dataEngineering": "dict",
+          "aiEngineering": "dict",
+          "completed": "bool"
+        },
+        "s7": {
+          "availability": "list",
+          "motivators": "list",
+          "riskTolerance": "list",
+          "completed": "bool"
+        },
+        "s8": {
+          "completed": "bool"
+        },
+        "completedSteps": [
+          "empty"
+        ],
+        "completed": "bool",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      }
+    },
+    "aimentors": {
+      "estimated_docs": 12,
+      "shape": {
+        "_id": "ObjectId",
+        "student": "ObjectId",
+        "enrollment": "ObjectId",
+        "active": "bool",
+        "billingCycle": "str",
+        "startedAt": "datetime",
+        "expiresAt": "datetime",
+        "totalInteractions": "int",
+        "canceled": "bool",
+        "insightsGenerated": [],
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "student": "ObjectId",
+        "enrollment": "ObjectId",
+        "active": "bool",
+        "billingCycle": "str",
+        "startedAt": "datetime",
+        "expiresAt": "datetime",
+        "totalInteractions": "int",
+        "canceled": "bool",
+        "insightsGenerated": [
+          "empty"
+        ],
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      }
+    },
+    "assessmentattempts": {
+      "estimated_docs": 68,
+      "shape": {
+        "_id": "ObjectId",
+        "student": "ObjectId",
+        "course": "ObjectId",
+        "levelTitle": "str",
+        "moduleTitle": "str",
+        "score": "int",
+        "passed": "bool",
+        "attemptType": "str",
+        "duration": "int",
+        "submittedAt": "datetime",
+        "__v": "int"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "student": "ObjectId",
+        "course": "ObjectId",
+        "levelTitle": "str",
+        "moduleTitle": "str",
+        "score": "int",
+        "passed": "bool",
+        "attemptType": "str",
+        "duration": "int",
+        "submittedAt": "datetime",
+        "__v": "int"
+      }
+    },
+    "contacts": {
+      "estimated_docs": 2,
+      "shape": {
+        "_id": "ObjectId",
+        "name": "str",
+        "email": "str",
+        "phoneNumber": "str",
+        "areaOfInterest": "str",
+        "message": "str",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "name": "str",
+        "email": "str",
+        "phoneNumber": "str",
+        "areaOfInterest": "str",
+        "message": "str",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      }
+    },
+    "courses": {
+      "estimated_docs": 2,
+      "shape": {
+        "_id": "ObjectId",
+        "title": "str",
+        "slug": "str",
+        "description": "str",
+        "overview": "str",
+        "keyHighlights": [
+          "str"
+        ],
+        "outcomeGoals": [
+          "str"
+        ],
+        "track": "str",
+        "levels": [
+          "dict"
+        ],
+        "finalAssessment": {
+          "passMark": "int",
+          "questions": "list"
+        },
+        "imageUrl": "str",
+        "createdBy": "ObjectId",
+        "isPublished": "bool",
+        "lastUpdated": "datetime",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "title": "str",
+        "slug": "str",
+        "description": "str",
+        "overview": "str",
+        "keyHighlights": [
+          "str"
+        ],
+        "outcomeGoals": [
+          "str"
+        ],
+        "track": "str",
+        "levels": [
+          "dict"
+        ],
+        "finalAssessment": {
+          "passMark": "int",
+          "questions": "list"
+        },
+        "imageUrl": "str",
+        "createdBy": "ObjectId",
+        "isPublished": "bool",
+        "lastUpdated": "datetime",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      }
+    },
+    "enrollments": {
+      "estimated_docs": 20,
+      "shape": {
+        "_id": "ObjectId",
+        "student": "ObjectId",
+        "course": "ObjectId",
+        "subscription": "ObjectId",
+        "progress": [
+          "dict"
+        ],
+        "overallProgress": "int",
+        "totalCompletedLessons": "int",
+        "totalWatchedHours": "int",
+        "finalAssessmentPassed": "bool",
+        "enrolledAt": "datetime",
+        "status": "bool",
+        "aiMentorActive": "bool",
+        "aiMentorAddedAt": [
+          "datetime",
+          "null"
+        ],
+        "aiMentorExpiresAt": [
+          "datetime",
+          "null"
+        ],
+        "renewedFrom": "null",
+        "deactivatedReason": "str",
+        "deactivatedAt": "datetime",
+        "certificates": [
+          "dict"
+        ],
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "student": "ObjectId",
+        "course": "ObjectId",
+        "subscription": "ObjectId",
+        "progress": [
+          "dict"
+        ],
+        "overallProgress": "int",
+        "totalCompletedLessons": "int",
+        "totalWatchedHours": "int",
+        "finalAssessmentPassed": "bool",
+        "enrolledAt": "datetime",
+        "status": "bool",
+        "aiMentorActive": "bool",
+        "aiMentorAddedAt": [
+          "datetime"
+        ],
+        "aiMentorExpiresAt": [
+          "datetime"
+        ],
+        "renewedFrom": "null",
+        "deactivatedReason": "str",
+        "deactivatedAt": "datetime",
+        "certificates": [
+          "dict"
+        ],
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      }
+    },
+    "feedbacks": {
+      "estimated_docs": 14,
+      "shape": {
+        "_id": "ObjectId",
+        "user": "ObjectId",
+        "type": "str",
+        "course": "ObjectId",
+        "levelIndex": [
+          "int",
+          "str"
+        ],
+        "moduleIndex": "int",
+        "lessonIndex": "int",
+        "aiSessionId": "str",
+        "rating": "int",
+        "comment": "str",
+        "createdAt": "datetime",
+        "__v": "int"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "user": "ObjectId",
+        "type": "str",
+        "course": "ObjectId",
+        "levelIndex": [
+          "int"
+        ],
+        "moduleIndex": "int",
+        "lessonIndex": "int",
+        "aiSessionId": "str",
+        "rating": "int",
+        "comment": "str",
+        "createdAt": "datetime",
+        "__v": "int"
+      }
+    },
+    "onboardings": {
+      "estimated_docs": 35,
+      "shape": {
+        "_id": "ObjectId",
+        "user": "ObjectId",
+        "phoneNumber": "str",
+        "learningTrack": "str",
+        "technicalBackground": {
+          "toolsWorkedWith": "list",
+          "aiSystemsBuilt": "list",
+          "experienceLevel": "dict",
+          "performedTasks": "list",
+          "dataTypes": "list"
+        },
+        "completedSteps": [
+          "str"
+        ],
+        "completed": "bool",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int",
+        "timeCommitment": {
+          "schedule": "str",
+          "hoursPerWeek": "int"
+        },
+        "learningPreferences": {
+          "learningStyle": "str",
+          "problemSolving": "str",
+          "explanationPreference": "str",
+          "challenges": "str"
+        }
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "user": "ObjectId",
+        "phoneNumber": "str",
+        "learningTrack": "str",
+        "technicalBackground": {
+          "toolsWorkedWith": "list",
+          "aiSystemsBuilt": "list",
+          "experienceLevel": "dict",
+          "performedTasks": "list",
+          "dataTypes": "list"
+        },
+        "completedSteps": [
+          "str"
+        ],
+        "completed": "bool",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int",
+        "timeCommitment": {
+          "schedule": "str",
+          "hoursPerWeek": "int"
+        },
+        "learningPreferences": {
+          "learningStyle": "str",
+          "problemSolving": "str",
+          "explanationPreference": "str",
+          "challenges": "str"
+        }
+      }
+    },
+    "projectsubmissions": {
+      "estimated_docs": 3,
+      "shape": {
+        "_id": "ObjectId",
+        "student": "ObjectId",
+        "course": "ObjectId",
+        "levelTitle": "str",
+        "moduleIndex": "int",
+        "fileUrl": "str",
+        "notes": "str",
+        "reviewed": "bool",
+        "submittedAt": "datetime",
+        "__v": "int",
+        "moduleTitle": "str",
+        "feedback": "str"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "student": "ObjectId",
+        "course": "ObjectId",
+        "levelTitle": "str",
+        "moduleIndex": "int",
+        "fileUrl": "str",
+        "notes": "str",
+        "reviewed": "bool",
+        "submittedAt": "datetime",
+        "__v": "int",
+        "moduleTitle": "str",
+        "feedback": "str"
+      }
+    },
+    "studyplanners": {
+      "estimated_docs": 0,
+      "shape": null,
+      "shape_signature": null
+    },
+    "subscriptionplans": {
+      "estimated_docs": 3,
+      "shape": {
+        "_id": "ObjectId",
+        "type": "str",
+        "courseId": [
+          "ObjectId",
+          "null"
+        ],
+        "track": [
+          "str",
+          "null"
+        ],
+        "title": "str",
+        "description": "str",
+        "pricing": {
+          "monthly": "int",
+          "threeMonths": "int",
+          "sixMonths": "int",
+          "oneYear": "int"
+        },
+        "aiMentorAddOnPricing": {
+          "monthly": "int",
+          "threeMonths": "int",
+          "sixMonths": "int",
+          "oneYear": "int"
+        },
+        "isActive": "bool",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "slug": "str",
+        "__v": "int"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "type": "str",
+        "courseId": [
+          "ObjectId"
+        ],
+        "track": [
+          "str"
+        ],
+        "title": "str",
+        "description": "str",
+        "pricing": {
+          "monthly": "int",
+          "threeMonths": "int",
+          "sixMonths": "int",
+          "oneYear": "int"
+        },
+        "aiMentorAddOnPricing": {
+          "monthly": "int",
+          "threeMonths": "int",
+          "sixMonths": "int",
+          "oneYear": "int"
+        },
+        "isActive": "bool",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "slug": "str",
+        "__v": "int"
+      }
+    },
+    "subscriptions": {
+      "estimated_docs": 59,
+      "shape": {
+        "_id": "ObjectId",
+        "user": "ObjectId",
+        "plan": "ObjectId",
+        "planType": "str",
+        "track": [
+          "str",
+          "null"
+        ],
+        "duration": "str",
+        "amount": "int",
+        "txRef": "str",
+        "transactionId": "str",
+        "paymentStatus": "str",
+        "startDate": "datetime",
+        "endDate": "datetime",
+        "active": "bool",
+        "aiMentorAddOn": {
+          "active": "bool",
+          "addedAt": "null",
+          "expiresAt": "null",
+          "proratedAmount": "int"
+        },
+        "renewedFrom": "null",
+        "canceled": "bool",
+        "canceledAt": "null",
+        "expiryNoticeSent": "bool",
+        "activeState": "str",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "user": "ObjectId",
+        "plan": "ObjectId",
+        "planType": "str",
+        "track": [
+          "str"
+        ],
+        "duration": "str",
+        "amount": "int",
+        "txRef": "str",
+        "transactionId": "str",
+        "paymentStatus": "str",
+        "startDate": "datetime",
+        "endDate": "datetime",
+        "active": "bool",
+        "aiMentorAddOn": {
+          "active": "bool",
+          "addedAt": "null",
+          "expiresAt": "null",
+          "proratedAmount": "int"
+        },
+        "renewedFrom": "null",
+        "canceled": "bool",
+        "canceledAt": "null",
+        "expiryNoticeSent": "bool",
+        "activeState": "str",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      }
+    },
+    "users": {
+      "estimated_docs": 66,
+      "shape": {
+        "_id": "ObjectId",
+        "name": "str",
+        "email": "str",
+        "password": "str",
+        "provider": "str",
+        "role": "str",
+        "emailVerified": "bool",
+        "isInvited": "bool",
+        "isActive": "bool",
+        "onboardingComplete": "bool",
+        "onboardingSkipped": "bool",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int",
+        "verificationCode": "null",
+        "verificationExpires": "null"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "name": "str",
+        "email": "str",
+        "password": "str",
+        "provider": "str",
+        "role": "str",
+        "emailVerified": "bool",
+        "isInvited": "bool",
+        "isActive": "bool",
+        "onboardingComplete": "bool",
+        "onboardingSkipped": "bool",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int",
+        "verificationCode": "null",
+        "verificationExpires": "null"
+      }
+    },
+    "waitlists": {
+      "estimated_docs": 114,
+      "shape": {
+        "_id": "ObjectId",
+        "fullName": "str",
+        "email": "str",
+        "primaryInterest": "str",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      },
+      "shape_signature": {
+        "_id": "ObjectId",
+        "fullName": "str",
+        "email": "str",
+        "primaryInterest": "str",
+        "createdAt": "datetime",
+        "updatedAt": "datetime",
+        "__v": "int"
+      }
+    }
+  }
+}

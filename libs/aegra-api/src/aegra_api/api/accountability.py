@@ -12,10 +12,12 @@ Note: Notification listing and mutation endpoints (mark read, dismiss, etc.)
 have been moved to the WebSocket endpoint at /ws/notifications.
 """
 
+import asyncio
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,7 +25,10 @@ from aegra_api.core.auth_deps import get_current_user
 from aegra_api.core.orm import get_session
 from aegra_api.models import User
 from aegra_api.services.accountability_service import AccountabilityService
+from aegra_api.services.advisor_cache import check_ai_mentor_addon
+from aegra_api.tools.course_content.mongo_client import get_course_content_mongo_client
 
+logger = structlog.get_logger(__name__)
 router = APIRouter(tags=["Accountability"])
 
 
@@ -50,6 +55,8 @@ class ActionItemResponse(BaseModel):
 class PreferencesRequest(BaseModel):
     notifications_enabled: bool | None = None
     email_enabled: bool | None = None
+    job_opportunity_mail_enabled: bool | None = None
+    job_opportunity_mail_frequency: str | None = None
     location: str | None = None
     push_subscription: dict | None = None
     max_daily: int | None = None
@@ -102,6 +109,40 @@ async def update_action_item(
 # ── Preferences ──────────────────────────────────────────────────────
 
 
+async def _auto_enable_job_mail_if_addon_active(
+    session: AsyncSession,
+    user: User,
+    pref_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Check Mongo for an active AI Mentor add-on and auto-enable job mail if found.
+
+    Called only when ``ai_mentor_addon_active`` has not yet been cached in the
+    preferences row, so the Mongo round-trip happens at most once per user.
+    Returns the (possibly updated) ``pref_data`` dict.
+    """
+    try:
+        sub = await asyncio.to_thread(
+            get_course_content_mongo_client().get_subscription_state,
+            user.identity,
+        )
+        addon = (sub or {}).get("aiMentorAddOn") or {}
+        if addon.get("active", False):
+            pref_data = dict(pref_data)
+            pref_data["ai_mentor_addon_active"] = True
+            pref_data["job_opportunity_mail_enabled"] = True
+            await AccountabilityService.upsert_preferences(
+                session,
+                user.identity,
+                {
+                    "ai_mentor_addon_active": True,
+                    "job_opportunity_mail_enabled": True,
+                },
+            )
+    except Exception as exc:
+        logger.warning("auto_enable_job_mail_failed", user_id=user.identity, error=str(exc))
+    return pref_data
+
+
 @router.get("/preferences")
 async def get_preferences(
     session: AsyncSession = Depends(get_session),
@@ -109,32 +150,77 @@ async def get_preferences(
 ) -> dict[str, Any]:
     prefs = await AccountabilityService.get_preferences(session, user.identity)
     if not prefs:
+        pref_data: dict[str, Any] = {
+            "job_opportunity_mail_enabled": False,
+            "job_opportunity_mail_frequency": "weekly",
+        }
+        pref_data = await _auto_enable_job_mail_if_addon_active(session, user, pref_data)
         return {
             "user_id": user.identity,
             "notifications_enabled": True,
             "location": None,
-            "preferences": {},
+            "preferences": pref_data,
         }
+    pref_data = dict(prefs.preferences) if prefs.preferences else {}
+    pref_data.setdefault("job_opportunity_mail_frequency", "weekly")
+    if not pref_data.get("ai_mentor_addon_active"):
+        pref_data = await _auto_enable_job_mail_if_addon_active(session, user, pref_data)
+    pref_data.setdefault("job_opportunity_mail_enabled", False)
     return {
         "user_id": prefs.user_id,
         "notifications_enabled": prefs.notifications_enabled,
         "location": prefs.location,
-        "preferences": prefs.preferences or {},
+        "preferences": pref_data,
     }
 
 
 @router.put("/preferences")
 async def update_preferences(
     body: PreferencesRequest,
+    request: Request,
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    prefs = await AccountabilityService.upsert_preferences(session, user.identity, body.model_dump(exclude_none=True))
+    data = body.model_dump(exclude_none=True)
+
+    # Gate: enabling job opportunity mail requires an active AI Mentor add-on.
+    # Admin/facilitator roles bypass the subscription check because the LMS
+    # subscription endpoint is not accessible to those roles.
+    if data.get("job_opportunity_mail_enabled") is True:
+        user_role = getattr(user, "role", None)
+        if user_role and user_role != "student":
+            # Non-student roles (admin, admin_facilitator, facilitator, etc.)
+            # are trusted and do not need an add-on subscription.
+            data["ai_mentor_addon_active"] = True
+        else:
+            auth_header = request.headers.get("Authorization", "")
+            token = auth_header.removeprefix("Bearer ").strip()
+            addon = await check_ai_mentor_addon(token)
+            if not addon["active"]:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Jobs & Opportunity email requires an active AI Mentor add-on subscription.",
+                )
+            # Cache the add-on state so the scheduler can verify without a token
+            data["ai_mentor_addon_active"] = True
+            if addon.get("expires_at"):
+                data["ai_mentor_addon_expires_at"] = addon["expires_at"]
+
+    # Always persist the caller's email/name so the scheduler can use them
+    # without calling the LMS.
+    if user.email:
+        data["user_email"] = user.email
+    if user.display_name:
+        data["user_name"] = user.display_name
+    prefs = await AccountabilityService.upsert_preferences(session, user.identity, data)
+    pref_data = prefs.preferences or {}
+    pref_data.setdefault("job_opportunity_mail_enabled", False)
+    pref_data.setdefault("job_opportunity_mail_frequency", "weekly")
     return {
         "user_id": prefs.user_id,
         "notifications_enabled": prefs.notifications_enabled,
         "location": prefs.location,
-        "preferences": prefs.preferences or {},
+        "preferences": pref_data,
     }
 
 
@@ -192,11 +278,21 @@ async def report_progress(
     This triggers celebration/struggle notifications as appropriate.
     """
     from aegra_api.services.notification_engine import notification_engine
+    from aegra_api.services.scheduler import SchedulerService
 
     # Record as course activity
     await AccountabilityService.record_activity(session, user.identity, "course")
 
     result: dict[str, Any] = {"status": "recorded", "event_type": body.event_type}
+
+    # Resolve the student's actual advisor so these emails sign off with the
+    # right persona instead of silently falling through to
+    # create_notification's own DEFAULT_PERSONA ("Alexandra") for everyone.
+    # Only the three event types below send a notification, so skip the
+    # lookup entirely otherwise.
+    advisor_name = None
+    if body.event_type in ("course_completed", "milestone", "quiz_failed"):
+        advisor_name = await SchedulerService._resolve_advisor_first_name(user.identity)
 
     # Generate celebration notifications based on event type
     if body.event_type == "course_completed":
@@ -216,6 +312,7 @@ async def report_progress(
             ],
             metadata={"event_type": body.event_type, "course_name": body.course_name},
             check_frequency=False,
+            persona=advisor_name,
             student_context={"first_name": user.display_name, "email": getattr(user, "email", None)},
         )
         result["notification"] = "celebration_sent"
@@ -231,6 +328,7 @@ async def report_progress(
             priority="normal",
             metadata={"event_type": body.event_type, "progress": pct},
             check_frequency=True,
+            persona=advisor_name,
             student_context={"first_name": user.display_name, "email": getattr(user, "email", None)},
         )
         result["notification"] = "milestone_sent"
@@ -252,6 +350,7 @@ async def report_progress(
             ],
             metadata={"event_type": body.event_type, "score": body.score},
             check_frequency=True,
+            persona=advisor_name,
             student_context={"first_name": user.display_name, "email": getattr(user, "email", None)},
         )
         result["notification"] = "encouragement_sent"

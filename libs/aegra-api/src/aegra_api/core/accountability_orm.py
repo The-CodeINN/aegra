@@ -22,7 +22,7 @@ from .orm import Base
 class ActionItem(Base):
     __tablename__ = "action_items"
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("public.uuid_generate_v4()::text"))
+    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("gen_random_uuid()::text"))
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     thread_id: Mapped[str | None] = mapped_column(Text, nullable=True)  # Optional link to thread
     description: Mapped[str] = mapped_column(Text, nullable=False)
@@ -39,6 +39,15 @@ class ActionItem(Base):
     dependencies: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # IDs of prerequisite action items
     reminder_sent_count: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
     last_reminder_sent: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    # Deadline tier ("7d"/"3d"/"24h"/"2h"/"overdue"/...) last notified for —
+    # gates check_deadlines so the same tier isn't resent every ~4h for as
+    # long as the task sits in it (was previously re-sent on any elapsed-time
+    # gate passing, regardless of whether the tier had actually changed).
+    last_reminder_tier: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Task-tracking fields (agent optimisation spec Item 2 / TaskMemory).
+    evidence: Mapped[str | None] = mapped_column(Text, nullable=True)  # proof of completion: URL, submission id, claim
+    advisor_note: Mapped[str | None] = mapped_column(Text, nullable=True)  # private note on how to handle follow-ups
+    miss_count: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)  # consecutive misses
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 
@@ -52,7 +61,7 @@ class ActionItem(Base):
 class Notification(Base):
     __tablename__ = "notifications"
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("public.uuid_generate_v4()::text"))
+    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("gen_random_uuid()::text"))
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
@@ -104,7 +113,7 @@ class DiscoveredOpportunity(Base):
 
     __tablename__ = "discovered_opportunities"
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("public.uuid_generate_v4()::text"))
+    id: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("gen_random_uuid()::text"))
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     opportunity_type: Mapped[str] = mapped_column(Text, nullable=False)  # 'event' or 'job'
     title: Mapped[str] = mapped_column(Text, nullable=False)

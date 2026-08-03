@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import warnings
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -12,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from aegra_api.api.runs import active_runs
+from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
 from aegra_api.core.auth_handlers import build_auth_context, handle_event
 from aegra_api.core.orm import Run as RunORM
@@ -35,11 +36,48 @@ from aegra_api.models import (
 from aegra_api.models.errors import CONFLICT, NOT_FOUND
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.services.thread_state_service import ThreadStateService
+from aegra_api.utils.run_utils import strip_pinned_config_keys
 
 router = APIRouter(tags=["Threads"], dependencies=auth_dependency)
 logger = structlog.getLogger(__name__)
 
 thread_state_service = ThreadStateService()
+
+
+# --- Sort resolution for /threads/search ---
+
+_ALLOWED_SORT_FIELDS: frozenset[str] = frozenset({"created_at", "updated_at", "thread_id", "status"})
+_DEFAULT_SORT_FIELD = "created_at"
+_DEFAULT_SORT_ASC = False
+
+
+def _resolve_sort(request: ThreadSearchRequest) -> tuple[Any, bool]:
+    """Resolve (ORM column, is_ascending) for /threads/search.
+
+    Precedence: SDK-style ``sort_by`` (Pydantic-validated against the column
+    Literal) wins over the legacy ``order_by`` string. ``order_by`` stays
+    permissive — unknown columns or malformed input silently fall back to the
+    default (``created_at DESC``) — to preserve backward compatibility.
+    """
+    if request.sort_by:
+        column = getattr(ThreadORM, request.sort_by)
+        asc = (request.sort_order or "desc").lower() == "asc"
+        return column, asc
+
+    # order_by is marked deprecated on the Pydantic Field for OpenAPI; the
+    # access-site warning is meant for callers, not for the handler honouring
+    # the field — suppress it here.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        legacy = request.order_by
+
+    if legacy:
+        parts = legacy.strip().split()
+        if parts and parts[0].lower() in _ALLOWED_SORT_FIELDS:
+            asc = len(parts) > 1 and parts[1].lower() == "asc"
+            return getattr(ThreadORM, parts[0].lower()), asc
+
+    return getattr(ThreadORM, _DEFAULT_SORT_FIELD), _DEFAULT_SORT_ASC
 
 
 # --- Helper for safe ORM -> Pydantic conversion (Test/Mock compatible) ---
@@ -157,14 +195,12 @@ async def create_thread(
                 raise HTTPException(409, f"Thread '{thread_id}' already exists")
 
     metadata = request.metadata or {}
-    metadata.update(
-        {
-            "owner": user.identity,
-            "assistant_id": None,
-            "graph_id": None,
-            "thread_name": metadata.get("thread_name", ""),
-        }
-    )
+    # Always enforce owner from authenticated user
+    metadata["owner"] = user.identity
+    # Preserve client-provided values; only set defaults if missing.
+    metadata.setdefault("assistant_id", None)
+    metadata.setdefault("graph_id", None)
+    metadata.setdefault("thread_name", "")
 
     thread_orm = ThreadORM(
         thread_id=thread_id,
@@ -332,7 +368,7 @@ async def get_thread_state(
         )
 
         langgraph_service = get_langgraph_service()
-        config: dict[str, Any] = create_thread_config(thread_id, user, {})
+        config: dict[str, Any] = create_thread_config(thread_id, user)
         if checkpoint_ns:
             config["configurable"]["checkpoint_ns"] = checkpoint_ns
 
@@ -393,11 +429,18 @@ async def update_thread_state(
 
     When `values` is provided, creates a new checkpoint with the updated state.
     Use `as_node` to attribute the update to a specific graph node. When
-    `values` is null, this endpoint acts as a POST-based alternative to the
-    GET state endpoint (useful when passing complex checkpoint/subgraph
-    parameters in the request body).
+    `values` is null AND `as_node` is not provided, this endpoint acts as a
+    POST-based alternative to the GET state endpoint (useful when passing
+    complex checkpoint/subgraph parameters in the request body).
+
+    When `values` is null AND `as_node` is provided (e.g. ``as_node="__copy__"``
+    as LangGraph Studio sends for "Re-run from here"), this creates a new
+    checkpoint derived from the supplied ``checkpoint_id`` without applying
+    any state change — used to anchor a subsequent run as a fork of that
+    checkpoint rather than of the thread's latest state.
     """
-    if request.values is None:
+    # GET-shim only fires when body has no mutation or checkpoint targeting.
+    if request.values is None and request.as_node is None and request.checkpoint_id is None and not request.checkpoint:
         return await get_thread_state(
             thread_id=thread_id,
             subgraphs=request.subgraphs or False,
@@ -426,12 +469,12 @@ async def update_thread_state(
         )
 
         langgraph_service = get_langgraph_service()
-        config: dict[str, Any] = create_thread_config(thread_id, user, {})
+        config: dict[str, Any] = create_thread_config(thread_id, user)
 
         if request.checkpoint_id:
             config["configurable"]["checkpoint_id"] = request.checkpoint_id
         if request.checkpoint:
-            config["configurable"].update(request.checkpoint)
+            config["configurable"].update(strip_pinned_config_keys(request.checkpoint))
         if request.checkpoint_ns:
             config["configurable"]["checkpoint_ns"] = request.checkpoint_ns
 
@@ -551,7 +594,7 @@ async def get_thread_state_at_checkpoint(
 
         langgraph_service = get_langgraph_service()
 
-        config: dict[str, Any] = create_thread_config(thread_id, user, {})
+        config: dict[str, Any] = create_thread_config(thread_id, user)
         config["configurable"]["checkpoint_id"] = checkpoint_id
         if checkpoint_ns:
             config["configurable"]["checkpoint_ns"] = checkpoint_ns
@@ -672,19 +715,30 @@ async def get_thread_history_post(
 
         langgraph_service = get_langgraph_service()
 
-        config: dict[str, Any] = create_thread_config(thread_id, user, {})
+        config: dict[str, Any] = create_thread_config(thread_id, user)
         if checkpoint:
-            cfg_cp = checkpoint.copy()
+            cfg_cp = strip_pinned_config_keys(checkpoint)
             if checkpoint_ns is not None:
                 cfg_cp.setdefault("checkpoint_ns", checkpoint_ns)
             config["configurable"].update(cfg_cp)
         elif checkpoint_ns is not None:
             config["configurable"]["checkpoint_ns"] = checkpoint_ns
 
+        # Convert `before` to a RunnableConfig for aget_state_history.
+        # The SDK sends `before` as either a checkpoint ID string, a raw
+        # checkpoint dict, or a full RunnableConfig with a "configurable" key.
+        # No thread_id scrub here: aget_state_history reads only checkpoint_id
+        # from `before` (the thread comes from the main config, pinned above).
+        before_config: dict[str, Any] | None = None
+        if isinstance(before, str):
+            before_config = {"configurable": {"checkpoint_id": before}}
+        elif isinstance(before, dict):
+            before_config = before if "configurable" in before else {"configurable": before}
+
         state_snapshots = []
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "limit": limit,
-            "before": before,
+            "before": before_config,
         }
         if metadata is not None:
             kwargs["metadata"] = metadata
@@ -831,12 +885,17 @@ async def search_threads(
         stmt = stmt.where(ThreadORM.status == request.status)
 
     if request.metadata:
-        for key, value in request.metadata.items():
-            stmt = stmt.where(ThreadORM.metadata_json[key].as_string() == str(value))
+        # JSONB containment: type-correct, deep-nested, GIN-indexable. Mirrors
+        # AssistantService.search_assistants for cross-endpoint consistency.
+        stmt = stmt.where(ThreadORM.metadata_json.op("@>")(request.metadata))
 
     offset = request.offset or 0
     limit = request.limit or 20
-    stmt = stmt.order_by(ThreadORM.created_at.desc()).offset(offset).limit(limit)
+    column, asc = _resolve_sort(request)
+    direction = column.asc() if asc else column.desc()
+    # Secondary sort on thread_id keeps offset pagination stable when the
+    # primary sort key has duplicates (status buckets, microsecond ties).
+    stmt = stmt.order_by(direction, ThreadORM.thread_id.asc()).offset(offset).limit(limit)
 
     result = await session.scalars(stmt)
     rows = result.all()
