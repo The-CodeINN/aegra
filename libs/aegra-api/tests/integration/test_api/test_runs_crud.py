@@ -1,9 +1,12 @@
 """Integration tests for runs CRUD operations"""
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from fastapi.testclient import TestClient
+
 from tests.fixtures.clients import create_test_app, make_client
-from tests.fixtures.database import DummySessionBase
+from tests.fixtures.database import DummyScalarResult, DummySessionBase
 from tests.fixtures.session_fixtures import BasicSession, override_session_dependency
 from tests.fixtures.test_helpers import DummyRun, DummyThread
 
@@ -329,12 +332,112 @@ class TestCancelRun:
         override_session_dependency(app, Session)
         client = make_client(app)
 
-        with patch("aegra_api.api.runs.streaming_service") as mock_streaming:
+        with (
+            patch("aegra_api.api.runs.streaming_service") as mock_streaming,
+            patch(
+                "aegra_api.api.runs.interrupt_unowned_run",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
             mock_streaming.cancel_run = AsyncMock()
+            mock_streaming.signal_run_cancelled = AsyncMock()
 
             resp = client.post("/threads/test-thread-123/runs/test-run-123/cancel")
 
             assert resp.status_code == 200
+            mock_streaming.cancel_run.assert_awaited_once_with("test-run-123", emit_end_event=False)
+            mock_streaming.signal_run_cancelled.assert_awaited_once_with("test-run-123")
+
+
+class TestCancelRuns:
+    """Test POST /runs/cancel (bulk cancel used by the SDK's cancel_many)."""
+
+    @staticmethod
+    def _app_with_runs(runs: list[Any], thread_exists: bool = True) -> TestClient:
+        app = create_test_app(include_runs=True, include_threads=False)
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: Any) -> str | None:
+                return "test-thread-123" if thread_exists else None
+
+            async def scalars(self, _stmt: Any = None) -> DummyScalarResult:
+                return DummyScalarResult(runs)
+
+            async def commit(self) -> None:
+                pass
+
+        override_session_dependency(app, Session)
+        return make_client(app)
+
+    def test_cancel_runs_by_status_cancels_each_active_run(self) -> None:
+        runs = [_run_row(run_id="run-a", status="running"), _run_row(run_id="run-b", status="pending")]
+        client = self._app_with_runs(runs)
+
+        with (
+            patch("aegra_api.api.runs.streaming_service") as mock_streaming,
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=True),
+        ):
+            mock_streaming.interrupt_run = AsyncMock()
+            mock_streaming.signal_run_cancelled = AsyncMock()
+
+            resp = client.post("/runs/cancel", json={"status": "all"}, params={"action": "interrupt"})
+
+            assert resp.status_code == 204
+            assert mock_streaming.interrupt_run.await_count == 2
+            assert mock_streaming.signal_run_cancelled.await_count == 2
+
+    def test_cancel_runs_by_ids_skips_finished_runs(self) -> None:
+        runs = [_run_row(run_id="run-a", status="running"), _run_row(run_id="run-b", status="success")]
+        client = self._app_with_runs(runs)
+
+        with (
+            patch("aegra_api.api.runs.streaming_service") as mock_streaming,
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=True),
+        ):
+            mock_streaming.cancel_run = AsyncMock()
+            mock_streaming.signal_run_cancelled = AsyncMock()
+
+            resp = client.post(
+                "/runs/cancel",
+                json={"thread_id": "test-thread-123", "run_ids": ["run-a", "run-b"]},
+                params={"action": "cancel"},
+            )
+
+            assert resp.status_code == 204
+            mock_streaming.cancel_run.assert_awaited_once_with("run-a", emit_end_event=False)
+
+    def test_cancel_runs_by_ids_unknown_thread_is_404(self) -> None:
+        client = self._app_with_runs([], thread_exists=False)
+
+        resp = client.post("/runs/cancel", json={"thread_id": "missing", "run_ids": ["run-a"]})
+
+        assert resp.status_code == 404
+
+    def test_cancel_runs_without_selector_is_422(self) -> None:
+        client = self._app_with_runs([])
+
+        resp = client.post("/runs/cancel", json={})
+
+        assert resp.status_code == 422
+
+    def test_cancel_runs_unsupported_action_is_422(self) -> None:
+        client = self._app_with_runs([])
+
+        resp = client.post("/runs/cancel", json={"status": "all"}, params={"action": "rollback"})
+
+        assert resp.status_code == 422
+
+    def test_cancel_runs_no_matches_is_204(self) -> None:
+        client = self._app_with_runs([])
+
+        with patch("aegra_api.api.runs.streaming_service") as mock_streaming:
+            mock_streaming.interrupt_run = AsyncMock()
+
+            resp = client.post("/runs/cancel", json={"status": "pending"})
+
+            assert resp.status_code == 204
+            mock_streaming.interrupt_run.assert_not_awaited()
 
 
 class TestDeleteRun:
@@ -453,10 +556,12 @@ class TestStreamRun:
             async def scalar(self, _stmt):
                 return None
 
-        override_session_dependency(app, BasicSession)
         client = make_client(app)
 
-        resp = client.get("/threads/test-thread-123/runs/nonexistent/stream")
+        # stream_run manages its session via _get_session_maker (not Depends),
+        # so the DI override doesn't apply — patch the maker instead.
+        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(Session())):
+            resp = client.get("/threads/test-thread-123/runs/nonexistent/stream")
 
         assert resp.status_code == 404
 
@@ -683,7 +788,16 @@ class TestWaitForRun:
         override_session_dependency(app, Session)
         client = make_client(app)
 
-        with patch("aegra_api.api.runs._get_session_maker", return_value=_make_session_maker(Session())):
+        # Resume validation polls fresh sessions via run_preparation._get_session_maker
+        # when the first read is not interrupted; keep those returning idle too, and
+        # collapse the settle backoff so the reject path does not wait.
+        maker = _make_session_maker(Session())
+        with (
+            patch("aegra_api.api.runs._get_session_maker", return_value=maker),
+            patch("aegra_api.services.run_preparation._get_session_maker", return_value=maker),
+            patch("aegra_api.services.run_preparation._RESUME_SETTLE_ATTEMPTS", 1),
+            patch("aegra_api.services.run_preparation._RESUME_SETTLE_INTERVAL_SECONDS", 0),
+        ):
             resp = client.post(
                 "/threads/test-thread-123/runs/wait",
                 json={
@@ -758,12 +872,45 @@ class TestCreateRunValidation:
         )
         assert resp.status_code == 404
 
+    def test_create_run_with_only_checkpoint_id_passes_validation(self) -> None:
+        app = create_test_app(include_runs=True, include_threads=False)
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: Any) -> None:
+                return None
+
+        override_session_dependency(app, Session)
+        client = make_client(app)
+
+        resp = client.post(
+            "/threads/test-thread-123/runs",
+            json={"assistant_id": "nonexistent", "checkpoint_id": "1ef4f797-8335-6428-8001-8a1503f9b875"},
+        )
+        # Past validation: the 404 comes from the assistant lookup.
+        assert resp.status_code == 404
+
+    def test_create_run_rejects_malformed_checkpoint_id(self) -> None:
+        app = create_test_app(include_runs=True, include_threads=False)
+        override_session_dependency(app, BasicSession)
+        client = make_client(app)
+
+        resp = client.post(
+            "/threads/test-thread-123/runs",
+            json={"assistant_id": "asst-123", "input": {"x": 1}, "checkpoint_id": "not-a-uuid"},
+        )
+        assert resp.status_code == 422
+
 
 class TestWaitForRunTimeouts:
-    """Test wait_for_run timeout behavior."""
+    """Test wait_for_run timeout behavior.
+
+    wait_for_run returns a StreamingResponse wrapping heartbeat_wait_body.
+    On timeout the run never reached a terminal state, so the generator yields
+    an ``__error__`` envelope rather than whatever partial output is on the row.
+    """
 
     def test_wait_for_run_timeout(self):
-        """Test that wait_for_run returns current state on timeout."""
+        """Test that wait_for_run reports the timeout instead of partial state."""
         app = create_test_app(include_runs=True, include_threads=False)
 
         # Mock assistant and run
@@ -771,9 +918,13 @@ class TestWaitForRunTimeouts:
         run = _run_row(status="running")
         run.output = {"partial": "data"}
 
+        thread = _thread_row()
+
         class Session(DummySessionBase):
             async def scalar(self, stmt):
                 stmt_str = str(stmt).lower()
+                if "from thread" in stmt_str:
+                    return thread
                 if "from assistant" in stmt_str:
                     return assistant
                 if "from run" in stmt_str:
@@ -797,16 +948,19 @@ class TestWaitForRunTimeouts:
 
         mock_maker = _make_session_maker(Session())
 
+        # Mock executor so wait_for_completion raises TimeoutError immediately
+        mock_executor = MagicMock()
+        mock_executor.wait_for_completion = AsyncMock(side_effect=TimeoutError)
+        mock_executor.submit = AsyncMock(return_value=None)
+
         override_session_dependency(app, Session)
         client = make_client(app)
 
-        # Mock asyncio.wait_for to raise TimeoutError
         with (
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
-            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
-            patch("asyncio.wait_for", side_effect=TimeoutError),
-            patch("aegra_api.api.runs.get_langgraph_service") as mock_service,
-            patch("aegra_api.api.runs.execute_run_async"),
+            patch("aegra_api.services.run_waiters._get_session_maker", return_value=mock_maker),
+            patch("aegra_api.services.run_waiters.executor", mock_executor),
+            patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_service,
         ):
             mock_service.return_value.list_graphs.return_value = ["test-graph"]
 
@@ -819,5 +973,5 @@ class TestWaitForRunTimeouts:
             )
 
             assert resp.status_code == 200
-            # Should return output even if timed out (running state)
-            assert resp.json() == {"partial": "data"}
+            # StreamingResponse: body is heartbeat newlines + final JSON
+            assert resp.json()["__error__"]["error"] == "TimeoutError"

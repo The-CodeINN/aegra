@@ -2,8 +2,37 @@ import copy
 from typing import Any
 
 import structlog
+from langgraph.types import Command, Send
 
 logger = structlog.getLogger(__name__)
+
+# A body-supplied thread_id overrides the route-verified one (the checkpointer
+# keys on thread_id alone), so the server pins these instead of trusting them.
+SERVER_PINNED_CONFIG_KEYS: frozenset[str] = frozenset({"thread_id", "run_id"})
+
+
+def strip_pinned_config_keys(client_config: dict[str, Any]) -> dict[str, Any]:
+    """Drop server-authoritative identity keys from a client-supplied config dict."""
+    return {k: v for k, v in client_config.items() if k not in SERVER_PINNED_CONFIG_KEYS}
+
+
+def map_command_to_langgraph(cmd: dict[str, Any]) -> Command:
+    """Convert an API command dict to a LangGraph Command object."""
+    goto = cmd.get("goto")
+    if goto is not None and not isinstance(goto, list):
+        goto = [goto]
+
+    cmd_update = cmd.get("update")
+    if isinstance(cmd_update, (tuple, list)) and all(
+        isinstance(t, (tuple, list)) and len(t) == 2 and isinstance(t[0], str) for t in cmd_update
+    ):
+        cmd_update = [tuple(t) for t in cmd_update]
+
+    return Command(
+        update=cmd_update,
+        goto=([it if isinstance(it, str) else Send(it["node"], it.get("input")) for it in goto] if goto else None),
+        resume=cmd.get("resume"),
+    )
 
 
 def _should_skip_event(raw_event: Any) -> bool:

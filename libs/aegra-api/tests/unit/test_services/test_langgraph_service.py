@@ -7,14 +7,14 @@ from unittest.mock import Mock, mock_open, patch
 
 import pytest
 
+# Import the settings singleton directly to patch it
+from aegra_api import config as config_module
 from aegra_api.services.langgraph_service import (
     LangGraphService,
     create_run_config,
     create_thread_config,
     inject_user_context,
 )
-
-# Import the settings singleton directly to patch it
 from aegra_api.settings import settings
 
 
@@ -57,13 +57,14 @@ class TestLangGraphServiceConfig:
         config_data = {"graphs": {"test": "./graphs/test.py:graph"}}
         env_path = "/env/path/config.json"
 
-        # Patch the settings object directly. This ensures the service sees the change
-        # without needing to reload modules.
+        # A sibling test reloads aegra_api.settings, so patch the settings
+        # object aegra_api.config actually holds (#512).
         with (
-            patch.object(settings.app, "AEGRA_CONFIG", env_path),
+            patch.object(config_module.settings.app, "AEGRA_CONFIG", env_path),
             patch("pathlib.Path.exists", return_value=True),
             patch("pathlib.Path.open", mock_open(read_data=json.dumps(config_data))),
             patch("aegra_api.services.langgraph_service.LangGraphService._ensure_default_assistants"),
+            patch("aegra_api.services.langgraph_service.LangGraphService._load_all_graph_modules"),
         ):
             service = LangGraphService()
             await service.initialize()
@@ -81,6 +82,7 @@ class TestLangGraphServiceConfig:
             patch("pathlib.Path.exists", return_value=True),
             patch("pathlib.Path.open", mock_open(read_data=json.dumps(config_data))),
             patch("aegra_api.services.langgraph_service.LangGraphService._ensure_default_assistants"),
+            patch("aegra_api.services.langgraph_service.LangGraphService._load_all_graph_modules"),
         ):
             service = LangGraphService("explicit.json")
             await service.initialize()
@@ -99,6 +101,7 @@ class TestLangGraphServiceConfig:
             patch("pathlib.Path.exists", return_value=True),
             patch("pathlib.Path.open", mock_open(read_data=json.dumps(config_data))),
             patch("aegra_api.services.langgraph_service.LangGraphService._ensure_default_assistants"),
+            patch("aegra_api.services.langgraph_service.LangGraphService._load_all_graph_modules"),
         ):
             service = LangGraphService()
             await service.initialize()
@@ -117,6 +120,7 @@ class TestLangGraphServiceConfig:
             patch("pathlib.Path.exists", return_value=True),
             patch("pathlib.Path.open", mock_open(read_data=json.dumps(config_data))),
             patch("aegra_api.services.langgraph_service.LangGraphService._ensure_default_assistants"),
+            patch("aegra_api.services.langgraph_service.LangGraphService._load_all_graph_modules"),
         ):
             service = LangGraphService()
             await service.initialize()
@@ -436,7 +440,7 @@ class TestLangGraphServiceGraphs:
     async def test_load_graph_from_file_with_dataclass(self, tmp_path: Path) -> None:
         """Test that a graph module containing a dataclass loads without errors.
 
-        Regression test for: https://github.com/ibbybuilds/aegra/issues/197
+        Regression test for: https://github.com/aegra/aegra/issues/197
         Dataclasses require the module to be in sys.modules during class creation.
         """
         graph_file = tmp_path / "dc_graph.py"
@@ -532,7 +536,6 @@ class TestLangGraphServiceContext:
         mock_user = Mock()
         mock_user.identity = "user-123"
         mock_user.display_name = "Test User"
-        mock_user.to_dict.return_value = {"identity": "user-123", "name": "Test User"}
 
         base_config = {"existing": "value"}
 
@@ -541,10 +544,7 @@ class TestLangGraphServiceContext:
         assert result["existing"] == "value"
         assert result["configurable"]["user_id"] == "user-123"
         assert result["configurable"]["user_display_name"] == "Test User"
-        assert result["configurable"]["langgraph_auth_user"] == {
-            "identity": "user-123",
-            "name": "Test User",
-        }
+        assert result["configurable"]["langgraph_auth_user"] is mock_user
 
     def test_inject_user_context_without_user(self):
         """Test injecting context without user object"""
@@ -561,32 +561,29 @@ class TestLangGraphServiceContext:
         mock_user = Mock()
         mock_user.identity = "user-123"
         mock_user.display_name = "Test User"
-        mock_user.to_dict.return_value = {"identity": "user-123"}
 
         result = inject_user_context(mock_user, None)
 
         assert result["configurable"]["user_id"] == "user-123"
         assert result["configurable"]["user_display_name"] == "Test User"
 
-    def test_inject_user_context_user_to_dict_failure(self):
-        """Test fallback when user.to_dict() fails"""
+    def test_inject_user_context_user_object_passed_directly(self):
+        """Test that the user object is passed directly (not serialized)."""
         mock_user = Mock()
         mock_user.identity = "user-123"
         mock_user.display_name = "Test User"
-        mock_user.to_dict.side_effect = Exception("to_dict failed")
 
         result = inject_user_context(mock_user, {})
 
         assert result["configurable"]["user_id"] == "user-123"
         assert result["configurable"]["user_display_name"] == "Test User"
-        assert result["configurable"]["langgraph_auth_user"] == {"identity": "user-123"}
+        assert result["configurable"]["langgraph_auth_user"] is mock_user
 
     def test_inject_user_context_existing_configurable(self):
         """Test preserving existing configurable values"""
         mock_user = Mock()
         mock_user.identity = "user-123"
         mock_user.display_name = "Test User"
-        mock_user.to_dict.return_value = {"identity": "user-123"}
 
         base_config = {"configurable": {"existing_key": "existing_value"}}
 
@@ -604,12 +601,11 @@ class TestLangGraphServiceConfigs:
         mock_user = Mock()
         mock_user.identity = "user-123"
         mock_user.display_name = "Test User"
-        mock_user.to_dict.return_value = {"identity": "user-123"}
 
         thread_id = "thread-456"
         additional_config = {"custom": "value"}
 
-        result = create_thread_config(thread_id, mock_user, additional_config)
+        result = create_thread_config(thread_id, mock_user, additional_config=additional_config)
 
         assert result["configurable"]["thread_id"] == thread_id
         assert result["configurable"]["user_id"] == "user-123"
@@ -620,7 +616,6 @@ class TestLangGraphServiceConfigs:
         mock_user = Mock()
         mock_user.identity = "user-123"
         mock_user.display_name = "Test User"
-        mock_user.to_dict.return_value = {"identity": "user-123"}
 
         thread_id = "thread-456"
 
@@ -634,7 +629,6 @@ class TestLangGraphServiceConfigs:
         mock_user = Mock()
         mock_user.identity = "user-123"
         mock_user.display_name = "Test User"
-        mock_user.to_dict.return_value = {"identity": "user-123"}
 
         run_id = "run-789"
         thread_id = "thread-456"
@@ -644,7 +638,7 @@ class TestLangGraphServiceConfigs:
             "aegra_api.services.langgraph_service.get_tracing_callbacks",
             return_value=[],
         ):
-            result = create_run_config(run_id, thread_id, mock_user, additional_config)
+            result = create_run_config(run_id, thread_id, mock_user, additional_config=additional_config)
 
         assert result["configurable"]["run_id"] == run_id
         assert result["configurable"]["thread_id"] == thread_id
@@ -656,7 +650,6 @@ class TestLangGraphServiceConfigs:
         mock_user = Mock()
         mock_user.identity = "user-123"
         mock_user.display_name = "Test User"
-        mock_user.to_dict.return_value = {"identity": "user-123"}
 
         run_id = "run-789"
         thread_id = "thread-456"
@@ -670,12 +663,54 @@ class TestLangGraphServiceConfigs:
 
         assert result["configurable"]["checkpoint_key"] == "checkpoint_value"
 
+    def test_create_run_config_ignores_client_thread_id_override(self):
+        """A client-supplied configurable.thread_id must not redirect execution.
+
+        The checkpointer keys solely on thread_id, so honoring a body override
+        would let a user read/write another user's thread despite the route
+        ownership check.
+        """
+        mock_user = Mock()
+        mock_user.identity = "user-123"
+        mock_user.display_name = "Test User"
+
+        attacker_override = {"configurable": {"thread_id": "victim-thread", "run_id": "victim-run"}}
+
+        with patch(
+            "aegra_api.services.langgraph_service.get_tracing_callbacks",
+            return_value=[],
+        ):
+            result = create_run_config("run-789", "thread-456", mock_user, additional_config=attacker_override)
+
+        assert result["configurable"]["thread_id"] == "thread-456"
+        assert result["configurable"]["run_id"] == "run-789"
+
+    def test_create_run_config_checkpoint_cannot_override_thread_id(self):
+        """The checkpoint param is merged last; it must not redefine thread_id.
+
+        RunCreate.checkpoint is a free-form client dict — a thread_id inside it
+        would otherwise win over the server-pinned value at the final merge.
+        """
+        mock_user = Mock()
+        mock_user.identity = "user-123"
+        mock_user.display_name = "Test User"
+
+        malicious_checkpoint = {"thread_id": "victim-thread", "checkpoint_id": "cp-9"}
+
+        with patch(
+            "aegra_api.services.langgraph_service.get_tracing_callbacks",
+            return_value=[],
+        ):
+            result = create_run_config("run-789", "thread-456", mock_user, checkpoint=malicious_checkpoint)
+
+        assert result["configurable"]["thread_id"] == "thread-456"
+        assert result["configurable"]["checkpoint_id"] == "cp-9"
+
     def test_create_run_config_with_tracing_callbacks(self):
         """Test creating run config with tracing callbacks"""
         mock_user = Mock()
         mock_user.identity = "user-123"
         mock_user.display_name = "Test User"
-        mock_user.to_dict.return_value = {"identity": "user-123"}
 
         run_id = "run-789"
         thread_id = "thread-456"
@@ -716,7 +751,6 @@ class TestLangGraphServiceConfigs:
         mock_user = Mock()
         mock_user.identity = "user-123"
         mock_user.display_name = "Test User"
-        mock_user.to_dict.return_value = {"identity": "user-123"}
 
         run_id = "run-789"
         thread_id = "thread-456"
@@ -729,7 +763,7 @@ class TestLangGraphServiceConfigs:
             "aegra_api.services.langgraph_service.get_tracing_callbacks",
             return_value=mock_callbacks,
         ):
-            result = create_run_config(run_id, thread_id, mock_user, additional_config)
+            result = create_run_config(run_id, thread_id, mock_user, additional_config=additional_config)
 
         # Should have existing + tracing callbacks
         assert len(result["callbacks"]) == 3
@@ -742,7 +776,6 @@ class TestLangGraphServiceConfigs:
         mock_user = Mock()
         mock_user.identity = "user-123"
         mock_user.display_name = "Test User"
-        mock_user.to_dict.return_value = {"identity": "user-123"}
 
         run_id = "run-789"
         thread_id = "thread-456"
@@ -754,7 +787,7 @@ class TestLangGraphServiceConfigs:
             "aegra_api.services.langgraph_service.get_tracing_callbacks",
             return_value=mock_callbacks,
         ):
-            result = create_run_config(run_id, thread_id, mock_user, additional_config)
+            result = create_run_config(run_id, thread_id, mock_user, additional_config=additional_config)
 
         assert result["callbacks"] == mock_callbacks
 
@@ -781,7 +814,6 @@ class TestLangGraphServiceConfigs:
         mock_user = Mock()
         mock_user.identity = "user-123"
         mock_user.display_name = "Test User"
-        mock_user.to_dict.return_value = {"identity": "user-123"}
 
         run_id = "run-abc-123"
         thread_id = "thread-456"

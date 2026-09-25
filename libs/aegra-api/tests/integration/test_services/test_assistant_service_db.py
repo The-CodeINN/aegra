@@ -4,16 +4,19 @@ These tests verify service interactions with real database operations.
 """
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import Insert
+from sqlalchemy.dialects import postgresql
 
-from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import AssistantVersion as AssistantVersionORM
 from aegra_api.models import Assistant, AssistantCreate, AssistantUpdate
+from aegra_api.models.auth import User
 from aegra_api.services.assistant_service import AssistantService
-from tests.fixtures.database import DummySessionBase
+from tests.fixtures.database import DummyScalarResult, DummySessionBase, echo_inserted_row
 
 
 class TestAssistantServiceDatabase:
@@ -32,7 +35,13 @@ class TestAssistantServiceDatabase:
     @pytest.fixture
     def db_session(self):
         """Database session for testing"""
-        from unittest.mock import AsyncMock
+        from unittest.mock import DEFAULT, AsyncMock
+
+        def echo_inserts(stmt=None):
+            """Inserts echo their RETURNING row; reads fall through to return_value."""
+            if isinstance(stmt, Insert):
+                return DummyScalarResult([echo_inserted_row(stmt)])
+            return DEFAULT
 
         class AssistantTestSession(DummySessionBase):
             def __init__(self):
@@ -42,7 +51,7 @@ class TestAssistantServiceDatabase:
 
                 # Create mockable methods
                 self.scalar = AsyncMock()
-                self.scalars = AsyncMock()
+                self.scalars = AsyncMock(side_effect=echo_inserts)
                 self.execute = AsyncMock()
                 self.commit = AsyncMock()
                 self.refresh = AsyncMock()
@@ -78,7 +87,7 @@ class TestAssistantServiceDatabase:
         db_session.scalar.return_value = None  # No existing assistant by default
         db_session.scalars.return_value.all.return_value = []  # Empty results by default
 
-        return AssistantService(db_session, mock_langgraph_service)
+        return AssistantService(db_session, User(identity="user-123"), mock_langgraph_service)
 
     @pytest.mark.asyncio
     async def test_create_assistant_db_transaction(self, assistant_service):
@@ -91,7 +100,7 @@ class TestAssistantServiceDatabase:
             metadata={"env": "test"},
         )
 
-        result = await assistant_service.create_assistant(request, "user-123")
+        result = await assistant_service.create_assistant(request)
 
         assert isinstance(result, Assistant)
         assert result.name == "Test Assistant"
@@ -102,12 +111,17 @@ class TestAssistantServiceDatabase:
         assert result.config == {"temperature": 0.7}
         assert result.metadata == {"env": "test"}
 
-        # Verify assistant ORM object was added to session
-        assert len(assistant_service.session.added_objects) >= 1
-        assistant_orm = assistant_service.session.added_objects[0]
-        assert isinstance(assistant_orm, AssistantORM)
-        assert assistant_orm.name == "Test Assistant"
-        assert assistant_orm.metadata_dict == {"env": "test"}
+        # The row is written by one conflict-tolerant INSERT and read back from its
+        # RETURNING, so a concurrent create cannot turn a unique violation into a 500.
+        insert_stmt = assistant_service.session.scalars.call_args.args[0]
+        compiled = str(insert_stmt.compile(dialect=postgresql.dialect()))
+        assert "INSERT INTO assistant" in compiled
+        assert "ON CONFLICT DO NOTHING" in compiled
+        assert "RETURNING" in compiled
+
+        # Only the version row goes through session.add now
+        assert len(assistant_service.session.added_objects) == 1
+        assert isinstance(assistant_service.session.added_objects[0], AssistantVersionORM)
 
     @pytest.mark.asyncio
     async def test_create_assistant_version_creation(self, assistant_service):
@@ -118,7 +132,7 @@ class TestAssistantServiceDatabase:
             config={"model": "gpt-4"},
         )
 
-        result = await assistant_service.create_assistant(request, "user-123")
+        result = await assistant_service.create_assistant(request)
 
         # Find the created version
         versions = [obj for obj in assistant_service.session.added_objects if isinstance(obj, AssistantVersionORM)]
@@ -139,11 +153,14 @@ class TestAssistantServiceDatabase:
             name="Original Assistant",
             graph_id="test-graph",
         )
-        original_assistant = await assistant_service.create_assistant(create_request, "user-123")
+        original_assistant = await assistant_service.create_assistant(create_request)
+        # The update resolves omitted fields against the stored row through ORM
+        # attributes (metadata_dict), so that row has to be ORM-shaped.
+        stored_row = SimpleNamespace(**original_assistant.model_dump(by_alias=True))
 
         # Mock scalar calls: first returns assistant, second returns max version, third returns updated assistant
         assistant_service.session.scalar.side_effect = [
-            original_assistant,
+            stored_row,
             1,
             original_assistant,
         ]  # max version = 1
@@ -155,7 +172,7 @@ class TestAssistantServiceDatabase:
             config={"temperature": 0.8},
         )
 
-        await assistant_service.update_assistant(original_assistant.assistant_id, update_request, "user-123")
+        await assistant_service.update_assistant(original_assistant.assistant_id, update_request)
 
         # Verify new version was created
         versions = [obj for obj in assistant_service.session.added_objects if isinstance(obj, AssistantVersionORM)]
@@ -178,15 +195,52 @@ class TestAssistantServiceDatabase:
             name="To Delete",
             graph_id="test-graph",
         )
-        assistant = await assistant_service.create_assistant(request, "user-123")
+        assistant = await assistant_service.create_assistant(request)
 
         # Mock the assistant for deletion
         assistant_service.session.scalar.return_value = assistant
 
-        result = await assistant_service.delete_assistant(assistant.assistant_id, "user-123")
+        result = await assistant_service.delete_assistant(assistant.assistant_id)
 
         assert result == {"status": "deleted"}
         assert assistant in assistant_service.session.deleted_objects
+
+    @pytest.mark.asyncio
+    async def test_list_assistants_no_metadata_filter(self, assistant_service):
+        """list_assistants without metadata returns all rows for the user."""
+        mock_result = Mock()
+        mock_result.all.return_value = []
+        assistant_service.session.scalars.return_value = mock_result
+
+        result = await assistant_service.list_assistants()
+
+        assert result == []
+        assistant_service.session.scalars.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_list_assistants_with_metadata_filter(self, assistant_service, monkeypatch):
+        """When an auth handler scopes results via a metadata filter, list_assistants
+        applies a JSONB containment predicate but no pagination — the regression
+        fence for the silent 20-row cap that a previous fix introduced."""
+        mock_result = Mock()
+        mock_result.all.return_value = []
+        assistant_service.session.scalars.return_value = mock_result
+
+        from aegra_api.services import authenticated
+
+        async def handler_filter(ctx, value):
+            return {"metadata": {"tenant": "x"}}
+
+        monkeypatch.setattr(authenticated, "handle_event", handler_filter)
+
+        result = await assistant_service.list_assistants()
+
+        assert result == []
+        called_stmt = assistant_service.session.scalars.call_args.args[0]
+        compiled = str(called_stmt.compile())
+        assert "@>" in compiled
+        assert "LIMIT" not in compiled.upper()
+        assert "OFFSET" not in compiled.upper()
 
     @pytest.mark.asyncio
     async def test_search_assistants_pagination(self, assistant_service):
@@ -198,7 +252,7 @@ class TestAssistantServiceDatabase:
                 graph_id="test-graph",
                 metadata={"index": i},
             )
-            await assistant_service.create_assistant(request, "user-123")
+            await assistant_service.create_assistant(request)
 
         # Mock search request
         mock_request = Mock()
@@ -214,8 +268,10 @@ class TestAssistantServiceDatabase:
         mock_result.all.return_value = []
 
         assistant_service.session.scalars.return_value = mock_result
+        # Drop the creates' inserts so the count below only covers the search
+        assistant_service.session.scalars.reset_mock()
 
-        result = await assistant_service.search_assistants(mock_request, "user-123")
+        result = await assistant_service.search_assistants(mock_request)
 
         assert isinstance(result, list)
         # Verify pagination parameters were applied
@@ -229,7 +285,7 @@ class TestAssistantServiceDatabase:
             name="Versioned Assistant",
             graph_id="test-graph",
         )
-        assistant = await assistant_service.create_assistant(create_request, "user-123")
+        assistant = await assistant_service.create_assistant(create_request)
 
         # Mock assistant for version listing
         assistant_service.session.scalar.return_value = assistant
@@ -265,7 +321,7 @@ class TestAssistantServiceDatabase:
 
         assistant_service.session.scalars.return_value = mock_result
 
-        result = await assistant_service.list_assistant_versions(assistant.assistant_id, "user-123")
+        result = await assistant_service.list_assistant_versions(assistant.assistant_id)
 
         assert isinstance(result, list)
         assert len(result) == 2
@@ -280,7 +336,7 @@ class TestAssistantServiceDatabase:
             name="Versioned Assistant",
             graph_id="test-graph",
         )
-        assistant = await assistant_service.create_assistant(create_request, "user-123")
+        assistant = await assistant_service.create_assistant(create_request)
 
         # Mock scalar calls: assistant, version, updated assistant
         from aegra_api.core.orm import AssistantVersion as AssistantVersionORM
@@ -303,7 +359,7 @@ class TestAssistantServiceDatabase:
             assistant,
         ]
 
-        result = await assistant_service.set_assistant_latest(assistant.assistant_id, 2, "user-123")
+        result = await assistant_service.set_assistant_latest(assistant.assistant_id, 2)
 
         assert isinstance(result, Assistant)
         # Verify update was executed
@@ -319,14 +375,14 @@ class TestAssistantServiceDatabase:
             graph_id="test-graph",
             metadata={"env": "prod", "team": "backend"},
         )
-        await assistant_service.create_assistant(request1, "user-123")
+        await assistant_service.create_assistant(request1)
 
         request2 = AssistantCreate(
             name="Dev Assistant",
             graph_id="test-graph",
             metadata={"env": "dev", "team": "frontend"},
         )
-        await assistant_service.create_assistant(request2, "user-123")
+        await assistant_service.create_assistant(request2)
 
         # Mock search request with metadata filter
         mock_request = Mock()
@@ -342,8 +398,10 @@ class TestAssistantServiceDatabase:
         mock_result.all.return_value = []
 
         assistant_service.session.scalars.return_value = mock_result
+        # Drop the creates' inserts so the count below only covers the search
+        assistant_service.session.scalars.reset_mock()
 
-        result = await assistant_service.search_assistants(mock_request, "user-123")
+        result = await assistant_service.search_assistants(mock_request)
 
         assert isinstance(result, list)
         # Verify metadata filter was applied
@@ -359,7 +417,7 @@ class TestAssistantServiceDatabase:
                 graph_id="test-graph",
                 metadata={"category": "test"},
             )
-            await assistant_service.create_assistant(request, "user-123")
+            await assistant_service.create_assistant(request)
 
         # Mock count request
         mock_request = Mock()
@@ -371,11 +429,11 @@ class TestAssistantServiceDatabase:
         # Mock count result
         assistant_service.session.scalar.return_value = 3
 
-        result = await assistant_service.count_assistants(mock_request, "user-123")
+        result = await assistant_service.count_assistants(mock_request)
 
         assert result == 3
-        # scalar is called 4 times: 3 for create_assistant + 1 for count_assistants
-        assert assistant_service.session.scalar.call_count == 4
+        # Uncontended creates never SELECT, so only count_assistants calls scalar
+        assert assistant_service.session.scalar.call_count == 1
 
     @pytest.mark.asyncio
     async def test_assistant_concurrent_operations(self, assistant_service):
@@ -392,7 +450,7 @@ class TestAssistantServiceDatabase:
         # Create assistants
         results = []
         for request in requests:
-            result = await assistant_service.create_assistant(request, "user-123")
+            result = await assistant_service.create_assistant(request)
             results.append(result)
 
         # Verify all assistants were created
@@ -414,7 +472,7 @@ class TestAssistantServiceDatabase:
         assistant_service.langgraph_service.get_graph_for_validation.side_effect = Exception("Graph load failed")
 
         with pytest.raises(HTTPException, match="Failed to load graph: Graph load failed"):
-            await assistant_service.create_assistant(request, "user-123")
+            await assistant_service.create_assistant(request)
 
         # Verify no objects were added to session
         assert len(assistant_service.session.added_objects) == 0
@@ -434,7 +492,7 @@ class TestAssistantServiceDatabase:
             metadata=large_metadata,
         )
 
-        result = await assistant_service.create_assistant(request, "user-123")
+        result = await assistant_service.create_assistant(request)
 
         assert result.metadata == large_metadata
         assert result.name == "Large Metadata Assistant"
@@ -452,7 +510,7 @@ class TestAssistantServiceDatabase:
             metadata={"unicode": "测试", "emoji": "🎉"},
         )
 
-        result = await assistant_service.create_assistant(request, "user-123")
+        result = await assistant_service.create_assistant(request)
 
         assert result.name == special_name
         assert result.description == special_description

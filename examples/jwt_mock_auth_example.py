@@ -27,12 +27,20 @@ This example includes:
 """
 
 from langgraph_sdk import Auth
+from langgraph_sdk.auth.types import (
+    AssistantsCreate,
+    AssistantsDelete,
+    AuthContext,
+    HandlerResult,
+    ThreadsCreate,
+    ThreadsSearch,
+)
 
 auth = Auth()
 
 
 @auth.authenticate
-async def authenticate(headers: dict) -> dict:
+async def authenticate(headers: dict[str, str]) -> dict[str, str | bool | list[str]]:
     """Mock JWT authentication that simulates real JWT behavior.
 
     Expects: Authorization: Bearer <token>
@@ -65,7 +73,8 @@ async def authenticate(headers: dict) -> dict:
 
     user_id = parts[0]
     role = parts[1]
-    team_id = parts[2] if len(parts) > 2 else "team_default"
+    has_team = len(parts) > 2
+    team_id = parts[2] if has_team else "team_default"
 
     # Determine subscription tier based on role
     subscription_tier = "premium" if role in ("admin", "premium") else "free"
@@ -79,6 +88,8 @@ async def authenticate(headers: dict) -> dict:
         "role": role,
         "subscription_tier": subscription_tier,
         "team_id": team_id,
+        # A team doubles as the user's org for org-scoped store sharing; no team => no org.
+        "org_id": team_id if has_team else None,
         "email": f"{user_id}@example.com",
     }
 
@@ -89,7 +100,7 @@ async def authenticate(headers: dict) -> dict:
 # Global fallback handler - runs for all resources/actions that don't have specific handlers
 # This provides default filtering behavior (e.g., user-scoped access)
 @auth.on
-async def authorize(_ctx, _value):
+async def authorize(ctx: AuthContext, value: dict) -> HandlerResult:
     """Global authorization handler - fallback for all requests.
 
     This handler runs for any resource/action that doesn't have a more specific
@@ -104,7 +115,7 @@ async def authorize(_ctx, _value):
 
 
 @auth.on.threads.create
-async def allow_thread_create(ctx, value):
+async def allow_thread_create(ctx: AuthContext, value: ThreadsCreate) -> HandlerResult:
     """Allow thread creation and inject team_id into metadata.
 
     This handler automatically injects the user's team_id into thread metadata,
@@ -124,7 +135,7 @@ async def allow_thread_create(ctx, value):
 
 
 @auth.on.threads.search
-async def filter_threads_by_team(ctx, _value):
+async def filter_threads_by_team(ctx: AuthContext, value: ThreadsSearch) -> HandlerResult:
     """Filter thread searches by team_id.
 
     This handler ensures users only see threads from their team,
@@ -140,7 +151,7 @@ async def filter_threads_by_team(ctx, _value):
 
 
 @auth.on.assistants.delete
-async def restrict_assistant_deletion(ctx, _value):
+async def restrict_assistant_deletion(ctx: AuthContext, value: AssistantsDelete) -> HandlerResult:
     """Only admins can delete assistants.
 
     This demonstrates role-based authorization - only users with
@@ -156,7 +167,7 @@ async def restrict_assistant_deletion(ctx, _value):
 
 
 @auth.on.assistants.create
-async def allow_assistant_create(ctx, value):
+async def allow_assistant_create(ctx: AuthContext, value: AssistantsCreate) -> HandlerResult:
     """Allow assistant creation and inject creator info.
 
     This handler injects metadata about who created the assistant

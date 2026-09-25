@@ -11,9 +11,11 @@ from typing import Any, cast
 
 import structlog
 from langchain_core.messages import (
+    AIMessage,
     AIMessageChunk,
     BaseMessage,
     BaseMessageChunk,
+    ToolMessage,
     ToolMessageChunk,
     convert_to_messages,
     message_chunk_to_message,
@@ -33,8 +35,45 @@ from aegra_api.utils.run_utils import _filter_context_by_schema
 
 logger = structlog.getLogger(__name__)
 
+
+def _to_message_chunk(msg: BaseMessage) -> BaseMessage:
+    """Convert a complete message to its chunk equivalent for messages-tuple mode.
+
+    When an LLM does not stream (streaming=False), LangGraph emits complete
+    AIMessage/ToolMessage objects instead of AIMessageChunk/ToolMessageChunk.
+    This means messages-tuple returns "type": "ai" for non-streaming LLMs but
+    "type": "AIMessageChunk" for streaming ones — inconsistent wire types for
+    the same stream mode. This function normalizes them so that messages-tuple
+    always returns chunk types regardless of LLM streaming capability.
+    """
+    if isinstance(msg, (AIMessageChunk, ToolMessageChunk)):
+        return msg
+    if isinstance(msg, AIMessage):
+        return AIMessageChunk(**msg.model_dump(exclude={"type"}))
+    if isinstance(msg, ToolMessage):
+        return ToolMessageChunk(**msg.model_dump(exclude={"type"}))
+    return msg
+
+
 # Type alias for stream output
 AnyStream = AsyncIterator[tuple[str, Any]]
+_INTERRUPT_KEYS = ("interrupt_before", "interrupt_after")
+
+
+def _normalize_interrupt_value(value: Any) -> Any:
+    if value == ["*"]:
+        return "*"
+    return value
+
+
+def _extract_interrupt_kwargs(config: RunnableConfig) -> tuple[RunnableConfig, dict[str, Any]]:
+    run_config = dict(config)
+    interrupt_kwargs = {}
+    for key in _INTERRUPT_KEYS:
+        value = run_config.pop(key, None)
+        if value is not None:
+            interrupt_kwargs[key] = _normalize_interrupt_value(value)
+    return cast("RunnableConfig", run_config), interrupt_kwargs
 
 
 def _normalize_checkpoint_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -107,6 +146,7 @@ async def stream_graph_events(
         Tuples of (mode, payload) where mode is the stream mode and payload is the event data
     """
     run_id = str(config.get("configurable", {}).get("run_id", uuid.uuid4()))
+    config, interrupt_kwargs = _extract_interrupt_kwargs(config)
 
     # Prepare stream modes
     stream_modes_set: set[str] = set(stream_mode) - {"events"}
@@ -164,6 +204,7 @@ async def stream_graph_events(
                 version="v2",
                 stream_mode=list(stream_modes_set),
                 subgraphs=subgraphs,
+                **interrupt_kwargs,
             )
         ) as stream:
             async for event in stream:
@@ -250,6 +291,7 @@ async def stream_graph_events(
                 stream_mode=list(stream_modes_set),
                 output_keys=output_keys,
                 subgraphs=subgraphs,
+                **interrupt_kwargs,
             )
         ) as stream:
             async for event in stream:
@@ -335,6 +377,10 @@ def _process_stream_event(
     # Handle messages mode
     if mode == "messages":
         if "messages-tuple" in stream_mode:
+            # Normalize message type to chunk for consistent client output
+            if isinstance(chunk, (tuple, list)) and len(chunk) == 2:
+                msg_, meta_ = chunk
+                chunk = (_to_message_chunk(msg_), meta_)
             # Pass through raw tuple format
             if subgraphs and namespace:
                 ns_str = "|".join(namespace) if isinstance(namespace, (list, tuple)) else str(namespace)

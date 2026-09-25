@@ -13,8 +13,8 @@ Architecture:
 
 from fastapi import APIRouter, Body, Depends, Query
 
-from aegra_api.core.auth_deps import auth_dependency, get_current_user
-from aegra_api.core.auth_handlers import build_auth_context, handle_event
+from aegra_api.core.auth_deps import auth_dependency
+from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.models import (
     AgentSchemas,
     Assistant,
@@ -22,18 +22,32 @@ from aegra_api.models import (
     AssistantList,
     AssistantSearchRequest,
     AssistantUpdate,
-    User,
 )
-from aegra_api.models.errors import NOT_FOUND
+from aegra_api.models.errors import CONFLICT, NOT_FOUND
 from aegra_api.services.assistant_service import AssistantService, get_assistant_service
 
 router = APIRouter(tags=["Assistants"], dependencies=auth_dependency)
 
 
-@router.post("/assistants", response_model=Assistant, response_model_by_alias=False)
+def _resolve_sort(request: AssistantSearchRequest) -> tuple[object, bool]:
+    """Resolve (ORM column, is_ascending) for /assistants/search.
+
+    sort_by is Pydantic-validated against a Literal — invalid values 422 at
+    the request boundary. Default is created_at DESC.
+    """
+    if request.sort_by:
+        return getattr(AssistantORM, request.sort_by), (request.sort_order or "desc").lower() == "asc"
+    return AssistantORM.created_at, False
+
+
+@router.post(
+    "/assistants",
+    response_model=Assistant,
+    response_model_by_alias=False,
+    responses={**CONFLICT},
+)
 async def create_assistant(
     request: AssistantCreate,
-    user: User = Depends(get_current_user),
     service: AssistantService = Depends(get_assistant_service),
 ):
     """Create a new assistant.
@@ -41,25 +55,14 @@ async def create_assistant(
     An assistant is a configured instance of a graph. Provide a `graph_id`
     referencing a graph defined in your `aegra.json`. If `assistant_id` is
     omitted, one is auto-generated. Set `if_exists` to `"do_nothing"` for
-    idempotent creation.
+    idempotent creation; otherwise a taken `assistant_id` or an identical
+    graph/config pair answers 409.
     """
-    # Authorization check
-    ctx = build_auth_context(user, "assistants", "create")
-    value = request.model_dump()
-    filters = await handle_event(ctx, value)
-
-    # If handler modified metadata, update request
-    if filters and "metadata" in filters:
-        request.metadata = {**(request.metadata or {}), **filters["metadata"]}
-    elif value.get("metadata"):
-        request.metadata = {**(request.metadata or {}), **value["metadata"]}
-
-    return await service.create_assistant(request, user.identity)
+    return await service.create_assistant(request)
 
 
 @router.get("/assistants", response_model=AssistantList, response_model_by_alias=False)
 async def list_assistants(
-    user: User = Depends(get_current_user),
     service: AssistantService = Depends(get_assistant_service),
 ):
     """List all assistants owned by the authenticated user.
@@ -67,26 +70,13 @@ async def list_assistants(
     Returns every assistant without filtering. Use the search endpoint for
     filtered queries.
     """
-    # Authorization check (search action for listing)
-    ctx = build_auth_context(user, "assistants", "search")
-    value = {}
-    filters = await handle_event(ctx, value)
-
-    # Apply filters if provided by handler
-    if filters:
-        # Convert filters to search request format
-        search_request = AssistantSearchRequest(filters=filters)
-        assistants = await service.search_assistants(search_request, user.identity)
-    else:
-        assistants = await service.list_assistants(user.identity)
-
+    assistants = await service.list_assistants()
     return AssistantList(assistants=assistants, total=len(assistants))
 
 
 @router.post("/assistants/search", response_model=list[Assistant], response_model_by_alias=False)
 async def search_assistants(
     request: AssistantSearchRequest,
-    user: User = Depends(get_current_user),
     service: AssistantService = Depends(get_assistant_service),
 ):
     """Search assistants with filters.
@@ -94,23 +84,13 @@ async def search_assistants(
     Filter by name, description, graph ID, or metadata. Results are paginated
     via `limit` and `offset`.
     """
-    # Authorization check
-    ctx = build_auth_context(user, "assistants", "search")
-    value = request.model_dump()
-    filters = await handle_event(ctx, value)
-
-    # Merge handler filters with request filters
-    if filters:
-        request_filters = request.filters or {}
-        request.filters = {**request_filters, **filters}
-
-    return await service.search_assistants(request, user.identity)
+    column, asc = _resolve_sort(request)
+    return await service.search_assistants(request, sort_column=column, sort_asc=asc)
 
 
 @router.post("/assistants/count", response_model=int)
 async def count_assistants(
     request: AssistantSearchRequest,
-    user: User = Depends(get_current_user),
     service: AssistantService = Depends(get_assistant_service),
 ):
     """Count assistants matching the given filters.
@@ -118,17 +98,7 @@ async def count_assistants(
     Accepts the same filter parameters as the search endpoint but returns only
     the total count.
     """
-    # Authorization check (search action for counting)
-    ctx = build_auth_context(user, "assistants", "search")
-    value = request.model_dump()
-    filters = await handle_event(ctx, value)
-
-    # Merge handler filters with request filters
-    if filters:
-        request_filters = request.filters or {}
-        request.filters = {**request_filters, **filters}
-
-    return await service.count_assistants(request, user.identity)
+    return await service.count_assistants(request)
 
 
 @router.get(
@@ -139,7 +109,6 @@ async def count_assistants(
 )
 async def get_assistant(
     assistant_id: str,
-    user: User = Depends(get_current_user),
     service: AssistantService = Depends(get_assistant_service),
 ):
     """Get an assistant by its ID.
@@ -147,12 +116,7 @@ async def get_assistant(
     Returns the latest version of the assistant. Returns 404 if the assistant
     does not exist or does not belong to the authenticated user.
     """
-    # Authorization check
-    ctx = build_auth_context(user, "assistants", "read")
-    value = {"assistant_id": assistant_id}
-    await handle_event(ctx, value)
-
-    return await service.get_assistant(assistant_id, user.identity)
+    return await service.get_assistant(assistant_id)
 
 
 @router.patch(
@@ -164,7 +128,6 @@ async def get_assistant(
 async def update_assistant(
     assistant_id: str,
     request: AssistantUpdate,
-    user: User = Depends(get_current_user),
     service: AssistantService = Depends(get_assistant_service),
 ):
     """Update an assistant by its ID.
@@ -172,24 +135,12 @@ async def update_assistant(
     Partial update: only fields included in the request body are changed.
     Creates a new version of the assistant.
     """
-    # Authorization check
-    ctx = build_auth_context(user, "assistants", "update")
-    value = {**request.model_dump(), "assistant_id": assistant_id}
-    filters = await handle_event(ctx, value)
-
-    # If handler modified metadata, update request
-    if filters and "metadata" in filters:
-        request.metadata = {**(request.metadata or {}), **filters["metadata"]}
-    elif value.get("metadata"):
-        request.metadata = {**(request.metadata or {}), **value["metadata"]}
-
-    return await service.update_assistant(assistant_id, request, user.identity)
+    return await service.update_assistant(assistant_id, request)
 
 
 @router.delete("/assistants/{assistant_id}", responses={**NOT_FOUND})
 async def delete_assistant(
     assistant_id: str,
-    user: User = Depends(get_current_user),
     service: AssistantService = Depends(get_assistant_service),
 ):
     """Delete an assistant by its ID.
@@ -197,12 +148,7 @@ async def delete_assistant(
     Permanently removes the assistant and all of its versions. This action
     cannot be undone.
     """
-    # Authorization check
-    ctx = build_auth_context(user, "assistants", "delete")
-    value = {"assistant_id": assistant_id}
-    await handle_event(ctx, value)
-
-    return await service.delete_assistant(assistant_id, user.identity)
+    return await service.delete_assistant(assistant_id)
 
 
 @router.post(
@@ -214,7 +160,6 @@ async def delete_assistant(
 async def set_assistant_latest(
     assistant_id: str,
     version: int = Body(..., embed=True, description="The version number to set as latest"),
-    user: User = Depends(get_current_user),
     service: AssistantService = Depends(get_assistant_service),
 ):
     """Pin a specific version as the latest version of an assistant.
@@ -222,7 +167,7 @@ async def set_assistant_latest(
     After calling this endpoint, the assistant will use the specified version's
     configuration when executing runs.
     """
-    return await service.set_assistant_latest(assistant_id, version, user.identity)
+    return await service.set_assistant_latest(assistant_id, version)
 
 
 @router.post(
@@ -233,7 +178,6 @@ async def set_assistant_latest(
 )
 async def list_assistant_versions(
     assistant_id: str,
-    user: User = Depends(get_current_user),
     service: AssistantService = Depends(get_assistant_service),
 ):
     """List all versions of an assistant.
@@ -241,7 +185,7 @@ async def list_assistant_versions(
     Returns versions ordered from newest to oldest. Each version captures the
     assistant's configuration at the time of creation or update.
     """
-    return await service.list_assistant_versions(assistant_id, user.identity)
+    return await service.list_assistant_versions(assistant_id)
 
 
 @router.get(
@@ -251,7 +195,6 @@ async def list_assistant_versions(
 )
 async def get_assistant_schemas(
     assistant_id: str,
-    user: User = Depends(get_current_user),
     service: AssistantService = Depends(get_assistant_service),
 ):
     """Get the JSON schemas for an assistant's graph.
@@ -259,7 +202,7 @@ async def get_assistant_schemas(
     Returns the input, output, state, and config schemas derived from the
     underlying graph's type annotations.
     """
-    return await service.get_assistant_schemas(assistant_id, user.identity)
+    return await service.get_assistant_schemas(assistant_id)
 
 
 @router.get("/assistants/{assistant_id}/graph", responses={**NOT_FOUND})
@@ -268,7 +211,6 @@ async def get_assistant_graph(
     xray: bool | int | None = Query(
         None, description="Expand subgraph nodes. Pass true or a depth integer to control nesting."
     ),
-    user: User = Depends(get_current_user),
     service: AssistantService = Depends(get_assistant_service),
 ):
     """Get the graph structure for visualization.
@@ -277,9 +219,8 @@ async def get_assistant_graph(
     rendering in graph visualizers. Use `xray` to expand subgraph nodes into
     their internal structure.
     """
-    # Default to False if not provided
     xray_value = xray if xray is not None else False
-    return await service.get_assistant_graph(assistant_id, xray_value, user.identity)
+    return await service.get_assistant_graph(assistant_id, xray_value)
 
 
 @router.get("/assistants/{assistant_id}/subgraphs", responses={**NOT_FOUND})
@@ -287,7 +228,6 @@ async def get_assistant_subgraphs(
     assistant_id: str,
     recurse: bool = Query(False, description="Recursively include nested subgraphs."),
     namespace: str | None = Query(None, description="Filter to a specific subgraph namespace."),
-    user: User = Depends(get_current_user),
     service: AssistantService = Depends(get_assistant_service),
 ):
     """Get subgraphs of an assistant.
@@ -296,4 +236,4 @@ async def get_assistant_subgraphs(
     `recurse=true` to include deeply nested subgraphs, or filter to a single
     namespace.
     """
-    return await service.get_assistant_subgraphs(assistant_id, namespace, recurse, user.identity)
+    return await service.get_assistant_subgraphs(assistant_id, namespace, recurse)

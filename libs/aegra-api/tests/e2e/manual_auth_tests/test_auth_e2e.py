@@ -1,20 +1,9 @@
 """E2E tests for authentication flow with running server.
 
-⚠️ MANUAL TESTS - These are skipped by default. Run with: pytest -m manual_auth
+These tests require a server started with auth enabled (see aegra.auth.json).
+Skipped by default; run with: make e2e-auth  or  pytest -m auth_only
 
-These tests require a server started with auth enabled (create your own config file).
-
-See tests/e2e/manual_auth_tests/README.md for details on when and how to run these tests.
-
-To run these tests:
-1. Create a config file with auth.path pointing to jwt_mock_auth_example.py:auth
-2. Start the server with your auth config:
-   AEGRA_CONFIG=my_auth_config.json python run_server.py
-   # OR for Docker:
-   AEGRA_CONFIG=my_auth_config.json docker compose up
-
-3. Run tests explicitly:
-   pytest tests/e2e/manual_auth_tests/test_auth_e2e.py -v -m manual_auth
+See tests/e2e/manual_auth_tests/README.md for details.
 """
 
 import httpx
@@ -42,7 +31,7 @@ def get_auth_headers(token: str | None = None) -> dict[str, str]:
 
 
 @pytest.mark.e2e
-@pytest.mark.manual_auth
+@pytest.mark.auth_only
 class TestCoreRoutesAuth:
     """Test that core routes require authentication"""
 
@@ -99,7 +88,7 @@ class TestCoreRoutesAuth:
 
 
 @pytest.mark.e2e
-@pytest.mark.manual_auth
+@pytest.mark.auth_only
 class TestCustomRoutesAuth:
     """Test authentication with custom routes"""
 
@@ -142,10 +131,7 @@ class TestCustomRoutesAuth:
 
         response = httpx.get(url, timeout=10.0)
 
-        # Should return 401 if auth is required
-        # Note: This depends on enable_custom_route_auth config
-        # If disabled, might return 200 with anonymous user
-        assert response.status_code in (200, 401), f"Unexpected status {response.status_code}: {response.text}"
+        assert response.status_code == 401, f"Expected 401 without auth, got {response.status_code}: {response.text}"
 
         elog("Custom whoami without auth", {"url": url, "status": response.status_code})
 
@@ -176,20 +162,17 @@ class TestCustomRoutesAuth:
 
 
 @pytest.mark.e2e
-@pytest.mark.manual_auth
+@pytest.mark.auth_only
 class TestCustomRouteAuthConfig:
     """Test enable_custom_route_auth configuration"""
 
-    def test_custom_public_endpoint_behavior(self):
-        """Test /custom/public endpoint behavior based on config"""
+    def test_custom_route_without_its_own_auth_requires_auth_when_enabled(self) -> None:
+        """/custom/public declares no auth; aegra.auth.json turns enable_custom_route_auth on."""
         url = f"{get_server_url()}/custom/public"
 
-        # Try without auth
         response_no_auth = httpx.get(url, timeout=10.0)
 
-        # If enable_custom_route_auth is True, should return 401
-        # If False, should return 200
-        assert response_no_auth.status_code in (200, 401), f"Unexpected status {response_no_auth.status_code}"
+        assert response_no_auth.status_code == 401, f"Expected 401 without auth, got {response_no_auth.status_code}"
 
         # Try with auth
         headers = get_auth_headers()
@@ -206,9 +189,16 @@ class TestCustomRouteAuthConfig:
             },
         )
 
+    @pytest.mark.parametrize("path", ["/live", "/info", "/"])
+    def test_aegra_public_routes_stay_public_when_enabled(self, path: str) -> None:
+        """Probes and the root must not start answering 401 when custom route auth is on."""
+        response = httpx.get(f"{get_server_url()}{path}", timeout=10.0)
+
+        assert response.status_code == 200, f"Expected 200 on {path} without auth, got {response.status_code}"
+
 
 @pytest.mark.e2e
-@pytest.mark.manual_auth
+@pytest.mark.auth_only
 class TestUserCustomFields:
     """Test that custom fields from auth flow through to routes"""
 
@@ -263,7 +253,7 @@ class TestUserCustomFields:
 
 
 @pytest.mark.e2e
-@pytest.mark.manual_auth
+@pytest.mark.auth_only
 class TestNoopAuth:
     """Test noop authentication behavior"""
 
@@ -284,7 +274,7 @@ class TestNoopAuth:
 
 
 @pytest.mark.e2e
-@pytest.mark.manual_auth
+@pytest.mark.auth_only
 class TestAuthErrorHandling:
     """Test authentication error handling"""
 

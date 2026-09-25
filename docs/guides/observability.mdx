@@ -96,6 +96,49 @@ Aegra uses a pure OpenTelemetry approach:
 
 This keeps overhead low and maintains compatibility with the entire OpenTelemetry ecosystem.
 
+## Run metadata
+
+Each `POST /threads/{thread_id}/runs` (and `/runs/stream`, `/runs/wait`) request accepts an optional top-level `metadata` field whose key/value pairs are propagated onto the run's root OTEL span. This is the recommended channel for filterable trace attributes that aren't part of the LangGraph payload — tenant id, feature flag, environment tag, sub-agent type, and similar.
+
+```json
+{
+  "assistant_id": "agent",
+  "input": {"question": "..."},
+  "metadata": {
+    "tenant": "acme",
+    "feature_flag": true,
+    "subagent": "matter_legal"
+  }
+}
+```
+
+Each entry reaches the root span as `langfuse.trace.metadata.<key>`, which Langfuse exposes as a queryable trace property (rather than burying it under per-observation metadata). On Phoenix and other OTLP targets the same attribute is set verbatim; native first-class metadata aliasing is a planned follow-up.
+
+The value is also persisted to the runs table (`execution_params.run_metadata` JSONB column) so it survives worker restart and is available for post-hoc analysis.
+
+### Constraints
+
+The request validator rejects payloads that would either be silently dropped downstream or balloon span size past collector limits. A violating payload returns `422` with a single message identifying the offending key:
+
+| Constraint | Limit |
+|------------|-------|
+| Maximum number of keys | 32 |
+| Key character set | `[A-Za-z0-9_-]` (no dots, no whitespace, no non-ASCII) |
+| Key length | 1–64 characters |
+| Value type | `str`, `int`, `float`, or `bool` (no nested dicts, lists, or `null`) |
+| String value length | ≤ 512 characters |
+
+The dot exclusion is deliberate: keys are stored under the `langfuse.trace.metadata.` prefix, and allowing dots would let a caller land bare attributes (e.g. `langfuse.user.id`) next to the system ones.
+
+### System-key collisions
+
+Aegra injects a small number of runtime keys into the same metadata stream so they're filterable alongside user-supplied attributes:
+
+- `run_id`, `thread_id`, `graph_id` — always present
+- `original_request_id` — present on the worker path when an HTTP correlation-id was supplied
+
+If the request `metadata` contains a key already populated by the runtime, the system value wins, the user value is dropped, and a warning is logged from `aegra_api.observability.span_enrichment`. This makes the OTEL view a reliable join key with logs and the runs table; user audit fidelity is preserved by keeping the original payload in `execution_params.run_metadata`.
+
 ## Key environment variables
 
 The main variables you'll need:
@@ -107,3 +150,31 @@ The main variables you'll need:
 | `OTEL_CONSOLE_EXPORT` | Log traces to console (`true`/`false`) |
 
 Each provider has its own set of variables (endpoints, API keys). See the [environment variables reference](/reference/environment-variables) for the full list including all Langfuse, Phoenix, and generic OTLP variables.
+
+## Prometheus metrics
+
+For infrastructure-level monitoring (request rates, latency, error rates), Aegra supports an optional Prometheus metrics endpoint alongside OpenTelemetry tracing.
+
+```bash
+ENABLE_PROMETHEUS_METRICS=true
+```
+
+This exposes a `/metrics` endpoint with standard HTTP request metrics in Prometheus exposition format. Scrape it with any Prometheus-compatible collector and visualize with Grafana.
+
+### Lease reaper metrics
+
+In production mode (`REDIS_BROKER_ENABLED=true`), the [lease reaper](/guides/worker-architecture) reports the runs it recovers:
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `aegra_reaper_recovered_runs_total` | `outcome="crashed_retried"` | Runs whose worker lease expired; reset to pending and re-enqueued |
+| | `outcome="crashed_exhausted"` | Crashed runs that exceeded `BG_JOB_MAX_RETRIES`; marked permanently failed |
+| | `outcome="stuck_pending"` | Runs never claimed by a worker; re-enqueued without charging retry budget |
+
+The counter increments only for confirmed operations: a successful Redis push for `crashed_retried`/`stuck_pending`, a successful DB update for `crashed_exhausted`. If Redis is down during recovery, workers still pick the runs up via the Postgres poll fallback, but those recoveries are not counted (the metric never overcounts, though it can undercount during a Redis outage).
+
+All three series are exported as `0` from startup, so `rate()` queries and alerts work before the first recovery. A sustained non-zero rate of `crashed_retried` means workers are dying mid-run (check memory limits and crash loops); any growth in `crashed_exhausted` means runs are being lost permanently and is worth alerting on. In dev mode (`aegra dev`) the reaper does not run and these counters stay at zero.
+
+The `/metrics` endpoint is **not** protected by Aegra's authentication middleware. This is intentional — Prometheus scrapers typically do not support application-level auth. If you need to restrict access, use network-level controls (firewall rules, internal load-balancer listeners, etc.).
+
+See the [environment variables reference](/reference/environment-variables#prometheus-metrics) for details.

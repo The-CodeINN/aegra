@@ -23,7 +23,7 @@
   ],
   "topbarCtaButton": {
     "name": "GitHub",
-    "url": "https://github.com/ibbybuilds/aegra"
+    "url": "https://github.com/aegra/aegra"
   },
   "navigation": {
     "tabs": [
@@ -50,7 +50,8 @@
               "guides/assistants",
               "guides/threads-and-state",
               "guides/streaming",
-              "guides/human-in-the-loop"
+              "guides/human-in-the-loop",
+              "guides/cron"
             ]
           },
           {
@@ -70,7 +71,9 @@
               "guides/custom-routes",
               "guides/dependencies",
               "guides/observability",
-              "guides/deployment"
+              "guides/deployment",
+              "guides/worker-architecture",
+              "guides/high-availability"
             ]
           },
           {
@@ -99,7 +102,7 @@
     ]
   },
   "footerSocials": {
-    "github": "https://github.com/ibbybuilds/aegra",
+    "github": "https://github.com/aegra/aegra",
     "discord": "https://discord.com/invite/D5M3ZPS25e"
   },
   "feedback": {

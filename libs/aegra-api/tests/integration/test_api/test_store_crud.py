@@ -1,7 +1,11 @@
 """Integration tests for store CRUD operations"""
 
-import pytest
+from unittest.mock import AsyncMock
 
+import pytest
+from fastapi.testclient import TestClient
+
+from aegra_api.settings import settings
 from tests.fixtures.clients import create_test_app, make_client
 from tests.fixtures.test_helpers import DummyStoreItem
 
@@ -211,6 +215,32 @@ class TestGetStoreItem:
         data = resp.json()
         assert data["key"] == "test-key"
 
+    def test_get_item_with_empty_namespace_query_param(self, client, mock_store):
+        """Test empty namespace query param is treated as no namespace"""
+        from unittest.mock import patch
+
+        from aegra_api.api.store import apply_namespace_scoping
+
+        mock_item = DummyStoreItem(
+            key="test-key",
+            value={"data": "test"},
+            namespace=("users", "test-user"),
+        )
+        mock_store.aget.return_value = mock_item
+
+        with patch(
+            "aegra_api.api.store.apply_namespace_scoping",
+            wraps=apply_namespace_scoping,
+        ) as spy:
+            resp = client.get("/store/items?namespace=&key=test-key")
+
+        assert resp.status_code == 200
+        spy.assert_called_once()
+        assert spy.call_args.args[0] == []
+        assert spy.call_args.args[1].identity == "test-user"
+        call_args = mock_store.aget.call_args
+        assert call_args[0][0] == ("users", "test-user")
+
 
 class TestDeleteStoreItem:
     """Test DELETE /store/items"""
@@ -241,6 +271,25 @@ class TestDeleteStoreItem:
 
         assert resp.status_code == 422
         assert "key" in resp.json()["detail"].lower()
+
+    def test_delete_item_with_empty_namespace_query_param(self, client, mock_store):
+        """Test empty namespace query param is treated as no namespace"""
+        from unittest.mock import patch
+
+        from aegra_api.api.store import apply_namespace_scoping
+
+        with patch(
+            "aegra_api.api.store.apply_namespace_scoping",
+            wraps=apply_namespace_scoping,
+        ) as spy:
+            resp = client.delete("/store/items?key=test-key&namespace=")
+
+        assert resp.status_code == 204
+        spy.assert_called_once()
+        assert spy.call_args.args[0] == []
+        assert spy.call_args.args[1].identity == "test-user"
+        call_args = mock_store.adelete.call_args
+        assert call_args[0][0] == ("users", "test-user")
 
     def test_delete_item_with_namespace(self, client, mock_store):
         """Test deleting item with specific namespace"""
@@ -387,6 +436,124 @@ class TestSearchStoreItems:
         mock_store.asearch.assert_called_once()
         call_args = mock_store.asearch.call_args
         assert call_args.kwargs["filter"] is None
+
+    def test_search_items_accepts_limit_500(self, client: TestClient, mock_store: AsyncMock) -> None:
+        """LangGraph SDK clients page with limit=500; must not 422."""
+        mock_store.asearch.return_value = []
+
+        resp = client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["test"], "limit": 500},
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["limit"] == 500
+        mock_store.asearch.assert_called_once()
+        assert mock_store.asearch.call_args.kwargs["limit"] == 500
+
+    def test_search_items_accepts_limit_at_cap(self, client: TestClient, mock_store: AsyncMock) -> None:
+        mock_store.asearch.return_value = []
+        cap = settings.app.MAX_SEARCH_LIMIT
+
+        resp = client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["test"], "limit": cap},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["limit"] == cap
+        mock_store.asearch.assert_called_once()
+        assert mock_store.asearch.call_args.kwargs["limit"] == cap
+
+    def test_search_items_null_limit_uses_default(self, client: TestClient, mock_store: AsyncMock) -> None:
+        mock_store.asearch.return_value = []
+
+        resp = client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["test"], "limit": None},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["limit"] == 20
+        mock_store.asearch.assert_called_once()
+        assert mock_store.asearch.call_args.kwargs["limit"] == 20
+
+    def test_search_items_omitted_limit_honors_cap_below_default(
+        self, client: TestClient, mock_store: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings.app, "MAX_SEARCH_LIMIT", 10)
+        mock_store.asearch.return_value = []
+
+        resp = client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["test"], "query": None},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["limit"] == 10
+        mock_store.asearch.assert_called_once()
+        assert mock_store.asearch.call_args.kwargs["limit"] == 10
+
+    def test_search_items_null_limit_honors_cap_below_default(
+        self, client: TestClient, mock_store: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings.app, "MAX_SEARCH_LIMIT", 10)
+        mock_store.asearch.return_value = []
+
+        resp = client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["test"], "limit": None},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["limit"] == 10
+        mock_store.asearch.assert_called_once()
+        assert mock_store.asearch.call_args.kwargs["limit"] == 10
+
+    def test_search_items_returns_422_when_limit_exceeds_cap(self, client: TestClient, mock_store: AsyncMock) -> None:
+        """limit above MAX_SEARCH_LIMIT is rejected before the store query."""
+        cap = settings.app.MAX_SEARCH_LIMIT
+        resp = client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["test"], "limit": cap + 1},
+        )
+
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert any(
+            error.get("loc") == ["body", "limit"]
+            and error.get("type") == "less_than_equal"
+            and error.get("ctx", {}).get("le") == cap
+            for error in detail
+        )
+        mock_store.asearch.assert_not_called()
+
+    @pytest.mark.parametrize("limit", [0, -1])
+    def test_search_items_returns_422_when_limit_is_zero_or_negative(
+        self, client: TestClient, mock_store: AsyncMock, limit: int
+    ) -> None:
+        resp = client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["test"], "limit": limit},
+        )
+
+        assert resp.status_code == 422
+        assert "limit" in resp.text
+        mock_store.asearch.assert_not_called()
+
+    @pytest.mark.parametrize("limit", ["abc", [], {}, 20.5])
+    def test_search_items_returns_422_when_limit_is_not_an_integer(
+        self, client: TestClient, mock_store: AsyncMock, limit: object
+    ) -> None:
+        resp = client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["test"], "limit": limit},
+        )
+
+        assert resp.status_code == 422
+        assert "limit" in resp.text
+        mock_store.asearch.assert_not_called()
 
     def test_search_items_with_auth_handler_filter_merge(self, client, mock_store):
         """Test that auth handler filters are merged with request filters"""
@@ -594,6 +761,184 @@ class TestNamespaceScoping:
         call_args = mock_store.aget.call_args
         namespace = call_args[0][0]  # First positional arg
         assert "users" in namespace or "test-user" in namespace
+
+    def test_put_cross_user_namespace_is_remapped(self, client, mock_store) -> None:
+        """Test that a cross-user namespace is scoped under the caller's prefix"""
+        resp = client.put(
+            "/store/items",
+            json={
+                "namespace": ["users", "other-user", "secrets"],
+                "key": "stolen",
+                "value": {"data": "nope"},
+            },
+        )
+
+        assert resp.status_code == 204
+        call_args = mock_store.aput.call_args
+        namespace = call_args.kwargs["namespace"]
+        assert namespace == ("users", "test-user", "users", "other-user", "secrets")
+
+    def test_get_cross_user_namespace_is_remapped(self, client, mock_store) -> None:
+        """Test that reading from another user's namespace is remapped"""
+        mock_store.aget.return_value = None
+
+        resp = client.get("/store/items?key=secret&namespace=users&namespace=other-user&namespace=data")
+
+        assert resp.status_code == 404
+        call_args = mock_store.aget.call_args
+        namespace = call_args[0][0]
+        assert namespace == ("users", "test-user", "users", "other-user", "data")
+
+    def test_delete_cross_user_namespace_is_remapped(self, client, mock_store) -> None:
+        """Test that deleting from another user's namespace is remapped"""
+        resp = client.request(
+            "DELETE",
+            "/store/items",
+            json={
+                "namespace": ["users", "other-user"],
+                "key": "victim-key",
+            },
+        )
+
+        assert resp.status_code == 204
+        call_args = mock_store.adelete.call_args
+        namespace = call_args[0][0]
+        assert namespace == ("users", "test-user", "users", "other-user")
+
+    def test_search_cross_user_namespace_is_remapped(self, client, mock_store) -> None:
+        """Test that searching another user's namespace is remapped"""
+        mock_store.asearch.return_value = []
+
+        resp = client.post(
+            "/store/items/search",
+            json={
+                "namespace_prefix": ["users", "other-user", "docs"],
+            },
+        )
+
+        assert resp.status_code == 200
+        call_args = mock_store.asearch.call_args
+        namespace_prefix = call_args[0][0]
+        assert namespace_prefix == ("users", "test-user", "users", "other-user", "docs")
+
+
+class TestConfiguredScopeIntegration:
+    """A configured store.scopes entry maps a namespace prefix to User attributes"""
+
+    @pytest.fixture(autouse=True)
+    def _org_scope(self, monkeypatch) -> None:
+        """Configure the "orgs" -> [org_id] scope for every test in this class."""
+        from aegra_api.api import store as store_module
+
+        monkeypatch.setattr(store_module, "_scope_attr_map", lambda: {"orgs": ["org_id"]})
+
+    def test_put_org_namespace_scopes_to_org(self, client, mock_store) -> None:
+        """A fully-qualified org namespace passes through to the org scope."""
+        resp = client.put(
+            "/store/items",
+            json={
+                "namespace": ["orgs", "org-1", "shared-prompts"],
+                "key": "greeting",
+                "value": {"text": "hi"},
+            },
+        )
+
+        assert resp.status_code == 204
+        assert mock_store.aput.call_args.kwargs["namespace"] == ("orgs", "org-1", "shared-prompts")
+
+    def test_get_org_namespace_scopes_to_org(self, client, mock_store) -> None:
+        """A GET under the org prefix reads from the caller's org scope."""
+        mock_store.aget.return_value = DummyStoreItem("greeting", {"text": "hi"}, ("orgs", "org-1"))
+
+        resp = client.get("/store/items?key=greeting&namespace=orgs&namespace=org-1")
+
+        assert resp.status_code == 200
+        assert mock_store.aget.call_args[0][0] == ("orgs", "org-1")
+
+    def test_search_org_namespace_scopes_to_org(self, client, mock_store) -> None:
+        """A search under the org prefix is scoped to the caller's org."""
+        mock_store.asearch.return_value = []
+
+        resp = client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["orgs", "org-1", "docs"]},
+        )
+
+        assert resp.status_code == 200
+        assert mock_store.asearch.call_args[0][0] == ("orgs", "org-1", "docs")
+
+    def test_other_org_namespace_is_buried(self, client, mock_store) -> None:
+        """A foreign org id never passes through — it is buried under the caller's org."""
+        resp = client.put(
+            "/store/items",
+            json={
+                "namespace": ["orgs", "victim-org", "secrets"],
+                "key": "stolen",
+                "value": {"data": "nope"},
+            },
+        )
+
+        assert resp.status_code == 204
+        assert mock_store.aput.call_args.kwargs["namespace"] == ("orgs", "org-1", "orgs", "victim-org", "secrets")
+
+    def test_org_prefix_without_org_membership_is_forbidden(self, client, mock_store) -> None:
+        """A user with no org_id using the "orgs" prefix gets 403."""
+        from aegra_api.core.auth_deps import get_current_user, require_auth
+        from aegra_api.models.auth import User
+
+        no_org_user = User(identity="test-user")
+        client.app.dependency_overrides[require_auth] = lambda: no_org_user
+        client.app.dependency_overrides[get_current_user] = lambda: no_org_user
+
+        resp = client.put(
+            "/store/items",
+            json={
+                "namespace": ["orgs", "shared-prompts"],
+                "key": "greeting",
+                "value": {"text": "hi"},
+            },
+        )
+
+        assert resp.status_code == 403
+        mock_store.aput.assert_not_called()
+
+    def test_fully_qualified_multi_attribute_namespace_passes_through(self, client, mock_store, monkeypatch) -> None:
+        """A namespace already under [prefix, *attr_values] passes through unchanged."""
+        from aegra_api.api import store as store_module
+        from aegra_api.core.auth_deps import get_current_user, require_auth
+        from aegra_api.models.auth import User
+
+        monkeypatch.setattr(store_module, "_scope_attr_map", lambda: {"teams": ["org_id", "team_id"]})
+        user = User(identity="test-user", org_id="org-1", team_id="team-42")
+        client.app.dependency_overrides[require_auth] = lambda: user
+        client.app.dependency_overrides[get_current_user] = lambda: user
+
+        resp = client.put(
+            "/store/items",
+            json={"namespace": ["teams", "org-1", "team-42", "kb"], "key": "greeting", "value": {"text": "hi"}},
+        )
+
+        assert resp.status_code == 204
+        assert mock_store.aput.call_args.kwargs["namespace"] == ("teams", "org-1", "team-42", "kb")
+
+    def test_multi_attribute_scope_buries_under_all_values(self, client, mock_store, monkeypatch) -> None:
+        """A scope listing several attributes partitions by each value, in order."""
+        from aegra_api.api import store as store_module
+        from aegra_api.core.auth_deps import get_current_user, require_auth
+        from aegra_api.models.auth import User
+
+        monkeypatch.setattr(store_module, "_scope_attr_map", lambda: {"teams": ["org_id", "team_id"]})
+        user = User(identity="test-user", org_id="org-1", team_id="team-42")
+        client.app.dependency_overrides[require_auth] = lambda: user
+        client.app.dependency_overrides[get_current_user] = lambda: user
+
+        resp = client.put(
+            "/store/items",
+            json={"namespace": ["teams", "kb"], "key": "greeting", "value": {"text": "hi"}},
+        )
+
+        assert resp.status_code == 204
+        assert mock_store.aput.call_args.kwargs["namespace"] == ("teams", "org-1", "team-42", "teams", "kb")
 
 
 class TestStoreIntegration:

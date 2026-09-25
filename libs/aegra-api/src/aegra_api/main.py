@@ -1,49 +1,59 @@
 """FastAPI application for Aegra (Agent Protocol Server)"""
 
-import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 import structlog
 from asgi_correlation_id import CorrelationIdMiddleware
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.dependencies.utils import get_parameterless_sub_dependant
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.routing import APIRoute, APIRouter
+from fastapi.routing import APIRoute
+from starlette.requests import HTTPConnection
 
+from aegra_api import __version__
 from aegra_api.api.assistants import router as assistants_router
+from aegra_api.api.crons import router as crons_router
+from aegra_api.api.event_streaming import router as event_streaming_router
 from aegra_api.api.runs import router as runs_router
 from aegra_api.api.stateless_runs import router as stateless_runs_router
 from aegra_api.api.store import router as store_router
 from aegra_api.api.threads import router as threads_router
-from aegra_api.config import HttpConfig, get_config_dir, load_http_config
+from aegra_api.config import CorsConfig, HttpConfig, get_config_dir, load_http_config
 from aegra_api.core.app_loader import load_custom_app
-from aegra_api.core.auth_deps import auth_dependency
+from aegra_api.core.auth_deps import require_auth
+from aegra_api.core.auth_enforcement import apply_auth_enforcement
 from aegra_api.core.database import db_manager
 from aegra_api.core.health import router as health_router
 from aegra_api.core.migrations import run_migrations_async
+from aegra_api.core.redis_manager import redis_manager
 from aegra_api.core.route_merger import (
     merge_exception_handlers,
     merge_lifespans,
 )
 from aegra_api.middleware import ContentTypeFixMiddleware, StructLogMiddleware
 from aegra_api.models.errors import AgentProtocolError, get_error_type
+from aegra_api.observability.metrics import setup_prometheus_metrics
 from aegra_api.observability.setup import setup_observability
-from aegra_api.services.event_store import event_store
+from aegra_api.services.broker import broker_manager
+from aegra_api.services.cron_scheduler import cron_scheduler
+from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
+from aegra_api.services.lease_reaper import lease_reaper
+from aegra_api.services.thread_ttl import get_thread_ttl_config, thread_ttl_sweeper
 from aegra_api.settings import settings
 from aegra_api.utils.setup_logging import setup_logging
-
-# Task management for run cancellation
-active_runs: dict[str, asyncio.Task] = {}
 
 OPENAPI_TAGS: list[dict[str, Any]] = [
     {"name": "Assistants", "description": "A configured instance of a graph."},
     {"name": "Threads", "description": "Accumulated state and outputs from a group of runs."},
     {"name": "Thread Runs", "description": "Invoke a graph on a thread, updating its persistent state."},
     {"name": "Stateless Runs", "description": "Invoke a graph without state or memory persistence."},
+    {"name": "Crons", "description": "Scheduled recurring runs on a cron schedule."},
     {"name": "Store", "description": "Persistent key-value and semantic storage available from any thread."},
+    {"name": "Event Streaming", "description": "Agent Protocol v2 thread event streaming and commands."},
     {"name": "Health", "description": "Server health checks and service information."},
 ]
 
@@ -73,12 +83,16 @@ def _log_connection_help(error: Exception) -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan context manager for startup/shutdown"""
-    # Auto-apply pending database migrations before anything else
-    try:
-        await run_migrations_async()
-    except (ConnectionRefusedError, OSError) as e:
-        _log_connection_help(e)
-        raise
+    # Multi-pod K8s: set RUN_MIGRATIONS_ON_STARTUP=false + run `aegra db upgrade`
+    # out-of-band. See docs/guides/deployment.mdx.
+    if settings.app.RUN_MIGRATIONS_ON_STARTUP:
+        try:
+            await run_migrations_async()
+        except (ConnectionRefusedError, OSError) as e:
+            _log_connection_help(e)
+            raise
+    else:
+        logger.info("skipping startup migrations (RUN_MIGRATIONS_ON_STARTUP=false)")
 
     # Startup: Initialize database and LangGraph components
     try:
@@ -94,18 +108,60 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     langgraph_service = get_langgraph_service()
     await langgraph_service.initialize()
 
-    # Initialize event store cleanup task
-    await event_store.start_cleanup_task()
+    # Initialize Redis broker (if enabled)
+    if settings.redis.REDIS_BROKER_ENABLED:
+        try:
+            await redis_manager.initialize()
+        except (ConnectionError, OSError) as e:
+            logger.error(
+                "Cannot connect to Redis. "
+                "Set REDIS_BROKER_ENABLED=false for single-instance mode without Redis, "
+                "or ensure Redis is running at REDIS_URL.",
+                redis_url=settings.redis.REDIS_URL,
+                error=str(e),
+            )
+            raise
+    else:
+        logger.warning(
+            "Running without Redis broker. Background runs have no crash recovery "
+            "or horizontal scaling. Set REDIS_BROKER_ENABLED=true and configure "
+            "REDIS_URL for production use.",
+        )
+
+    # Start broker manager (cleanup task for in-memory, cancel listener for Redis)
+    await broker_manager.start()
+
+    # Start executor (spawns worker coroutines when Redis is enabled)
+    await executor.start()
+
+    # Start lease reaper (recovers crashed worker runs, Redis mode only)
+    if settings.redis.REDIS_BROKER_ENABLED:
+        await lease_reaper.start()
+
+    # Start cron scheduler (fires due cron jobs)
+    if settings.cron.CRON_ENABLED:
+        await cron_scheduler.start()
+
+    # Start thread TTL sweeper (deletes/compacts expired threads); resolving
+    # the config here also fails fast on an invalid retention policy.
+    if get_thread_ttl_config() is not None:
+        await thread_ttl_sweeper.start()
 
     yield
 
-    # Shutdown: Clean up connections and cancel active runs
-    for task in active_runs.values():
-        if not task.done():
-            task.cancel()
+    # Shutdown order: ttl sweeper → cron → reaper → executor (drains jobs) → broker → Redis → DB
+    if get_thread_ttl_config() is not None:
+        await thread_ttl_sweeper.stop()
+    if settings.cron.CRON_ENABLED:
+        await cron_scheduler.stop()
+    if settings.redis.REDIS_BROKER_ENABLED:
+        await lease_reaper.stop()
+    await executor.stop()
+    await broker_manager.stop()
 
-    # Stop event store cleanup task
-    await event_store.stop_cleanup_task()
+    # Close Redis broker (if enabled)
+    if settings.redis.REDIS_BROKER_ENABLED:
+        await redis_manager.close()
 
     await db_manager.close()
 
@@ -130,7 +186,7 @@ async def general_exception_handler(_request: Request, exc: Exception) -> JSONRe
         content=AgentProtocolError(
             error="internal_error",
             message="An unexpected error occurred",
-            details={"exception": str(exc)},
+            details=None,  # FIX: do not leak internal exception details
         ).model_dump(),
     )
 
@@ -146,47 +202,91 @@ async def root_handler() -> dict[str, str]:
     """Root endpoint"""
     return {
         "message": settings.app.PROJECT_NAME,
-        "version": settings.app.VERSION,
+        "version": __version__,
         "status": "running",
     }
 
 
-def _apply_auth_to_routes(app: FastAPI, auth_deps: list[Any]) -> None:
-    """Apply auth dependency to all existing routes in the FastAPI app.
+async def _require_auth_on_http(connection: HTTPConnection) -> None:
+    """``require_auth`` for custom routes; websocket routes under an included router pass through."""
+    # An included router's dependencies reach its websockets too, and a Request-typed
+    # dependency there fails every connection with a TypeError.
+    if isinstance(connection, Request):
+        await require_auth(connection)
 
-    This function recursively processes all routes including nested routers,
-    adding the auth dependency to each route that doesn't already have it.
-    Auth dependencies are prepended to ensure they run first (fail-fast).
 
-    Args:
-        app: FastAPI application instance
-        auth_deps: List of dependencies to apply (e.g., [Depends(require_auth)])
+CUSTOM_ROUTE_AUTH = [Depends(_require_auth_on_http)]
+
+
+def _apply_auth_to_custom_routes(app: FastAPI, auth_deps: list[Any]) -> int:
+    """Prepend ``auth_deps`` to every FastAPI route the custom app declares.
+
+    Must run before the core routers are included: health checks and the root
+    stay public, and protocol routes carry their own auth. Returns the number
+    of routes protected.
     """
+    fastapi_pages = {app.openapi_url, app.docs_url, app.redoc_url, app.swagger_ui_oauth2_redirect_url}
+    protected = 0
+    uncovered: list[str] = []
 
-    def process_routes(routes: list) -> None:
-        """Recursively process routes and nested routers."""
+    def walk(routes: list[Any], context_changed: bool | None) -> None:
+        """``context_changed`` is None outside an included router, else whether its context got ``auth_deps``."""
+        nonlocal protected
         for route in routes:
             if isinstance(route, APIRoute):
-                # Add auth dependency if not already present
-                existing_deps = list(route.dependencies or [])
-                # Check if auth dependency is already present
-                auth_dep_ids = {id(dep) for dep in auth_deps}
-                existing_dep_ids = {id(dep) for dep in existing_deps}
-                if not auth_dep_ids.intersection(existing_dep_ids):
-                    # Prepend auth deps so they run first (fail-fast)
-                    route.dependencies = auth_deps + existing_deps
-            elif isinstance(route, APIRouter):
-                # Process nested router
-                process_routes(route.routes)
-            elif hasattr(route, "routes"):
-                # Handle other route types that have nested routes
-                process_routes(route.routes)
+                if context_changed is None:
+                    protected += _prepend_dependencies(route, auth_deps)
+                else:
+                    protected += int(context_changed)
+                continue
+            # FastAPI wraps included routers; newer versions expose the wrapped
+            # router as `original_router` rather than `routes`.
+            nested = getattr(route, "original_router", None)
+            if nested is not None:
+                changed = _prepend_to_include_context(route, auth_deps) if context_changed is None else context_changed
+                walk(list(nested.routes), changed)
+                # Effective routes are cached until the wrapped router reports a change; a
+                # schema built at import would otherwise keep serving them unauthenticated.
+                getattr(nested, "_mark_routes_changed", lambda: None)()
+            elif getattr(route, "routes", None):
+                # A mounted app's routes never inherit an include context.
+                walk(list(route.routes), None)
+            elif getattr(route, "path", None) not in fastapi_pages:
+                uncovered.append(getattr(route, "path", repr(route)))
 
-    process_routes(app.routes)
-    logger.info("Applied authentication dependency to custom routes")
+    walk(list(app.routes), None)
+    logger.info("Applied authentication dependency to custom routes", route_count=protected)
+    if uncovered:
+        # Plain Starlette routes and mounted non-FastAPI apps take no dependency, and
+        # websockets are skipped by `_require_auth_on_http`; say so rather than imply cover.
+        logger.warning("enable_custom_route_auth does not cover these custom routes", paths=uncovered)
+    return protected
 
 
-def _add_cors_middleware(app: FastAPI, cors_config: dict[str, Any] | None) -> None:
+def _prepend_to_include_context(included: Any, deps: list[Any]) -> bool:
+    """Put ``deps`` ahead of an included router's app- and include-level dependencies, once."""
+    # On FastAPI >= 0.137 those run before every route's own list, so prepending
+    # to the route alone would let them execute for unauthenticated requests.
+    context = included.include_context
+    if any(dep in context.dependencies for dep in deps):
+        return False
+    context.dependencies = [*deps, *context.dependencies]
+    return True
+
+
+def _prepend_dependencies(route: APIRoute, deps: list[Any]) -> int:
+    """Prepend ``deps`` to one route, once. Returns 1 if the route changed."""
+    if any(dep in route.dependencies for dep in deps):
+        return 0
+    route.dependencies = [*deps, *route.dependencies]
+    # `dependencies` alone is only read at construction time; mirror what
+    # APIRoute.__init__ does so the already-built dependant picks it up.
+    for dep in reversed(deps):
+        route.dependant.dependencies.insert(0, get_parameterless_sub_dependant(depends=dep, path=route.path_format))
+    return 1
+
+
+def _add_cors_middleware(app: FastAPI, cors_config: CorsConfig | None) -> None:
     """Add CORS middleware with config or defaults.
 
     When ``allow_origins`` is ``["*"]`` (the default), ``allow_credentials``
@@ -224,7 +324,7 @@ def _add_cors_middleware(app: FastAPI, cors_config: dict[str, Any] | None) -> No
         )
 
 
-def _add_common_middleware(app: FastAPI, cors_config: dict[str, Any] | None) -> None:
+def _add_common_middleware(app: FastAPI, cors_config: CorsConfig | None) -> None:
     """Add common middleware stack in correct order.
 
     Middleware runs in reverse registration order, so we register:
@@ -252,7 +352,8 @@ def _include_core_routers(app: FastAPI) -> None:
     3. Threads (with auth)
     4. Runs (with auth)
     5. Stateless Runs (with auth)
-    6. Store (with auth)
+    6. Crons (with auth)
+    7. Store (with auth)
 
     Args:
         app: FastAPI application instance
@@ -262,7 +363,13 @@ def _include_core_routers(app: FastAPI) -> None:
     app.include_router(threads_router)
     app.include_router(runs_router)
     app.include_router(stateless_runs_router)
+    app.include_router(crons_router)
     app.include_router(store_router)
+    app.include_router(event_streaming_router)
+
+    # Attach @auth.on dispatch from the route registry. Routes must opt out
+    # explicitly; forgetting the in-body call no longer disables authorization.
+    apply_auth_enforcement(app)
 
 
 def create_app() -> FastAPI:
@@ -272,7 +379,7 @@ def create_app() -> FastAPI:
         Configured FastAPI application instance
     """
     http_config: HttpConfig | None = load_http_config()
-    cors_config = http_config.get("cors") if http_config else None
+    cors_config: CorsConfig | None = http_config.get("cors") if http_config else None
 
     # Try to load custom app if configured
     user_app = None
@@ -292,6 +399,8 @@ def create_app() -> FastAPI:
             )
 
         application = user_app
+        if http_config and http_config.get("enable_custom_route_auth", False):
+            _apply_auth_to_custom_routes(application, CUSTOM_ROUTE_AUTH)
         if not application.openapi_tags:
             application.openapi_tags = OPENAPI_TAGS
         _include_core_routers(application)
@@ -303,10 +412,6 @@ def create_app() -> FastAPI:
         application = merge_lifespans(application, lifespan)
         application = merge_exception_handlers(application, exception_handlers)
         _add_common_middleware(application, cors_config)
-
-        # Apply auth to custom routes if enabled
-        if http_config and http_config.get("enable_custom_route_auth", False):
-            _apply_auth_to_routes(application, auth_dependency)
     else:
         application = FastAPI(
             title=settings.app.PROJECT_NAME,
@@ -326,6 +431,8 @@ def create_app() -> FastAPI:
             application.exception_handler(exc_type)(handler)
 
         application.get("/")(root_handler)
+
+    setup_prometheus_metrics(application)
 
     return application
 

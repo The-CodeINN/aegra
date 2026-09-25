@@ -73,6 +73,13 @@ class LangGraphAuthBackend(AuthenticationBackend):
 
     def __init__(self) -> None:
         self.auth_instance = self._load_auth_instance()
+        if self.auth_instance is None:
+            logger.warning(
+                "No auth file configured — all requests share a single 'anonymous' identity. "
+                "Data is NOT isolated between users in this mode. "
+                "Configure 'auth.path' in aegra.json before serving multiple users. "
+                "See: https://docs.aegra.dev/guides/authentication"
+            )
 
     def _load_auth_instance(self) -> Auth | None:
         """Load the auth instance from config or fallback to hardcoded candidates.
@@ -224,8 +231,11 @@ class LangGraphAuthBackend(AuthenticationBackend):
         # Default to noop (anonymous) authentication when no auth file is found,
         # regardless of AUTH_TYPE setting. This ensures the server works out-of-the-box.
         if self.auth_instance is None:
+            # The no-auth warning is emitted once at startup in __init__;
+            # logging here would repeat it on every request.
             logger.debug("No auth file configured, defaulting to noop (anonymous) authentication")
-            # Return anonymous user when no auth is configured
+            # Return anonymous user when no auth is configured.
+            # WARNING: all callers share this identity; no tenant isolation is enforced.
             user_data: Auth.types.MinimalUserDict = {
                 "identity": "anonymous",
                 "display_name": "Anonymous User",
@@ -276,9 +286,12 @@ class LangGraphAuthBackend(AuthenticationBackend):
             raise AuthenticationError("Authentication system error") from e
 
 
+@functools.lru_cache(maxsize=1)
 def get_auth_backend() -> AuthenticationBackend:
     """
     Get authentication backend based on AUTH_TYPE environment variable.
+
+    Cached so the auth module is loaded once at first use, not per-request.
 
     Returns:
         AuthenticationBackend instance
@@ -316,16 +329,20 @@ def on_auth_error(conn: HTTPConnection, exc: AuthenticationError) -> JSONRespons
     )
 
 
-@functools.lru_cache(maxsize=1)
 def get_auth_instance() -> Auth | None:
-    """Get cached Auth instance for use by other modules.
+    """Get the Auth instance from the cached backend.
 
-    Uses LRU cache to ensure only one Auth instance is loaded per process.
-    This allows other modules to access the same Auth instance used by
-    the middleware without re-loading it.
+    Delegates to get_auth_backend() so only one Auth instance exists
+    per process.
 
     Returns:
         Auth instance or None if not configured/found
     """
-    backend = LangGraphAuthBackend()
-    return backend.auth_instance
+    backend = get_auth_backend()
+    if isinstance(backend, LangGraphAuthBackend):
+        return backend.auth_instance
+    logger.warning(
+        "get_auth_instance() called but backend is not LangGraphAuthBackend: %s",
+        type(backend).__name__,
+    )
+    return None

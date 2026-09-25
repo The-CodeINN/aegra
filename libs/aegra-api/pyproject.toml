@@ -1,6 +1,6 @@
 [project]
 name = "aegra-api"
-version = "0.8.3"
+version = "0.10.6"
 description = "Aegra core API - Self-hosted Agent Protocol server"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -19,9 +19,11 @@ classifiers = [
 dependencies = [
     # Core
     "fastapi>=0.110.1",
-    "uvicorn>=0.35.0",
+    # >=0.36.0: --loop accepts import strings (Windows selector loop, #513)
+    "uvicorn>=0.36.0",
     "pydantic>=2.11.7",
-    "pydantic-settings>=2.12.0",
+    "pydantic-settings>=2.14.2",
+    "sse-starlette>=3.3.4,<4.0.0",
 
     # LangGraph
     "langgraph>=1.0.3",
@@ -41,16 +43,27 @@ dependencies = [
     "opentelemetry-exporter-otlp>=1.39.1",
     "openinference-instrumentation-langchain>=0.1.58",
 
+    # Metrics
+    # >=8.0.2: 7.x reads route.path on FastAPI >=0.137's _IncludedRouter (which has
+    # no .path), 500ing every request when metrics are on. 8.0.2 handles the new tree.
+    "prometheus-fastapi-instrumentator>=8.0.2",
+
     # Utils
     "structlog>=25.4.0",
     "asgi-correlation-id>=4.3.4",
+
+    # Redis (optional broker backend for multi-instance streaming)
+    "redis[hiredis]>=5.0.0",
+
+    # Cron expression parsing
+    "croniter>=6.0.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/ibbybuilds/aegra"
-Documentation = "https://github.com/ibbybuilds/aegra#readme"
-Repository = "https://github.com/ibbybuilds/aegra"
-Issues = "https://github.com/ibbybuilds/aegra/issues"
+Homepage = "https://github.com/aegra/aegra"
+Documentation = "https://github.com/aegra/aegra#readme"
+Repository = "https://github.com/aegra/aegra"
+Issues = "https://github.com/aegra/aegra/issues"
 
 [build-system]
 requires = ["hatchling"]
@@ -66,6 +79,11 @@ packages = ["src/aegra_api"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+
+[tool.ruff.format]
+# This package's [tool.ruff] overrides the root config for files beneath it, so
+# the markdown exclusion has to be repeated here. See the root pyproject.toml.
+exclude = ["**/*.md"]
 
 [tool.ruff.lint]
 select = [
@@ -98,6 +116,8 @@ testpaths = ["tests"]
 markers = [
     "unit: unit tests",
     "e2e: end-to-end tests requiring a running server",
+    "prod_only: tests that require Redis workers (skipped in dev mode)",
+    "auth_only: tests that require an auth-enabled server (run with -m auth_only)",
 ]
 
 [dependency-groups]
@@ -106,11 +126,11 @@ dev = [
     "pytest-asyncio>=1.3.0",
     "pytest-mock>=3.15.1",
     "pytest-cov>=6.0.0",
-    "ruff>=0.13.0",
+    "ruff>=0.16.0",
     "ty>=0.0.17,<0.1.0",
     "bandit>=1.8.0",
     "pre-commit>=4.0.1",
-    "langchain-openai>=1.0.3",
-    "langchain>=1.0.0",
+    "langchain-openai>=1.1.14",
+    "langchain>=1.3.9",
     "langchain-mcp-adapters>=0.1.0",
 ]

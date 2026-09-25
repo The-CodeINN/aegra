@@ -3,7 +3,7 @@ import pytest
 from aegra_api.settings import settings
 
 # Match import style used by other e2e tests when run as top-level modules
-from tests.e2e._utils import check_and_skip_if_geo_blocked, elog, get_e2e_client
+from tests.e2e._utils import await_terminal_run, check_and_skip_if_geo_blocked, elog, get_e2e_client
 
 
 @pytest.mark.e2e
@@ -152,10 +152,13 @@ async def test_runs_cancel_e2e():
     # It might have failed in background
     check_and_skip_if_geo_blocked(patched)
 
-    assert patched["status"] in ("interrupted", "success")
+    # A live worker finalizes the run itself, so the immediate response may
+    # still be non-terminal. Only the settled state below is guaranteed.
+    assert patched["status"] in ("pending", "running", "interrupted", "success", "error")
 
-    # Verify final state
-    got = await client.runs.get(thread_id, run_id)
+    # Verify final state, polling because cancellation of a live-owned run settles
+    # asynchronously.
+    got = await await_terminal_run(client, thread_id, run_id)
     elog("Runs.get(post-cancel)", got)
     assert got["status"] in ("interrupted", "error", "success")
 
@@ -292,6 +295,12 @@ async def test_runs_wait_with_interrupts_e2e():
         last_run = runs_list[0]
 
         check_and_skip_if_geo_blocked(last_run)
+
+        # The wait response can return before the run row leaves "running"
+        # (the status write races the HTTP response). Join blocks until the
+        # run reaches a terminal state, then re-read to get the settled status.
+        await client.runs.join(thread_id, last_run["run_id"])
+        last_run = (await client.runs.list(thread_id))[0]
 
         # Status can be interrupted or success depending on graph structure
         assert last_run["status"] in ("interrupted", "success"), (

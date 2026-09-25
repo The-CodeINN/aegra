@@ -6,10 +6,20 @@ from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from redis import RedisError
 
-from aegra_api.api.runs import _resolve_context, create_run, get_run, join_run, list_runs, update_run
+from aegra_api.api.runs import (
+    _apply_create_run_auth,
+    _request_run_interruption,
+    create_run,
+    get_run,
+    join_run,
+    list_runs,
+    update_run,
+)
 from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Run as RunORM
+from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.models import Run, RunCreate, RunStatus, User
 
 
@@ -26,6 +36,17 @@ class TestRunsEndpoints:
         session.refresh = AsyncMock()
         session.add = MagicMock()  # session.add is synchronous
         return session
+
+    @pytest.fixture
+    def sample_thread(self) -> ThreadORM:
+        return ThreadORM(
+            thread_id="test-thread-123",
+            user_id="test-user",
+            status="idle",
+            metadata_json={},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
 
     @pytest.fixture
     def sample_assistant(self) -> AssistantORM:
@@ -54,23 +75,25 @@ class TestRunsEndpoints:
 
         # Mock dependencies
         with (
-            patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
-            patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
+            patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch(
-                "aegra_api.api.runs.resolve_assistant_id",
+                "aegra_api.services.run_preparation.resolve_assistant_id",
                 return_value="test-assistant",
             ),
-            patch("aegra_api.api.runs.update_thread_metadata", new_callable=AsyncMock),
-            patch("aegra_api.api.runs.set_thread_status", new_callable=AsyncMock),
-            patch("aegra_api.api.runs.uuid4", return_value=run_id),
-            patch("aegra_api.api.runs.asyncio.create_task") as mock_create_task,
+            patch("aegra_api.services.run_preparation.update_thread_metadata", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.set_thread_status", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.uuid4", return_value=run_id),
+            patch(
+                "aegra_api.services.run_preparation.executor.submit",
+                new_callable=AsyncMock,
+            ) as mock_submit,
             patch("aegra_api.api.runs.active_runs", {}),
-            patch("aegra_api.api.runs.execute_run_async", new_callable=MagicMock),
         ):
             mock_lg_service.return_value.list_graphs.return_value = ["test-graph"]
 
-            # DB setup
-            mock_session.scalar.return_value = sample_assistant
+            # DB setup: first scalar = thread ownership check (None = new thread), second = assistant
+            mock_session.scalar.side_effect = [None, sample_assistant]
 
             result = await create_run(thread_id, request, mock_user, mock_session)
 
@@ -85,24 +108,26 @@ class TestRunsEndpoints:
             mock_session.add.assert_called_once()
             mock_session.commit.assert_called_once()
 
-            # Verify background task creation
-            mock_create_task.assert_called_once()
+            # Verify background execution submission
+            mock_submit.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_create_run_assistant_not_found(self, mock_user: User, mock_session: AsyncMock) -> None:
+    async def test_create_run_assistant_not_found(
+        self, mock_user: User, mock_session: AsyncMock, sample_thread: ThreadORM
+    ) -> None:
         """Test creation with non-existent assistant."""
         thread_id = "test-thread-123"
         request = RunCreate(assistant_id="nonexistent", input={})
 
         with (
-            patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
-            patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
-            patch("aegra_api.api.runs.resolve_assistant_id", return_value="nonexistent"),
+            patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
+            patch("aegra_api.services.run_preparation.resolve_assistant_id", return_value="nonexistent"),
         ):
             mock_lg_service.return_value.list_graphs.return_value = ["test-graph"]
 
-            # Return None for assistant lookup
-            mock_session.scalar.return_value = None
+            # First scalar call: thread ownership check (pass). Second: assistant lookup (None).
+            mock_session.scalar.side_effect = [sample_thread, None]
 
             with pytest.raises(HTTPException) as exc:
                 await create_run(thread_id, request, mock_user, mock_session)
@@ -119,17 +144,17 @@ class TestRunsEndpoints:
         request = RunCreate(assistant_id="test-assistant", input={})
 
         with (
-            patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
-            patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
+            patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch(
-                "aegra_api.api.runs.resolve_assistant_id",
+                "aegra_api.services.run_preparation.resolve_assistant_id",
                 return_value="test-assistant",
             ),
         ):
             # Graph not in available graphs
             mock_lg_service.return_value.list_graphs.return_value = ["other-graph"]
 
-            mock_session.scalar.return_value = sample_assistant
+            mock_session.scalar.side_effect = [None, sample_assistant]
 
             with pytest.raises(HTTPException) as exc:
                 await create_run(thread_id, request, mock_user, mock_session)
@@ -138,7 +163,9 @@ class TestRunsEndpoints:
             assert "Graph" in str(exc.value.detail)
 
     @pytest.mark.asyncio
-    async def test_create_run_config_context_allowed(self, mock_user: User, mock_session: AsyncMock) -> None:
+    async def test_create_run_config_context_allowed(
+        self, mock_user: User, mock_session: AsyncMock, sample_thread: ThreadORM
+    ) -> None:
         """Test both configurable and context are accepted."""
         thread_id = "test-thread-123"
         request = RunCreate(
@@ -149,15 +176,16 @@ class TestRunsEndpoints:
         )
 
         with (
-            patch("aegra_api.api.runs._validate_resume_command", new_callable=AsyncMock),
-            patch("aegra_api.api.runs.get_langgraph_service") as mock_lg_service,
+            patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch(
-                "aegra_api.api.runs.resolve_assistant_id",
+                "aegra_api.services.run_preparation.resolve_assistant_id",
                 return_value="test-assistant",
             ),
         ):
             mock_lg_service.return_value.list_graphs.return_value = ["test-graph"]
-            mock_session.scalar.return_value = None
+            # First scalar call: thread ownership check (pass). Second: assistant lookup (None).
+            mock_session.scalar.side_effect = [sample_thread, None]
 
             with pytest.raises(HTTPException) as exc:
                 await create_run(thread_id, request, mock_user, mock_session)
@@ -254,13 +282,19 @@ class TestRunsEndpoints:
             updated_at=datetime.now(UTC),
         )
 
-        # scalar called twice: first to find for update, second to return
-        mock_session.scalar.side_effect = [run_orm, run_orm]
+        mock_session.scalar.return_value = run_orm
 
-        with patch(
-            "aegra_api.api.runs.streaming_service.interrupt_run",
-            new_callable=AsyncMock,
-        ) as mock_interrupt:
+        with (
+            patch(
+                "aegra_api.api.runs.interrupt_unowned_run",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as mock_reconcile,
+            patch(
+                "aegra_api.api.runs.streaming_service.interrupt_run",
+                new_callable=AsyncMock,
+            ) as mock_interrupt,
+        ):
             result = await update_run(
                 thread_id,
                 run_id,
@@ -269,10 +303,154 @@ class TestRunsEndpoints:
                 mock_session,
             )
 
+            mock_reconcile.assert_awaited_once_with(mock_session, run_id, thread_id, user_id=mock_user.identity)
             mock_interrupt.assert_called_once_with(run_id)
-            mock_session.execute.assert_called_once()  # Update statement
-            mock_session.commit.assert_called_once()
+            mock_session.execute.assert_not_awaited()
+            mock_session.commit.assert_not_awaited()
             assert result.run_id == run_id
+
+    @pytest.mark.asyncio
+    async def test_update_run_does_not_overwrite_terminal_status(
+        self,
+        mock_user: User,
+        mock_session: AsyncMock,
+    ) -> None:
+        """A late interrupt request must leave a completed run unchanged."""
+        run_orm = RunORM(
+            run_id="run-123",
+            thread_id="test-thread",
+            assistant_id="agent",
+            user_id=mock_user.identity,
+            status="success",
+            input={},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        mock_session.scalar.return_value = run_orm
+
+        with (
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock) as mock_reconcile,
+            patch("aegra_api.api.runs.streaming_service.interrupt_run", new_callable=AsyncMock) as mock_interrupt,
+        ):
+            result = await update_run(
+                "test-thread",
+                "run-123",
+                RunStatus(run_id="run-123", status="interrupted"),
+                mock_user,
+                mock_session,
+            )
+
+        assert result.status == "success"
+        mock_reconcile.assert_not_awaited()
+        mock_interrupt.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_interruption_reconciles_unowned_run_before_it_starts(
+        self,
+        mock_session: AsyncMock,
+    ) -> None:
+        run_orm = RunORM(
+            run_id="run-123",
+            thread_id="test-thread",
+            assistant_id="agent",
+            user_id="test-user",
+            status="pending",
+            input={},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        with (
+            patch(
+                "aegra_api.api.runs.interrupt_unowned_run",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_reconcile,
+            patch(
+                "aegra_api.api.runs.streaming_service.cancel_run",
+                new_callable=AsyncMock,
+            ) as mock_cancel,
+            patch(
+                "aegra_api.api.runs.streaming_service.signal_run_cancelled",
+                new_callable=AsyncMock,
+            ) as mock_signal,
+        ):
+            await _request_run_interruption(mock_session, run_orm, "cancel")
+
+        mock_reconcile.assert_awaited_once_with(
+            mock_session,
+            run_orm.run_id,
+            run_orm.thread_id,
+            user_id=run_orm.user_id,
+        )
+        mock_cancel.assert_awaited_once_with(run_orm.run_id, emit_end_event=False)
+        mock_signal.assert_awaited_once_with(run_orm.run_id)
+
+    @pytest.mark.asyncio
+    async def test_reconciled_interrupt_uses_cooperative_stop(
+        self,
+        mock_session: AsyncMock,
+    ) -> None:
+        run_orm = RunORM(
+            run_id="run-123",
+            thread_id="test-thread",
+            assistant_id="agent",
+            user_id="test-user",
+            status="pending",
+            input={},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+
+        with (
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=True),
+            patch("aegra_api.api.runs.streaming_service.cancel_run", new_callable=AsyncMock) as mock_cancel,
+            patch(
+                "aegra_api.api.runs.streaming_service.interrupt_run",
+                new_callable=AsyncMock,
+            ) as mock_interrupt,
+            patch(
+                "aegra_api.api.runs.streaming_service.signal_run_cancelled",
+                new_callable=AsyncMock,
+            ) as mock_signal,
+        ):
+            await _request_run_interruption(mock_session, run_orm, "interrupt")
+
+        mock_interrupt.assert_awaited_once_with(run_orm.run_id, emit_end_event=False)
+        mock_cancel.assert_not_awaited()
+        mock_signal.assert_awaited_once_with(run_orm.run_id)
+
+    @pytest.mark.asyncio
+    async def test_reconciled_interruption_survives_terminal_signal_outage(
+        self,
+        mock_session: AsyncMock,
+    ) -> None:
+        run_orm = RunORM(
+            run_id="run-123",
+            thread_id="test-thread",
+            assistant_id="agent",
+            user_id="test-user",
+            status="pending",
+            input={},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+
+        with (
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=True),
+            patch(
+                "aegra_api.api.runs.streaming_service.cancel_run",
+                new_callable=AsyncMock,
+            ) as mock_cancel,
+            patch(
+                "aegra_api.api.runs.streaming_service.signal_run_cancelled",
+                new_callable=AsyncMock,
+                side_effect=RedisError("unavailable"),
+            ) as mock_signal,
+        ):
+            await _request_run_interruption(mock_session, run_orm, "cancel")
+
+        mock_cancel.assert_awaited_once_with(run_orm.run_id, emit_end_event=False)
+        mock_signal.assert_awaited_once_with(run_orm.run_id)
 
     @pytest.mark.asyncio
     async def test_update_run_not_found(self, mock_user: User, mock_session: AsyncMock) -> None:
@@ -292,7 +470,9 @@ class TestRunsEndpoints:
 
     @pytest.mark.asyncio
     async def test_join_run_terminal_state(self, mock_user: User, mock_session: AsyncMock) -> None:
-        """Test joining a completed run returns output immediately."""
+        """Test joining a completed run returns output immediately via StreamingResponse."""
+        import json
+
         run_orm = RunORM(
             run_id="run-1",
             thread_id="thread-1",
@@ -311,13 +491,20 @@ class TestRunsEndpoints:
         mock_maker = MagicMock(return_value=ctx)
 
         with patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker):
-            result = await join_run("thread-1", "run-1", mock_user)
+            response = await join_run("thread-1", "run-1", mock_user)
 
-        assert result == {"result": "done"}
+        # join_run now returns StreamingResponse; consume body to get JSON
+        assert response.media_type == "application/json"
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk if isinstance(chunk, bytes) else chunk.encode()
+        assert json.loads(body) == {"result": "done"}
 
     @pytest.mark.asyncio
     async def test_join_run_active_state(self, mock_user: User, mock_session: AsyncMock) -> None:
-        """Test joining an active run waits for completion."""
+        """Test joining an active run returns a StreamingResponse with heartbeat."""
+        from fastapi.responses import StreamingResponse
+
         # Setup run initially in running state
         run_orm_running = RunORM(
             run_id="run-1",
@@ -329,89 +516,86 @@ class TestRunsEndpoints:
             updated_at=datetime.now(UTC),
         )
 
-        # Then state after re-fetch (success)
-        run_orm_done = RunORM(
-            run_id="run-1",
-            thread_id="thread-1",
-            user_id=mock_user.identity,
-            status="success",
-            input={},
-            output={"result": "waited"},
-            created_at=datetime.now(UTC),
-            updated_at=datetime.now(UTC),
-        )
+        mock_session.scalar.return_value = run_orm_running
 
-        # Two separate sessions: first returns running, second returns done
-        mock_session_1 = AsyncMock()
-        mock_session_1.scalar.return_value = run_orm_running
-        mock_session_2 = AsyncMock()
-        mock_session_2.scalar.return_value = run_orm_done
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        mock_maker = MagicMock(return_value=ctx)
 
-        sessions_iter = iter([mock_session_1, mock_session_2])
-
-        def _make_ctx() -> MagicMock:
-            ctx = MagicMock()
-            ctx.__aenter__ = AsyncMock(side_effect=lambda: next(sessions_iter))
-            ctx.__aexit__ = AsyncMock(return_value=False)
-            return ctx
-
-        mock_maker = MagicMock(side_effect=lambda: _make_ctx())
-
-        # Mock active task
-        mock_task = AsyncMock()
+        # Mock executor and settings for the heartbeat body
         with (
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
-            patch("aegra_api.api.runs.active_runs", {"run-1": mock_task}),
-            patch("aegra_api.api.runs.asyncio.shield", side_effect=lambda t: t),
-            patch("aegra_api.api.runs.asyncio.wait_for", new_callable=AsyncMock) as mock_wait,
+            patch("aegra_api.services.run_waiters._get_session_maker", return_value=mock_maker),
+            patch("aegra_api.services.run_waiters.executor") as mock_executor,
+            patch("aegra_api.services.run_waiters.settings") as mock_settings,
         ):
-            result = await join_run("thread-1", "run-1", mock_user)
+            mock_executor.wait_for_completion = AsyncMock()
+            mock_settings.app.KEEPALIVE_INTERVAL_SECS = 5
+            mock_settings.worker.BG_JOB_TIMEOUT_SECS = 3600
 
-            mock_wait.assert_called_once()  # Should wait on task
-            assert result == {"result": "waited"}
+            response = await join_run("thread-1", "run-1", mock_user)
+
+        assert isinstance(response, StreamingResponse)
+        assert response.media_type == "application/json"
+        assert "Location" in response.headers
 
 
-class TestResolveContext:
-    """Unit tests for the _resolve_context helper."""
+# Note: _resolve_context was removed from runs.py during the worker architecture
+# refactor — context resolution is now handled in services/run_preparation.py.
+# The equivalent tests live in tests/unit/test_services/.
 
-    def test_returns_context_when_provided(self) -> None:
-        """When caller provides context, return it unchanged."""
-        config: dict = {"configurable": {"key": "val"}}
-        context = {"token": "secret"}
-        result = _resolve_context(config, context)
-        assert result == {"token": "secret"}
 
-    def test_derives_context_from_configurable_when_empty(self) -> None:
-        """When context is empty, fall back to a copy of configurable."""
-        config: dict = {"configurable": {"a": 1, "b": 2}}
-        result = _resolve_context(config, {})
-        assert result == {"a": 1, "b": 2}
+class TestApplyCreateRunAuth:
+    """Unit tests for the threads.create_run auth helper's config/context merge contract."""
 
-    def test_returns_empty_dict_when_both_empty(self) -> None:
-        """When both context and configurable are empty, return empty dict."""
-        result = _resolve_context({}, {})
-        assert result == {}
+    @pytest.fixture
+    def mock_user(self) -> User:
+        return User(identity="test-user", scopes=[])
 
-    def test_raises_422_when_configurable_not_a_mapping(self) -> None:
-        """Non-dict configurable must raise HTTPException with status 422."""
-        config: dict = {"configurable": ["not", "a", "dict"]}
-        with pytest.raises(HTTPException) as exc_info:
-            _resolve_context(config, {})
-        assert exc_info.value.status_code == 422
-        assert "configurable" in exc_info.value.detail
+    @pytest.mark.asyncio
+    async def test_empty_filter_dict_wins_over_value_mutations(self, mock_user: User) -> None:
+        """An explicit empty dict {} suppresses in-place value mutations.
 
-    def test_derived_context_is_a_copy(self) -> None:
-        """Modifying the returned dict must not mutate config.configurable."""
-        configurable: dict = {"x": 1}
-        config: dict = {"configurable": configurable}
-        result = _resolve_context(config, {})
-        result["x"] = 99
-        assert configurable["x"] == 1
+        Regression: ``filters if filters`` treated {} as falsy and fell back to
+        ``value``, applying in-place mutations despite the handler returning a dict.
+        """
+        request = RunCreate(assistant_id="a", input={}, config={"original": "kept"})
 
-    def test_context_not_mixed_with_configurable(self) -> None:
-        """Provided context should not be merged with configurable keys."""
-        config: dict = {"configurable": {"model": "gpt-4"}}
-        context = {"user_id": "alice"}
-        result = _resolve_context(config, context)
-        assert "model" not in result
-        assert result == {"user_id": "alice"}
+        def _handler(_ctx: object, value: dict) -> dict:
+            value["config"] = {"injected_via_value": True}
+            return {}
+
+        with patch("aegra_api.api.runs.handle_event", new_callable=AsyncMock, side_effect=_handler):
+            await _apply_create_run_auth(mock_user, "t", request)
+
+        assert request.config == {"original": "kept"}
+
+    @pytest.mark.asyncio
+    async def test_none_result_falls_back_to_value_mutations(self, mock_user: User) -> None:
+        """A handler returning None applies its in-place value mutations."""
+        request = RunCreate(assistant_id="a", input={}, config={"original": "kept"})
+
+        def _handler(_ctx: object, value: dict) -> None:
+            value["config"] = {"injected_via_value": True}
+            return None
+
+        with patch("aegra_api.api.runs.handle_event", new_callable=AsyncMock, side_effect=_handler):
+            await _apply_create_run_auth(mock_user, "t", request)
+
+        assert request.config == {"original": "kept", "injected_via_value": True}
+
+    @pytest.mark.asyncio
+    async def test_filter_dict_overrides_merge_into_request(self, mock_user: User) -> None:
+        """Config/context keys in the returned filter dict merge over the request."""
+        request = RunCreate(assistant_id="a", input={}, config={"original": "kept"})
+
+        with patch(
+            "aegra_api.api.runs.handle_event",
+            new_callable=AsyncMock,
+            return_value={"config": {"injected": True}, "context": {"injected_ctx": 2}},
+        ):
+            await _apply_create_run_auth(mock_user, "t", request)
+
+        assert request.config == {"original": "kept", "injected": True}
+        assert request.context == {"injected_ctx": 2}

@@ -1,16 +1,29 @@
 """Integration tests for threads CRUD operations"""
 
+import secrets
 from contextlib import asynccontextmanager
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from uuid import uuid4
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from langgraph.types import StateSnapshot
+from psycopg import Error as PsycopgError
+from sqlalchemy.dialects import postgresql
 
+from aegra_api.api import threads as threads_module
 from aegra_api.core.orm import get_session as core_get_session
+from aegra_api.settings import settings
 from tests.fixtures.clients import create_test_app, make_client
-from tests.fixtures.database import DummySessionBase, override_get_session_dep
-from tests.fixtures.session_fixtures import BasicSession, override_session_dependency
+from tests.fixtures.database import (
+    DummyScalarResult,
+    DummySessionBase,
+    apply_thread_metadata_merge,
+    override_get_session_dep,
+)
+from tests.fixtures.session_fixtures import BasicSession, ThreadSession, override_session_dependency
 from tests.fixtures.test_helpers import DummyRun, DummyThread
 
 
@@ -63,6 +76,25 @@ def _run_row(
     return DummyRun(run_id, thread_id, status, user_id)
 
 
+def _conflicting_app(app: FastAPI, incumbent: Any) -> FastAPI:
+    """Wire the app to a session whose INSERT conflicts.
+
+    ``incumbent`` is the row the follow-up read finds, or None to model a row
+    that was deleted between the conflict and the read.
+    """
+
+    class Session(DummySessionBase):
+        async def scalars(self, stmt: Any = None) -> DummyScalarResult:
+            # Insert hit a unique constraint, so RETURNING yields nothing.
+            return DummyScalarResult()
+
+        async def scalar(self, _stmt: Any) -> Any:
+            return incumbent
+
+    app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+    return app
+
+
 class TestCreateThread:
     """Test POST /threads endpoint"""
 
@@ -99,6 +131,38 @@ class TestCreateThread:
         assert "thread_id" in data
         assert data["status"] == "idle"
         assert data["metadata"]["thread_name"] == "Test Thread"
+
+    def test_create_thread_preserves_graph_id_from_metadata(self, client):
+        """Test that client-provided graph_id in metadata is preserved (fixes #254)."""
+        resp = client.post(
+            "/threads",
+            json={"metadata": {"graph_id": "agent"}},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["metadata"]["graph_id"] == "agent"
+
+    def test_create_thread_does_not_normalize_camel_case_graph_id(self, client):
+        """Thread metadata should stay server-canonical; JS SDK already sends snake_case on the wire."""
+        resp = client.post(
+            "/threads",
+            json={"metadata": {"graphId": "agent"}},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["metadata"]["graph_id"] is None
+        assert data["metadata"]["graphId"] == "agent"
+
+    def test_create_thread_snake_case_graph_id_takes_precedence(self, client):
+        """Canonical graph_id is preserved even if an unrelated camelCase key is also present."""
+        resp = client.post(
+            "/threads",
+            json={"metadata": {"graph_id": "snake", "graphId": "camel"}},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["metadata"]["graph_id"] == "snake"
+        assert data["metadata"]["graphId"] == "camel"
 
     def test_create_thread_empty_request(self, client):
         """Test creating a thread with empty request body"""
@@ -140,24 +204,39 @@ class TestCreateThread:
         data = resp.json()
         assert data["thread_id"] == custom_id
 
+    def test_create_thread_rejects_oversized_random_id(self, client: TestClient) -> None:
+        """Oversized ids 422 at validation; they must not reach Postgres btree."""
+        resp = client.post("/threads", json={"thread_id": secrets.token_hex(2500)})
+        assert resp.status_code == 422
+        assert "thread_id" in resp.text
+
+    def test_create_thread_rejects_empty_id(self, client: TestClient) -> None:
+        resp = client.post("/threads", json={"thread_id": ""})
+        assert resp.status_code == 422
+        assert "thread_id" in resp.text
+
+    def test_create_thread_rejects_blank_id(self, client: TestClient) -> None:
+        resp = client.post("/threads", json={"thread_id": "   "})
+        assert resp.status_code == 422
+        assert "thread_id" in resp.text
+
+    def test_create_thread_accepts_uuid(self, client: TestClient) -> None:
+        thread_id = str(uuid4())
+        resp = client.post("/threads", json={"thread_id": thread_id})
+        assert resp.status_code == 200
+        assert resp.json()["thread_id"] == thread_id
+
+    def test_create_thread_omitted_id_still_200(self, client: TestClient) -> None:
+        resp = client.post("/threads", json={})
+        assert resp.status_code == 200
+        assert resp.json()["thread_id"]
+
     def test_create_thread_if_exists_do_nothing(self):
         """Test ifExists='do_nothing' returns existing thread"""
         app = create_test_app(include_runs=False, include_threads=True)
 
         existing_thread = _thread_row("existing-thread-id", metadata={"original": True})
-
-        class Session(DummySessionBase):
-            call_count = 0
-
-            async def scalar(self, _stmt):
-                # First call is the existence check
-                Session.call_count += 1
-                if Session.call_count == 1:
-                    return existing_thread
-                return None
-
-        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
-        client = make_client(app)
+        client = make_client(_conflicting_app(app, existing_thread))
 
         # Try to create with same ID and ifExists='do_nothing'
         resp = client.post(
@@ -175,13 +254,7 @@ class TestCreateThread:
         app = create_test_app(include_runs=False, include_threads=True)
 
         existing_thread = _thread_row("conflict-thread-id")
-
-        class Session(DummySessionBase):
-            async def scalar(self, _stmt):
-                return existing_thread
-
-        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
-        client = make_client(app)
+        client = make_client(_conflicting_app(app, existing_thread))
 
         # Try to create with same ID (default ifExists='raise')
         resp = client.post("/threads", json={"threadId": "conflict-thread-id"})
@@ -193,18 +266,60 @@ class TestCreateThread:
         app = create_test_app(include_runs=False, include_threads=True)
 
         existing_thread = _thread_row("conflict-thread-id")
-
-        class Session(DummySessionBase):
-            async def scalar(self, _stmt):
-                return existing_thread
-
-        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
-        client = make_client(app)
+        client = make_client(_conflicting_app(app, existing_thread))
 
         # Explicitly set ifExists='raise'
         resp = client.post(
             "/threads",
             json={"threadId": "conflict-thread-id", "ifExists": "raise"},
+        )
+        assert resp.status_code == 409
+        assert "already exists" in resp.json()["detail"]
+
+    def test_create_thread_insert_is_atomic(self) -> None:
+        """Creation must arbitrate on thread_pkey, not on a preceding SELECT.
+
+        A SELECT-then-INSERT lets two concurrent creates for one thread_id both
+        miss the SELECT and then collide on the primary key, and the loser's
+        UniqueViolationError surfaces as a 500 instead of honouring ifExists.
+        """
+        app = create_test_app(include_runs=False, include_threads=True)
+
+        statements: list[Any] = []
+
+        class Session(DummySessionBase):
+            async def scalars(self, stmt: Any = None) -> DummyScalarResult:
+                statements.append(stmt)
+                return await super().scalars(stmt)
+
+            async def scalar(self, stmt: Any) -> Any:
+                statements.append(stmt)
+                return None
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        resp = client.post("/threads", json={"threadId": "atomic-thread-id"})
+        assert resp.status_code == 200
+
+        # The insert is the first statement issued, and it is conflict-tolerant.
+        assert statements, "create_thread issued no statements"
+        sql = str(statements[0].compile(dialect=postgresql.dialect()))
+        assert "INSERT INTO thread" in sql
+        assert "ON CONFLICT (thread_id) DO NOTHING" in sql
+        assert "RETURNING" in sql
+
+    def test_create_thread_conflict_with_other_owner_conflicts(self) -> None:
+        """thread_pkey is global while the read is scoped, so the ID can be taken
+        by another owner. That used to be a permanent 500; it is now a 409, and
+        the other owner's thread is never adopted.
+        """
+        app = create_test_app(include_runs=False, include_threads=True)
+        client = make_client(_conflicting_app(app, None))
+
+        resp = client.post(
+            "/threads",
+            json={"threadId": "foreign-thread-id", "ifExists": "do_nothing"},
         )
         assert resp.status_code == 409
         assert "already exists" in resp.json()["detail"]
@@ -305,6 +420,15 @@ class TestGetThread:
 class TestDeleteThread:
     """Test DELETE /threads/{thread_id} endpoint"""
 
+    @pytest.fixture
+    def mock_checkpointer(self, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+        """Stub the checkpointer — db_manager is never initialized in tests."""
+        checkpointer = AsyncMock()
+        db = MagicMock()
+        db.get_checkpointer.return_value = checkpointer
+        monkeypatch.setattr(threads_module, "db_manager", db)
+        return checkpointer
+
     def test_delete_thread_not_found(self):
         """Test deleting a non-existent thread"""
         app = create_test_app(include_runs=False, include_threads=True)
@@ -319,7 +443,22 @@ class TestDeleteThread:
         resp = client.delete("/threads/nonexistent")
         assert resp.status_code == 404
 
-    def test_delete_thread_no_active_runs(self):
+    def test_delete_thread_not_found_skips_checkpointer(self, mock_checkpointer: AsyncMock) -> None:
+        """The 404 path never touches the checkpoint backend."""
+        app = create_test_app(include_runs=False, include_threads=True)
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> None:
+                return None
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        resp = client.delete("/threads/nonexistent")
+        assert resp.status_code == 404
+        mock_checkpointer.adelete_thread.assert_not_called()
+
+    def test_delete_thread_no_active_runs(self, mock_checkpointer: AsyncMock) -> None:
         """Test deleting a thread with no active runs"""
         app = create_test_app(include_runs=False, include_threads=True)
 
@@ -348,6 +487,61 @@ class TestDeleteThread:
         resp = client.delete("/threads/test-123")
         assert resp.status_code == 200
         assert resp.json()["status"] == "deleted"
+
+    def test_delete_thread_deletes_backend_checkpoints(self, mock_checkpointer: AsyncMock) -> None:
+        """Deleting a thread also deletes its checkpoint history."""
+        app = create_test_app(include_runs=False, include_threads=True)
+
+        thread = _thread_row("test-123")
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> object:
+                return thread
+
+            async def delete(self, obj: object) -> None:
+                pass
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        resp = client.delete("/threads/test-123")
+        assert resp.status_code == 200
+        mock_checkpointer.adelete_thread.assert_awaited_once_with("test-123")
+
+    def test_delete_thread_returns_500_and_keeps_row_when_checkpoint_delete_fails(
+        self, mock_checkpointer: AsyncMock
+    ) -> None:
+        """Checkpoint-delete failure propagates; the thread row is not committed.
+
+        Deleting the row anyway would orphan the checkpoints — the exact bug
+        this endpoint change fixes. A 500 leaves the delete retryable.
+        """
+        app = create_test_app(include_runs=False, include_threads=True)
+
+        thread = _thread_row("test-123")
+        deleted: list[object] = []
+        committed: list[bool] = []
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> object:
+                return thread
+
+            async def delete(self, obj: object) -> None:
+                deleted.append(obj)
+
+            async def commit(self) -> None:
+                committed.append(True)
+
+        mock_checkpointer.adelete_thread.side_effect = PsycopgError("checkpoint backend down")
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.delete("/threads/test-123")
+        assert resp.status_code == 500
+        mock_checkpointer.adelete_thread.assert_awaited_once_with("test-123")
+        assert deleted == []
+        assert committed == []
 
 
 class TestSearchThreads:
@@ -417,6 +611,144 @@ class TestSearchThreads:
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data, list)
+
+    def test_search_accepts_order_by_asc(self, client):
+        """order_by='created_at ASC' is accepted without error."""
+        resp = client.post("/threads/search", json={"order_by": "created_at ASC"})
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_search_malformed_order_by_does_not_500(self, client):
+        """Malformed order_by falls back to default and returns 200."""
+        for bad in ["password; DROP TABLE", "nonexistent_col", ""]:
+            resp = client.post("/threads/search", json={"order_by": bad})
+            assert resp.status_code == 200, f"order_by={bad!r} raised {resp.status_code}"
+
+    def test_search_accepts_sdk_sort_shape(self, client):
+        """SDK-style sort_by/sort_order is accepted."""
+        resp = client.post(
+            "/threads/search",
+            json={"sort_by": "updated_at", "sort_order": "asc"},
+        )
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_search_sdk_state_updated_at_returns_422(self, client):
+        """sort_by='state_updated_at' is in the SDK's literal but not in our schema → 422."""
+        resp = client.post(
+            "/threads/search",
+            json={"sort_by": "state_updated_at", "sort_order": "desc"},
+        )
+        assert resp.status_code == 422
+        assert "sort_by" in resp.text
+
+    def test_search_invalid_sort_by_returns_422(self, client):
+        """Unknown sort_by is rejected at the model layer, regardless of order_by.
+
+        Regression: pre-fix code silently fell back to created_at DESC when
+        sort_by was invalid, dropping a valid order_by alongside it.
+        """
+        resp = client.post(
+            "/threads/search",
+            json={"sort_by": "definitely_not_a_column", "order_by": "updated_at ASC"},
+        )
+        assert resp.status_code == 422
+        assert "sort_by" in resp.text
+
+    def test_search_rejects_invalid_sort_order(self, client):
+        """sort_order is a Literal['asc','desc']; other values are rejected by Pydantic."""
+        resp = client.post(
+            "/threads/search",
+            json={"sort_by": "created_at", "sort_order": "sideways"},
+        )
+        assert resp.status_code == 422
+
+    def test_search_accepts_bool_metadata_filter(self, client):
+        """metadata={'active': True} is accepted end-to-end (real matching verified in E2E)."""
+        resp = client.post("/threads/search", json={"metadata": {"active": True}})
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_search_accepts_limit_500(self, client: TestClient) -> None:
+        """LangGraph SDK clients page with limit=500; must not 422."""
+        resp = client.post("/threads/search", json={"limit": 500})
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_search_accepts_limit_at_cap(self, client: TestClient) -> None:
+        resp = client.post("/threads/search", json={"limit": settings.app.MAX_SEARCH_LIMIT})
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_search_accepts_null_limit(self, client: TestClient) -> None:
+        resp = client.post("/threads/search", json={"limit": None})
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_search_omitted_limit_honors_cap_below_default(
+        self: "TestSearchThreads", monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings.app, "MAX_SEARCH_LIMIT", 10)
+        captured: list[int | None] = []
+        app = create_test_app(include_runs=False, include_threads=True)
+        threads = [_thread_row("thread-1")]
+
+        class Session(ThreadSession):
+            async def scalars(self: "Session", stmt: Any = None) -> Any:
+                if stmt is not None and hasattr(stmt, "_limit"):
+                    captured.append(stmt._limit)
+                return await super().scalars(stmt)
+
+        override_session_dependency(app, Session, threads=threads)
+        client = make_client(app)
+        resp = client.post("/threads/search", json={})
+        assert resp.status_code == 200
+        assert captured == [10]
+
+    def test_search_null_limit_honors_cap_below_default(
+        self: "TestSearchThreads", monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings.app, "MAX_SEARCH_LIMIT", 10)
+        captured: list[int | None] = []
+        app = create_test_app(include_runs=False, include_threads=True)
+        threads = [_thread_row("thread-1")]
+
+        class Session(ThreadSession):
+            async def scalars(self: "Session", stmt: Any = None) -> Any:
+                if stmt is not None and hasattr(stmt, "_limit"):
+                    captured.append(stmt._limit)
+                return await super().scalars(stmt)
+
+        override_session_dependency(app, Session, threads=threads)
+        client = make_client(app)
+        resp = client.post("/threads/search", json={"limit": None})
+        assert resp.status_code == 200
+        assert captured == [10]
+
+    def test_search_returns_422_when_limit_exceeds_cap(self, client: TestClient) -> None:
+        """limit above MAX_SEARCH_LIMIT is rejected at the request model."""
+        cap = settings.app.MAX_SEARCH_LIMIT
+        resp = client.post("/threads/search", json={"limit": cap + 1})
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert any(
+            error.get("loc") == ["body", "limit"]
+            and error.get("type") == "less_than_equal"
+            and error.get("ctx", {}).get("le") == cap
+            for error in detail
+        )
+
+    @pytest.mark.parametrize("limit", [0, -1])
+    def test_search_returns_422_when_limit_is_zero_or_negative(self, client: TestClient, limit: int) -> None:
+        resp = client.post("/threads/search", json={"limit": limit})
+        assert resp.status_code == 422
+        assert "limit" in resp.text
+
+    @pytest.mark.parametrize("limit", ["abc", [], {}, 20.5])
+    def test_search_returns_422_when_limit_is_not_an_integer(self, client: TestClient, limit: object) -> None:
+        resp = client.post("/threads/search", json={"limit": limit})
+        assert resp.status_code == 422
+        assert "limit" in resp.text
 
 
 class TestThreadGetState:
@@ -588,6 +920,123 @@ class TestThreadUpdateState:
         )
         assert resp.status_code == 400
         assert "no associated graph" in resp.json()["detail"]
+
+    def test_update_state_copy_checkpoint_with_as_node(self):
+        """values=None + as_node must create a copy checkpoint via aupdate_state.
+
+        Regression test: LangGraph Studio posts {"values": null,
+        "as_node": "__copy__", "checkpoint_id": X} to anchor a "Re-run
+        from here" fork at checkpoint X. Previously the handler short-
+        circuited to get_thread_state whenever values was None, so no
+        new checkpoint was created and subsequent runs forked from the
+        thread's latest checkpoint instead of X.
+        """
+        app = create_test_app(include_runs=False, include_threads=True)
+        thread = _thread_row("test-123", metadata={"graph_id": "test-graph"})
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt):
+                return thread
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        mock_agent = AsyncMock()
+        mock_agent.aupdate_state.return_value = {"configurable": {"checkpoint_id": "copy-cp", "checkpoint_ns": ""}}
+        mock_agent.with_config = Mock(return_value=mock_agent)
+
+        with patch("aegra_api.services.langgraph_service.get_langgraph_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.get_graph = create_get_graph_mock(return_value=mock_agent)
+
+            resp = client.post(
+                "/threads/test-123/state",
+                json={
+                    "values": None,
+                    "as_node": "__copy__",
+                    "checkpoint_id": "original-cp",
+                },
+            )
+
+            assert resp.status_code == 200
+            result = resp.json()
+            assert result["checkpoint"]["checkpoint_id"] == "copy-cp"
+
+            # aupdate_state must be invoked with the Studio-supplied checkpoint_id
+            # so the copy is anchored to the correct parent.
+            mock_agent.aupdate_state.assert_called_once()
+            cfg, values, *_ = mock_agent.aupdate_state.call_args[0]
+            assert values is None
+            assert cfg["configurable"]["checkpoint_id"] == "original-cp"
+            assert mock_agent.aupdate_state.call_args[1]["as_node"] == "__copy__"
+
+    def test_update_state_body_checkpoint_id_routes_to_update_path(self):
+        """Body-only checkpoint_id must flow to aupdate_state, not the GET shim
+        which reads query params and would silently drop the body field."""
+        app = create_test_app(include_runs=False, include_threads=True)
+        thread = _thread_row("test-123", metadata={"graph_id": "test-graph"})
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt):
+                return thread
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        mock_agent = AsyncMock()
+        mock_agent.aupdate_state.return_value = {"configurable": {"checkpoint_id": "new-cp", "checkpoint_ns": ""}}
+        mock_agent.with_config = Mock(return_value=mock_agent)
+
+        with patch("aegra_api.services.langgraph_service.get_langgraph_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.get_graph = create_get_graph_mock(return_value=mock_agent)
+
+            resp = client.post(
+                "/threads/test-123/state",
+                json={"values": None, "as_node": None, "checkpoint_id": "body-cp"},
+            )
+
+            assert resp.status_code == 200
+            mock_agent.aupdate_state.assert_called_once()
+            cfg, values, *_ = mock_agent.aupdate_state.call_args[0]
+            assert values is None
+            assert cfg["configurable"]["checkpoint_id"] == "body-cp"
+
+    def test_update_state_body_checkpoint_dict_routes_to_update_path(self):
+        """Mirror of the checkpoint_id case for the `checkpoint` dict variant
+        so neither half of the gate condition can regress silently."""
+        app = create_test_app(include_runs=False, include_threads=True)
+        thread = _thread_row("test-123", metadata={"graph_id": "test-graph"})
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt):
+                return thread
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        mock_agent = AsyncMock()
+        mock_agent.aupdate_state.return_value = {"configurable": {"checkpoint_id": "new-cp", "checkpoint_ns": ""}}
+        mock_agent.with_config = Mock(return_value=mock_agent)
+
+        with patch("aegra_api.services.langgraph_service.get_langgraph_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.get_graph = create_get_graph_mock(return_value=mock_agent)
+
+            resp = client.post(
+                "/threads/test-123/state",
+                json={
+                    "values": None,
+                    "as_node": None,
+                    "checkpoint": {"checkpoint_id": "body-cp", "checkpoint_ns": ""},
+                },
+            )
+
+            assert resp.status_code == 200
+            mock_agent.aupdate_state.assert_called_once()
+            cfg, values, *_ = mock_agent.aupdate_state.call_args[0]
+            assert values is None
+            assert cfg["configurable"]["checkpoint_id"] == "body-cp"
 
 
 class TestThreadStateCheckpoint:
@@ -775,11 +1224,14 @@ class TestUpdateThread:
             async def scalar(self, _stmt):
                 return thread
 
+            async def execute(self, stmt, *args, **kwargs):
+                # The merge happens in the database; stand in for it.
+                apply_thread_metadata_merge(stmt, thread)
+
             async def commit(self):
                 pass
 
             async def refresh(self, obj):
-                # In a real DB, refresh updates the object; here we just simulate it
                 pass
 
         app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
@@ -811,6 +1263,9 @@ class TestUpdateThread:
         class Session(DummySessionBase):
             async def scalar(self, _stmt):
                 return thread
+
+            async def execute(self, stmt, *args, **kwargs):
+                apply_thread_metadata_merge(stmt, thread)
 
             async def commit(self):
                 pass
@@ -852,6 +1307,9 @@ class TestUpdateThread:
         class Session(DummySessionBase):
             async def scalar(self, _stmt):
                 return thread
+
+            async def execute(self, stmt, *args, **kwargs):
+                apply_thread_metadata_merge(stmt, thread)
 
             async def commit(self):
                 pass

@@ -76,6 +76,12 @@ aegra/
 
 **Key principle:** LangGraph handles ALL state persistence and graph execution. FastAPI provides only HTTP/Agent Protocol compliance.
 
+### Run Execution Architecture
+- **Production mode** (`REDIS_BROKER_ENABLED=true`): Runs are dispatched via a Redis job queue (BLPOP). Workers run as concurrent asyncio tasks inside each instance (default: 3 workers x 10 jobs = 30 concurrent runs per instance). Lease-based crash recovery with heartbeat and reaper. Execution params stored in Postgres so workers can reconstruct jobs. OpenTelemetry trace context propagates across the Redis queue boundary.
+- **Dev mode** (`aegra dev`, `REDIS_BROKER_ENABLED=false`): Runs execute as in-process asyncio tasks via `LocalExecutor`. No Redis needed. SSE uses an in-memory broker.
+- Key files: `services/executor.py` (factory), `services/local_executor.py` (dev), `services/worker_executor.py` (prod), `services/lease_reaper.py` (crash recovery), `models/run_job.py` (serialized execution params).
+- See `docs/guides/worker-architecture.mdx` for the full architecture documentation.
+
 ## Development Rules
 
 ### Type Annotations (STRICT)
@@ -100,6 +106,20 @@ def process(items): ...
 ### Import Conventions
 - Use absolute imports with `aegra_api.*` prefix.
 - **ALWAYS place imports at the top of the file.** Never use inline/lazy imports inside functions unless there is a **proven circular dependency** (confirmed by actual `ImportError`) or the import is from an **optional dependency** that may not be installed (wrapped in `try/except ImportError`). "Might be slow" or "only used here" are NOT valid reasons for inline imports. If unsure, put it at the top — only move inline after confirming the import cycle with an actual error.
+
+### Code Comments (STRICT)
+- **Max 2 lines per comment. 3 only when truly unavoidable.** If you can't say it in 2 lines, the code is the wrong shape or you're over-explaining. Delete the comment, rename a variable, or split the function.
+- Comments answer **why** the code exists or **why this weird shape**. They never restate what the code obviously does, narrate history ("previously X, now Y"), or apologize. Git blame holds the history.
+- No JSDoc/docstring filler on self-describing names. The signature IS the doc.
+- Optimize for future readers grepping for intent, not for narrative.
+
+### Linter Suppressions (`noqa`, `type: ignore`)
+- **NEVER suppress a lint warning when the underlying issue can be fixed.** `# noqa: F401` on a dead re-export means you should delete the re-export and fix the importers. `# type: ignore` on a type mismatch means you should fix the types.
+- Suppressions are **only acceptable** when:
+  1. The linter is genuinely wrong (false positive for this specific case).
+  2. There is no correct fix — e.g., `# noqa: S311` on `random.uniform` used for jitter (not security), or `# noqa: B017` when an SDK doesn't expose specific exception types.
+  3. A third-party API forces an incompatible type that cannot be narrowed.
+- If you're tempted to add a suppression, first try to fix the code. If you can't, add a comment explaining **why** the suppression is necessary.
 
 ### Error Handling
 - **NEVER use bare `except:` or `except Exception: pass`.** Always catch specific exceptions.
@@ -179,9 +199,22 @@ After implementing a feature or fixing a bug, **verify the work end-to-end again
    - **Custom verification script** (large responses or multi-step flows): write a Python script with `httpx` to call endpoints, parse responses, and assert results, then clean up
 4. **Cleanup** — `docker compose down` when done (unless user wants it kept running).
 
+#### E2E Testing in Both Modes
+Aegra has two execution modes (dev = LocalExecutor, prod = WorkerExecutor). E2E tests should pass in **both** modes. Use the Makefile targets:
+
+```bash
+make e2e-dev     # Dev mode (no Redis, in-process tasks)
+make e2e-prod    # Prod mode (Redis workers, lease recovery)
+make e2e-both    # Run both sequentially
+make e2e-auth    # Auth-enabled server (JWT mock); runs auth_only tests
+```
+
+Tests marked `@pytest.mark.prod_only` are skipped in dev mode (they require Redis workers). Tests marked `@pytest.mark.auth_only` live under `tests/e2e/manual_auth_tests/` and run only in the auth job / `make e2e-auth`. Multi-instance and stress tests in `tests/e2e/multi_instance/` are manual-only — run them explicitly when testing worker architecture or scaling changes.
+
 ### LLM Agent Anti-Patterns (IMPORTANT)
 These rules exist because AI agents repeatedly make these mistakes. Follow them carefully:
 
+- **Never pipe long command output through `tail`.** When running tests, builds, or any command where you need to see results, do NOT use `| tail -N` — the results you need will scroll past and be lost. Use `| grep "passed\|failed\|error"` to filter, or just let the full output show. If output is too long, use `| tail -30` with a generous line count, not `| tail -5`.
 - **Only modify code related to the task at hand.** Do not "helpfully" refactor, rename, or clean up adjacent code — this introduces breakage and scope creep.
 - **When tests fail, fix the ROOT CAUSE, not the symptom.** Do not delete failing assertions, weaken test conditions, or add workarounds to make tests pass. Investigate why the test fails and fix the underlying bug.
 - **NEVER add conditional logic that returns hardcoded values for specific test inputs.** This is cheating, not fixing.
@@ -190,12 +223,43 @@ These rules exist because AI agents repeatedly make these mistakes. Follow them 
 - **If you don't understand why code exists, ask or leave it alone** (Chesterton's Fence).
 - **NEVER commit commented-out code.** Delete it or keep it — no middle ground.
 
+### Database & Migrations (STRICT)
+Aegra runs against user-managed Postgres including multi-host HA (PR #299). DB code has invariants that break silently in prod. Before touching DB code, walk this checklist:
+
+- **Two URLs, do not cross drivers.**
+  - `settings.db.database_url` → asyncpg query-param form. SQLAlchemy only.
+  - `settings.db.database_url_sync` → raw libpq, comma-host preserved. psycopg only (LangGraph pool, migrations precheck).
+  - Feeding `database_url_sync` to SQLAlchemy (`create_engine`, `async_engine_from_config`) silently breaks HA — SQLAlchemy's URL parser doesn't grok libpq comma-hosts. For sync DBAPI, use `psycopg.connect(database_url_sync)` directly.
+
+- **Pool ownership.** Long-lived pools belong in `db_manager` only. Short-lived helpers must close deterministically (`with` or `try/finally`). Code running before `db_manager.initialize()` cannot assume pools exist.
+
+- **Migrations.**
+  - Schema changes go through alembic, never raw DDL from app code.
+  - Linear `down_revision` chain. Idempotent + resumable.
+  - Lifespan uses `run_migrations_if_needed()` (lock-free precheck). `run_migrations()` is for `aegra db upgrade` only. Don't regress the precheck.
+  - Multi-pod path: `RUN_MIGRATIONS_ON_STARTUP=false` + `aegra db upgrade` out-of-band. Changing startup behavior needs both `.env.example` files + `docs/guides/deployment.mdx` updated.
+
+- **SQL-layer authorization.** Every tenant-scoped read/write needs `user_id == user.identity` in the WHERE, even with `@auth.on` registered (default-allow when no handler — see GHSA-m98r-6667-4wq7). Routes taking `thread_id`/`assistant_id`/`cron_id` path params verify ownership + 404 at handler entry, not deeper.
+
+- **Connection footprint.** New pools increase per-pod conn count. Extend existing or document the cap impact. PgBouncer/RDS Proxy transaction-pool mode breaks LISTEN/NOTIFY + prepared statements; flag accordingly.
+
+- **Testing.** Mock at the driver layer, not SQLAlchemy, when bypassing SQLAlchemy. Assert the exact URL passed to the driver matches `settings.db.*` so refactors can't quietly reintroduce SQLAlchemy URL parsing on libpq strings.
+
 ### Security
 - NEVER store secrets, API keys, or passwords in code — only in `.env` files or environment variables.
 - NEVER log sensitive information (passwords, tokens, PII).
 - Use parameterized queries / ORM — never raw string SQL.
 - NEVER use `eval()`, `exec()`, or `pickle` on user input.
 - Use `subprocess.run([...], shell=False)` — never `shell=True` with user input.
+
+### API Compatibility (STRICT)
+Aegra is a drop-in replacement for LangSmith Deployments, so every request field the LangGraph SDK can send must be handled explicitly. A field that is accepted and quietly ignored is the most common compatibility bug: the client sees success and the behavior it asked for never happens.
+
+- **Every field the SDK can send either changes behavior or returns 422.** Never accept a field and ignore it. If a feature is not implemented, declare the field and reject any value that differs from current behavior with a clear error.
+- **One exception: fields that configure a system outside Aegra.** A field whose only effect is on a LangSmith-side service (for example `langsmith_tracer`, `feedback_keys`) may be accepted and left inert. Each such field is listed in `docs/feature-support.mdx` with the reason. Nothing else may be inert.
+- **Declare accepted keys.** Request models list every SDK field. Agent Protocol v2 handlers keep an explicit key set (`RUN_START_KEYS`, `INPUT_RESPOND_KEYS` in `services/event_streaming/commands.py`) and log unknown keys at warning level. Do not use `extra="forbid"`: the Python SDK always sends default-valued booleans, so a new SDK field would break every client.
+- **Pin the contract with a drift test.** v2: `tests/unit/test_services/test_event_streaming/test_spec_params.py` vendors the protocol param shapes and asserts the handler key sets cover them. v1: the request-model drift test against the SDK request body is tracked in #503; until it lands, add explicit field tests with each new field. A new SDK field must fail CI, not reach a user.
+- **Match public names and defaults.** Config keys, env vars and enum values follow the public LangGraph Platform docs where one exists, so users can move between deployments without changing payloads.
 
 ## Architecture
 
@@ -259,7 +323,7 @@ Supported factory signatures: 0-arg (called once at startup), config-only (`dict
 - Run `make lint` (or `uv run ruff check .`) for linting
 - Include tests for new functionality
 - Update migrations if modifying database schema
-- Title format: `[component] Brief description`
+- Title format: Conventional Commits (`type(scope): subject`), e.g. `fix(api): raise search limit cap`
 
 ### Documentation Updates (STRICT)
 - **EVERY code change that affects user-facing behavior MUST include corresponding documentation updates.** This is NOT optional — treat docs as part of the implementation, not a follow-up task.
@@ -282,14 +346,15 @@ Supported factory signatures: 0-arg (called once at startup), config-only (`dict
 - **`aegra-api` and `aegra-cli` MUST always have the same version.** Both versions live in their respective `pyproject.toml` files (`libs/aegra-api/pyproject.toml` and `libs/aegra-cli/pyproject.toml`).
 - **`aegra-cli` depends on `aegra-api~=X.Y.Z`** (compatible release). This allows patch updates (X.Y.Z+1) without changing the constraint, but a **minor bump requires updating the constraint** in `aegra-cli/pyproject.toml`.
 - **Pre-1.0.0 versioning (current):** While in beta (`0.x.y`), the version scheme is `0.MAJOR.PATCH`:
-  - **Patch** (0.5.1 → 0.5.2): Bug fixes, small improvements, new features, non-breaking additions. Update `version` in BOTH `pyproject.toml` files.
-  - **Minor** (0.5.x → 0.6.0): Breaking changes (removed/renamed endpoints, changed behavior, schema migrations). Update `version` in BOTH `pyproject.toml` files AND update the `aegra-api~=` constraint in `aegra-cli/pyproject.toml`.
+  - **Patch** (0.5.1 → 0.5.2): Bug fixes, small improvements, new features, non-breaking additions.
+  - **Minor** (0.5.x → 0.6.0): Breaking changes (removed/renamed endpoints, changed behavior, schema migrations). The release PR also updates the `aegra-api~=` constraint in `aegra-cli/pyproject.toml`.
   - **1.0.0**: Reserved for when the public API is considered stable and we commit to full SemVer guarantees. This is a deliberate decision, not triggered by a single change.
 - **Post-1.0.0 versioning (future):** Standard SemVer applies:
   - **Patch** (1.0.0 → 1.0.1): Bug fixes only.
   - **Minor** (1.0.x → 1.1.0): New features, non-breaking additions.
   - **Major** (1.x.y → 2.0.0): Breaking changes.
-- **Always bump the version before creating a PR.** Determine the bump type from the changes:
-  - Bug fix, small improvement, or new non-breaking feature → patch bump
-  - Breaking change (removed/renamed API, changed defaults, schema migration) → minor bump
+- **Do NOT bump the version in a feature or fix PR.** Releases are batched: several PRs merge, then one release PR bumps everything at once. A bump inside a normal PR conflicts with every other PR in the batch and has to be rebased away.
+- **The release PR bumps four things together:** `version` in BOTH `pyproject.toml` files, `uv.lock`, and `docs/openapi.json`. Determine the bump type from everything in the batch:
+  - Bug fixes, small improvements, new non-breaking features → patch bump
+  - Any breaking change (removed/renamed API, changed defaults, schema migration) → minor bump
 - **`aegra` meta-package** (on PyPI, not in this repo) is a name reservation that points to `aegra-cli`. It does not need to be updated on every release.

@@ -111,7 +111,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Aegra also creates a default assistant for each graph on startup, so you can skip this step and use the graph ID directly in runs.
+Aegra also creates a default assistant for each graph on startup, so you can skip this step and use the graph ID directly in runs and crons.
 
 ## Step 5: Create a thread and run a conversation
 
@@ -190,7 +190,7 @@ async def inspect_state():
     history = await client.threads.get_history(thread_id)
     print(f"Total checkpoints: {len(history)}")
     for entry in history:
-        print(f"  Checkpoint: {entry['checkpoint_id']}")
+        print(f"  Checkpoint: {entry['checkpoint']['checkpoint_id']}")
 
 
 asyncio.run(inspect_state())

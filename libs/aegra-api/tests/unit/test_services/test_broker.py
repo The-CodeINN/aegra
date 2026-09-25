@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from aegra_api.services.base_broker import REPLAY_RETENTION_SECONDS
 from aegra_api.services.broker import BrokerManager, RunBroker
 
 
@@ -16,7 +17,7 @@ class TestRunBroker:
         broker = RunBroker("run-123")
 
         assert broker.run_id == "run-123"
-        assert broker.queue is not None
+        assert broker._subscribers == set()
         assert not broker.finished.is_set()
 
     @pytest.mark.asyncio
@@ -26,10 +27,9 @@ class TestRunBroker:
 
         await broker.put("evt-1", {"data": "test"})
 
-        # Event should be in queue
-        event_id, payload = await asyncio.wait_for(broker.queue.get(), timeout=1.0)
-        assert event_id == "evt-1"
-        assert payload == {"data": "test"}
+        # Event is buffered for replay and delivered to a subscriber's aiter.
+        replayed = await broker.replay(None)
+        assert replayed == [("evt-1", {"data": "test"})]
 
     @pytest.mark.asyncio
     async def test_put_end_event_marks_finished(self):
@@ -51,8 +51,8 @@ class TestRunBroker:
         # Should not raise, just log warning
         await broker.put("evt-1", {"data": "test"})
 
-        # Queue should be empty
-        assert broker.queue.empty()
+        # Event is dropped (broker finished) — nothing buffered.
+        assert await broker.replay(None) == []
 
     @pytest.mark.asyncio
     async def test_mark_finished(self):
@@ -99,6 +99,35 @@ class TestRunBroker:
 
         # Should get both events including end
         assert len(events) == 2
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_aiters_each_receive_every_live_event(self):
+        """Regression: the v2 SDK opens two SSE on one run (main + lifecycle watcher).
+
+        Both must receive every event. A single shared queue would split events
+        between the two consumers, so the watcher would miss the interrupt.
+        """
+        broker = RunBroker("run-123")
+
+        async def drain() -> list[tuple[str, object]]:
+            out: list[tuple[str, object]] = []
+            async for event_id, payload in broker.aiter():
+                out.append((event_id, payload))
+                if event_id == "evt-end":
+                    break
+            return out
+
+        a = asyncio.create_task(drain())
+        b = asyncio.create_task(drain())
+        await asyncio.sleep(0.05)  # let both register their subscriber queues
+
+        await broker.put("evt-1", {"data": "first"})
+        await broker.put("evt-2", {"data": "second"})
+        await broker.put("evt-end", ("end", {}))
+
+        got_a, got_b = await asyncio.gather(a, b)
+        assert got_a == got_b
+        assert [eid for eid, _ in got_a] == ["evt-1", "evt-2", "evt-end"]
 
 
 class TestBrokerManager:
@@ -196,17 +225,77 @@ class TestBrokerManager:
         manager.remove_broker("nonexistent")
 
     @pytest.mark.asyncio
-    async def test_start_and_stop_cleanup_task(self):
-        """Test starting and stopping cleanup task"""
+    async def test_start_and_stop(self):
+        """Test starting and stopping broker manager"""
         manager = BrokerManager()
 
-        # Start cleanup task
-        await manager.start_cleanup_task()
+        # Start (creates cleanup task)
+        await manager.start()
 
         assert manager._cleanup_task is not None
         assert not manager._cleanup_task.done()
 
-        # Stop cleanup task
-        await manager.stop_cleanup_task()
+        # Stop (cancels cleanup task)
+        await manager.stop()
 
         assert manager._cleanup_task.cancelled() or manager._cleanup_task.done()
+
+
+class TestReplayRetention:
+    """Finished brokers survive the replay window, then get swept."""
+
+    @staticmethod
+    def _finish_at(broker: RunBroker, seconds_ago: float) -> None:
+        """Backdate the broker's completion so the sweep sees it as aged."""
+        broker.mark_finished()
+        assert broker._finished_at is not None
+        broker._finished_at -= seconds_ago
+
+    @pytest.mark.asyncio
+    async def test_unfinished_broker_is_never_swept(self) -> None:
+        manager = BrokerManager()
+        manager.get_or_create_broker("run-1")
+
+        assert manager.sweep_expired_brokers(retention_seconds=0) == []
+        assert manager.get_broker("run-1") is not None
+
+    @pytest.mark.asyncio
+    async def test_finished_broker_survives_inside_the_window(self) -> None:
+        manager = BrokerManager()
+        self._finish_at(manager.get_or_create_broker("run-1"), seconds_ago=REPLAY_RETENTION_SECONDS - 60)
+
+        assert manager.sweep_expired_brokers() == []
+        assert manager.get_broker("run-1") is not None
+
+    @pytest.mark.asyncio
+    async def test_finished_broker_is_swept_past_the_window(self) -> None:
+        manager = BrokerManager()
+        self._finish_at(manager.get_or_create_broker("run-1"), seconds_ago=REPLAY_RETENTION_SECONDS + 60)
+        await manager.allocate_event_id("run-1")
+
+        assert manager.sweep_expired_brokers() == ["run-1"]
+        assert manager.get_broker("run-1") is None
+        assert manager._event_counters == {}
+
+    @pytest.mark.asyncio
+    async def test_window_starts_at_completion_not_creation(self) -> None:
+        """A long run must still get a full window after it ends."""
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1")
+        broker._created_at -= REPLAY_RETENTION_SECONDS * 10
+        broker.mark_finished()
+
+        assert manager.sweep_expired_brokers() == []
+
+    @pytest.mark.asyncio
+    async def test_broker_with_a_queued_event_is_kept(self) -> None:
+        """is_empty() gates the sweep so a subscriber cannot lose an undelivered event."""
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker("run-1")
+        queue: asyncio.Queue = asyncio.Queue()
+        broker._subscribers.add(queue)
+        queue.put_nowait(("evt-1", {"data": "x"}))
+        self._finish_at(broker, seconds_ago=REPLAY_RETENTION_SECONDS + 60)
+
+        assert manager.sweep_expired_brokers() == []
+        assert manager.get_broker("run-1") is not None
