@@ -41,6 +41,8 @@ from aegra_api.models import (
 )
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, AgentProtocolError
 from aegra_api.models.search_limit import effective_search_limit
+from aegra_api.services.langgraph_service import create_thread_config
+from aegra_api.services.run_status import set_thread_values
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.services.thread_state_service import ThreadStateService
 from aegra_api.services.thread_ttl import get_thread_ttl_config, prune_expired_threads_for_user
@@ -143,6 +145,12 @@ def _serialize_thread(thread_orm: ThreadORM, default_metadata: dict[str, Any] | 
     if not isinstance(u_at, datetime):
         u_at = datetime.now(UTC)
 
+    # 6. Cached latest-checkpoint values and interrupts
+    values_source = getattr(thread_orm, "values_json", None)
+    values = values_source if isinstance(values_source, dict) else None
+    interrupts_source = getattr(thread_orm, "interrupts_json", None)
+    interrupts = interrupts_source if isinstance(interrupts_source, dict) else {}
+
     # Validate from dict (more robust than validate(orm_obj) for partial mocks)
     return Thread.model_validate(
         {
@@ -152,8 +160,24 @@ def _serialize_thread(thread_orm: ThreadORM, default_metadata: dict[str, Any] | 
             "user_id": u_id,
             "created_at": c_at,
             "updated_at": u_at,
+            "values": values,
+            "interrupts": interrupts,
         }
     )
+
+
+async def _refresh_thread_values(graph: Any, session: AsyncSession, thread_id: str, user: User) -> None:
+    """Re-cache the thread's latest values and interrupts after its state changed.
+
+    Best-effort: the checkpoint is already written, so a failed refresh must not fail the request.
+    """
+    try:
+        snapshot = await graph.aget_state(create_thread_config(thread_id, user))
+        thread_values = thread_state_service.extract_thread_values(snapshot)
+        await set_thread_values(session, thread_id, thread_values, user_id=user.identity)
+        await session.commit()
+    except Exception:
+        logger.warning("Failed to refresh cached thread values", thread_id=thread_id, exc_info=True)
 
 
 # --- Endpoints ---
@@ -551,10 +575,10 @@ async def update_thread_state(
                 config=config,
                 access_context="threads.update",
                 user=user,
-            ) as agent:
+            ) as graph:
                 # Update state using aupdate_state method
                 # This creates a new checkpoint with the updated values
-                agent = agent.with_config(config)
+                agent = graph.with_config(config)
 
                 # Handle values - can be dict or list of dicts
                 update_values = request.values
@@ -613,6 +637,9 @@ async def update_thread_state(
                     thread_id,
                     checkpoint_info.get("checkpoint_id"),
                 )
+
+                # Unbound graph: the request's checkpoint_id/ns must not pin the latest-state read.
+                await _refresh_thread_values(graph, session, thread_id, user)
 
                 return ThreadStateUpdateResponse(checkpoint=checkpoint_info)
 
