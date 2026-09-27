@@ -27,8 +27,10 @@ def upgrade() -> None:
         "thread",
         sa.Column("interrupts_json", JSONB(), server_default=sa.text("'{}'::jsonb"), nullable=False),
     )
+    op.add_column("thread", sa.Column("values_checkpoint_id", sa.Text(), nullable=True))
 
 
 def downgrade() -> None:
+    op.drop_column("thread", "values_checkpoint_id")
     op.drop_column("thread", "interrupts_json")
     op.drop_column("thread", "values_json")

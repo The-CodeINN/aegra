@@ -88,7 +88,7 @@ class TestExecuteRunThreadValues:
     async def test_passes_captured_thread_values_to_finalize(self, has_interrupt: bool, status: str) -> None:
         graph_result = _GraphResult()
         graph_result.has_interrupt = has_interrupt
-        graph_result.thread_values = ThreadValues(values={"messages": []}, interrupts={})
+        graph_result.thread_values = ThreadValues(values={"messages": []}, interrupts={}, checkpoint_id="cp-1")
         mock_finalize = AsyncMock(return_value=True)
 
         with (
@@ -130,6 +130,7 @@ class TestCaptureThreadValues:
         assert result == ThreadValues(
             values={"messages": ["done"]},
             interrupts={"task-1": [{"value": "ok?", "id": "int-1"}]},
+            checkpoint_id="cp-2",
         )
 
     @pytest.mark.asyncio

@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
@@ -35,6 +36,7 @@ from aegra_api.models import (
     ThreadState,
     ThreadStateUpdate,
     ThreadStateUpdateResponse,
+    ThreadSummary,
     ThreadTTLSpec,
     ThreadUpdate,
     User,
@@ -94,9 +96,9 @@ def _resolve_sort(request: ThreadSearchRequest) -> tuple[Any, bool]:
 # --- Helper for safe ORM -> Pydantic conversion (Test/Mock compatible) ---
 
 
-def _serialize_thread(thread_orm: ThreadORM, default_metadata: dict[str, Any] | None = None) -> Thread:
+def _serialize_thread_summary(thread_orm: ThreadORM, default_metadata: dict[str, Any] | None = None) -> ThreadSummary:
     """
-    Safely converts ThreadORM to Thread model using dictionary construction.
+    Safely converts ThreadORM to ThreadSummary model using dictionary construction.
     This handles None values and MagicMocks that appear in tests, preventing
     Pydantic V2 ValidationErrors.
     """
@@ -145,14 +147,8 @@ def _serialize_thread(thread_orm: ThreadORM, default_metadata: dict[str, Any] | 
     if not isinstance(u_at, datetime):
         u_at = datetime.now(UTC)
 
-    # 6. Cached latest-checkpoint values and interrupts
-    values_source = getattr(thread_orm, "values_json", None)
-    values = values_source if isinstance(values_source, dict) else None
-    interrupts_source = getattr(thread_orm, "interrupts_json", None)
-    interrupts = interrupts_source if isinstance(interrupts_source, dict) else {}
-
     # Validate from dict (more robust than validate(orm_obj) for partial mocks)
-    return Thread.model_validate(
+    return ThreadSummary.model_validate(
         {
             "thread_id": t_id,
             "status": status,
@@ -160,8 +156,20 @@ def _serialize_thread(thread_orm: ThreadORM, default_metadata: dict[str, Any] | 
             "user_id": u_id,
             "created_at": c_at,
             "updated_at": u_at,
-            "values": values,
-            "interrupts": interrupts,
+        }
+    )
+
+
+def _serialize_thread(thread_orm: ThreadORM, default_metadata: dict[str, Any] | None = None) -> Thread:
+    """Convert ThreadORM to Thread, adding the cached latest-checkpoint values and interrupts."""
+    summary = _serialize_thread_summary(thread_orm, default_metadata)
+    values_source = getattr(thread_orm, "values_json", None)
+    interrupts_source = getattr(thread_orm, "interrupts_json", None)
+    return Thread.model_validate(
+        {
+            **summary.model_dump(),
+            "values": values_source if isinstance(values_source, dict) else None,
+            "interrupts": interrupts_source if isinstance(interrupts_source, dict) else {},
         }
     )
 
@@ -305,15 +313,20 @@ async def list_threads(
 ) -> ThreadList:
     """List all threads owned by the authenticated user.
 
-    Returns every thread without filtering. Use the search endpoint for
-    filtered queries.
+    Returns every thread without filtering or state values. Use the search
+    endpoint for filtered, paginated queries that include each thread's values.
     """
     # Authorization check (search action for listing)
     ctx = build_auth_context(user, "threads", "search")
     value = {}
     filters = await handle_event(ctx, value)
 
-    stmt = select(ThreadORM).where(ThreadORM.user_id == user.identity)
+    # Unpaginated, so the cached state columns stay unloaded; raiseload makes an accidental read fail loudly.
+    stmt = (
+        select(ThreadORM)
+        .where(ThreadORM.user_id == user.identity)
+        .options(defer(ThreadORM.values_json, raiseload=True), defer(ThreadORM.interrupts_json, raiseload=True))
+    )
     auth_filter = build_metadata_filter(ThreadORM.metadata_json, filters)
     if auth_filter is not None:
         stmt = stmt.where(auth_filter)
@@ -321,7 +334,7 @@ async def list_threads(
     rows = result.all()
 
     # Use safe serialization
-    user_threads = [_serialize_thread(t) for t in rows]
+    user_threads = [_serialize_thread_summary(t) for t in rows]
     return ThreadList(threads=user_threads, total=len(user_threads))
 
 

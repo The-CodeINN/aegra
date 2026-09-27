@@ -4,9 +4,11 @@ import asyncio
 import json
 from typing import Any
 
+import httpx
 import pytest
 from langgraph_sdk.client import LangGraphClient
 
+from aegra_api.settings import settings
 from tests.e2e._utils import elog, get_e2e_client
 
 
@@ -74,6 +76,24 @@ async def test_thread_get_and_search_return_latest_values_after_run() -> None:
 
     patched = await client.threads.update(thread_id, metadata={"label": "checked"})
     assert patched["values"] == state["values"]
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_list_threads_omits_state_values() -> None:
+    """GET /threads is unpaginated, so it lists threads without their cached state."""
+    client = get_e2e_client()
+    assistant = await client.assistants.create(graph_id="stress_test", if_exists="do_nothing")
+    thread = await client.threads.create()
+    await client.runs.wait(thread["thread_id"], assistant["assistant_id"], input=_stress_input())
+
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        resp = await http.get(f"{settings.app.SERVER_URL}/threads")
+
+    assert resp.status_code == 200
+    [listed] = [t for t in resp.json()["threads"] if t["thread_id"] == thread["thread_id"]]
+    assert listed["status"] == "idle"
+    assert "values" not in listed
 
 
 @pytest.mark.e2e

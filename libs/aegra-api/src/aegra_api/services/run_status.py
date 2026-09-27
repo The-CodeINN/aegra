@@ -12,6 +12,7 @@ from typing import Any, cast
 
 import structlog
 from sqlalchemy import CursorResult, exists, or_, select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.orm import Run as RunORM
@@ -78,11 +79,39 @@ async def set_thread_values(
 
     Does NOT commit — the caller controls the transaction boundary.
     """
+    # Checkpoint IDs are time-ordered and the checkpointer picks "latest" by the same ordering,
+    # so a snapshot read before a concurrent update_state can never replace the newer one.
+    cached = ThreadORM.values_checkpoint_id
+    is_not_older = (
+        cached.is_(None)
+        if thread_values.checkpoint_id is None
+        else or_(cached.is_(None), cached <= thread_values.checkpoint_id)
+    )
     await session.execute(
         update(ThreadORM)
-        .where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user_id)
-        .values(values_json=thread_values.values, interrupts_json=thread_values.interrupts)
+        .where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user_id, is_not_older)
+        .values(
+            values_json=thread_values.values,
+            interrupts_json=thread_values.interrupts,
+            values_checkpoint_id=thread_values.checkpoint_id,
+        )
     )
+
+
+async def _cache_thread_values_in_savepoint(
+    session: AsyncSession,
+    thread_id: str,
+    thread_values: ThreadValues,
+    *,
+    user_id: str,
+    run_id: str,
+) -> None:
+    """Write the thread cache without letting a rejected write roll back the run's terminal status."""
+    try:
+        async with session.begin_nested():
+            await set_thread_values(session, thread_id, thread_values, user_id=user_id)
+    except SQLAlchemyError:
+        logger.warning("Failed to cache thread values", run_id=run_id, thread_id=thread_id, exc_info=True)
 
 
 async def set_thread_status_if_no_active_runs(
@@ -214,7 +243,7 @@ async def finalize_run(
             return False
 
         if thread_values is not None:
-            await set_thread_values(session, thread_id, thread_values, user_id=user_id)
+            await _cache_thread_values_in_savepoint(session, thread_id, thread_values, user_id=user_id, run_id=run_id)
         await set_thread_status_if_no_active_runs(
             session,
             [thread_id],

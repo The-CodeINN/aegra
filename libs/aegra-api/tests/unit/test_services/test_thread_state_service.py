@@ -149,6 +149,7 @@ class TestExtractThreadValues:
 
         assert result.values == {"messages": ["hi"]}
         assert result.interrupts == {"task-1": [{"value": "approve?", "id": "int-1"}]}
+        assert result.checkpoint_id == "cp-1"
 
     def test_serializes_message_objects_to_json_safe_dicts(self) -> None:
         service = ThreadStateService()
@@ -173,6 +174,7 @@ class TestExtractThreadValues:
 
         assert result.values == {}
         assert result.interrupts == {}
+        assert result.checkpoint_id is None
 
     def test_drops_non_mapping_values(self) -> None:
         service = ThreadStateService()

@@ -1430,22 +1430,33 @@ class TestThreadValuesAndInterrupts:
         assert resp.json()["metadata"]["label"] == "x"
         assert resp.json()["values"] == {"messages": [{"type": "ai", "content": "done"}]}
 
-    def test_list_threads_returns_cached_values_per_thread(self) -> None:
+    def test_list_threads_omits_state_and_does_not_load_it(self) -> None:
+        """GET /threads is unpaginated, so it must not ship or even load each thread's cached state."""
         app = create_test_app(include_runs=False, include_threads=True)
         ran = _thread_row("thread-ran")
         ran.values_json = {"messages": [{"type": "ai", "content": "hi"}]}
-        ran.interrupts_json = {}
-        fresh = _thread_row("thread-fresh")
-        override_session_dependency(app, ThreadSession, threads=[ran, fresh])
+        ran.interrupts_json = {"task-1": [{"value": "x", "id": "i"}]}
+        statements: list[Any] = []
+
+        class Session(ThreadSession):
+            async def scalars(self, stmt: Any = None) -> Any:
+                statements.append(stmt)
+                return await super().scalars(stmt)
+
+        override_session_dependency(app, Session, threads=[ran])
         client = make_client(app)
 
         resp = client.get("/threads")
 
         assert resp.status_code == 200
-        by_id = {t["thread_id"]: t for t in resp.json()["threads"]}
-        assert by_id["thread-ran"]["values"]["messages"][0]["content"] == "hi"
-        assert by_id["thread-fresh"]["values"] is None
-        assert by_id["thread-fresh"]["interrupts"] == {}
+        [thread] = resp.json()["threads"]
+        assert thread["thread_id"] == "thread-ran"
+        assert "values" not in thread
+        assert "interrupts" not in thread
+        [stmt] = statements
+        selected = str(stmt.compile(dialect=postgresql.dialect()))
+        assert "values_json" not in selected
+        assert "interrupts_json" not in selected
 
     def test_create_thread_returns_null_values(self) -> None:
         app = create_test_app(include_runs=False, include_threads=True)

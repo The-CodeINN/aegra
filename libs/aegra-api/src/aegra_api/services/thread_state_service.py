@@ -18,6 +18,7 @@ class ThreadValues:
 
     values: dict[str, Any]
     interrupts: dict[str, list[dict[str, Any]]]
+    checkpoint_id: str | None
 
 
 class ThreadStateService:
@@ -92,7 +93,11 @@ class ThreadStateService:
             task_interrupts = getattr(task, "interrupts", None)
             if task_interrupts:
                 interrupts[str(task.id)] = self.serializer.serialize(list(task_interrupts))
-        return ThreadValues(values=values if isinstance(values, dict) else {}, interrupts=interrupts)
+        return ThreadValues(
+            values=values if isinstance(values, dict) else {},
+            interrupts=interrupts,
+            checkpoint_id=self._extract_checkpoint_id(getattr(snapshot, "config", None)),
+        )
 
     def convert_snapshots_to_thread_states(self, snapshots: list[Any], thread_id: str) -> list[ThreadState]:
         """Convert multiple snapshots to ThreadState objects"""
