@@ -1408,6 +1408,45 @@ class TestThreadValuesAndInterrupts:
         assert data["values"]["messages"][-1]["content"] == "last"
         assert data["interrupts"] == {}
 
+    def test_patch_thread_keeps_cached_values_in_response(self) -> None:
+        app = create_test_app(include_runs=False, include_threads=True)
+        thread = _thread_row("test-123", metadata={"graph_id": "g"})
+        thread.values_json = {"messages": [{"type": "ai", "content": "done"}]}
+        thread.interrupts_json = {}
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: Any) -> Any:
+                return thread
+
+            async def execute(self, stmt: Any) -> None:
+                apply_thread_metadata_merge(stmt, thread)
+
+        app.dependency_overrides[core_get_session] = override_get_session_dep(Session)
+        client = make_client(app)
+
+        resp = client.patch("/threads/test-123", json={"metadata": {"label": "x"}})
+
+        assert resp.status_code == 200
+        assert resp.json()["metadata"]["label"] == "x"
+        assert resp.json()["values"] == {"messages": [{"type": "ai", "content": "done"}]}
+
+    def test_list_threads_returns_cached_values_per_thread(self) -> None:
+        app = create_test_app(include_runs=False, include_threads=True)
+        ran = _thread_row("thread-ran")
+        ran.values_json = {"messages": [{"type": "ai", "content": "hi"}]}
+        ran.interrupts_json = {}
+        fresh = _thread_row("thread-fresh")
+        override_session_dependency(app, ThreadSession, threads=[ran, fresh])
+        client = make_client(app)
+
+        resp = client.get("/threads")
+
+        assert resp.status_code == 200
+        by_id = {t["thread_id"]: t for t in resp.json()["threads"]}
+        assert by_id["thread-ran"]["values"]["messages"][0]["content"] == "hi"
+        assert by_id["thread-fresh"]["values"] is None
+        assert by_id["thread-fresh"]["interrupts"] == {}
+
     def test_create_thread_returns_null_values(self) -> None:
         app = create_test_app(include_runs=False, include_threads=True)
         override_session_dependency(app, BasicSession)
