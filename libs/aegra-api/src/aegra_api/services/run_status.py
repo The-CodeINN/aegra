@@ -18,6 +18,7 @@ from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.serializers import GeneralSerializer
+from aegra_api.services.thread_state_service import ThreadValues
 from aegra_api.utils.status_compat import validate_run_status, validate_thread_status
 
 logger = structlog.getLogger(__name__)
@@ -64,6 +65,24 @@ async def set_thread_status(session: AsyncSession, thread_id: str, status: str) 
     )
     if result.rowcount == 0:
         raise ValueError(f"Thread '{thread_id}' not found")
+
+
+async def set_thread_values(
+    session: AsyncSession,
+    thread_id: str,
+    thread_values: ThreadValues,
+    *,
+    user_id: str,
+) -> None:
+    """Cache the latest checkpoint values and interrupts on the thread row.
+
+    Does NOT commit — the caller controls the transaction boundary.
+    """
+    await session.execute(
+        update(ThreadORM)
+        .where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user_id)
+        .values(values_json=thread_values.values, interrupts_json=thread_values.interrupts)
+    )
 
 
 async def set_thread_status_if_no_active_runs(
@@ -158,6 +177,7 @@ async def finalize_run(
     thread_status: str,
     output: Any = None,
     error: str | None = None,
+    thread_values: ThreadValues | None = None,
 ) -> bool:
     """Conditionally update run and thread status in one transaction.
 
@@ -193,6 +213,8 @@ async def finalize_run(
             logger.info("Skipped finalizing terminal run", run_id=run_id, status=validated_run)
             return False
 
+        if thread_values is not None:
+            await set_thread_values(session, thread_id, thread_values, user_id=user_id)
         await set_thread_status_if_no_active_runs(
             session,
             [thread_id],

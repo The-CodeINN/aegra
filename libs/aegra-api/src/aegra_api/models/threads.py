@@ -100,6 +100,15 @@ class Thread(BaseModel):
     user_id: str = Field(..., description="Identifier of the user who owns this thread.")
     created_at: datetime = Field(..., description="Timestamp when the thread was created.")
     updated_at: datetime = Field(..., description="Timestamp when the thread was last updated.")
+    values: dict[str, Any] | None = Field(
+        None,
+        description="State values of the latest checkpoint, refreshed when a run finishes or the state is "
+        "updated. Null until the thread's first run completes.",
+    )
+    interrupts: dict[str, list[dict[str, Any]]] = Field(
+        default_factory=dict,
+        description="Pending interrupts of the latest checkpoint, keyed by the task ID that raised them.",
+    )
 
     @field_validator("status", mode="before")
     @classmethod
