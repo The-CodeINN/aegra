@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 from langgraph.checkpoint.base.id import uuid6
 from sqlalchemy import delete, select, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
@@ -25,24 +25,31 @@ from aegra_api.settings import settings
 _USER_ID = "thread-values-cache-test-user"
 
 
+async def _schema_skip_reason(engine: AsyncEngine) -> str | None:
+    """Why these tests can't run against ``engine``, or None when the migrated schema is there."""
+    try:
+        async with engine.begin() as conn:
+            has_column = await conn.scalar(
+                text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = 'thread' AND column_name = 'values_checkpoint_id'"
+                )
+            )
+    except Exception as exc:  # noqa: BLE001 - any connect failure means "no database here"
+        return f"PostgreSQL test database is unavailable: {exc}"
+    if has_column is None:
+        return "thread values columns are unavailable; run Alembic migrations before this DB test"
+    return None
+
+
 @pytest.fixture
 async def maker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     """Hand out a session factory on the test database, or skip without one."""
     engine = create_async_engine(settings.db.database_url)
     try:
-        try:
-            async with engine.begin() as conn:
-                has_column = await conn.scalar(
-                    text(
-                        "SELECT 1 FROM information_schema.columns "
-                        "WHERE table_name = 'thread' AND column_name = 'values_checkpoint_id'"
-                    )
-                )
-        except Exception as exc:  # noqa: BLE001 - any connect failure means "no database here"
-            pytest.skip(f"PostgreSQL test database is unavailable: {exc}")
-
-        if has_column is None:
-            pytest.skip("thread values columns are unavailable; run Alembic migrations before this DB test")
+        skip_reason = await _schema_skip_reason(engine)
+        if skip_reason is not None:
+            pytest.skip(skip_reason)
 
         session_maker = async_sessionmaker(engine, expire_on_commit=False)
         try:
