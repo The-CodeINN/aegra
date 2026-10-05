@@ -109,13 +109,61 @@ class TestExecuteRunThreadValues:
         assert mock_finalize.await_args.kwargs["status"] == status
         assert mock_finalize.await_args.kwargs["thread_values"] is graph_result.thread_values
         assert mock_finalize.await_args.kwargs["refresh_thread_values"] is True
-        assert mock_finalize.await_args.kwargs["run_start_checkpoint_id"] == graph_result.start_checkpoint_id
+        assert mock_finalize.await_args.kwargs["latest_checkpoint_id"] == graph_result.latest_checkpoint_id
 
 
 def _graph_with_checkpointer(checkpointer: object) -> MagicMock:
     graph = MagicMock()
     graph.checkpointer = checkpointer
     return graph
+
+
+class TestStreamGraphLatestCheckpoint:
+    @staticmethod
+    def _graph_service() -> MagicMock:
+        graph_cm = MagicMock()
+        graph_cm.__aenter__ = AsyncMock(return_value=MagicMock())
+        graph_cm.__aexit__ = AsyncMock(return_value=False)
+        service = MagicMock()
+        service.get_graph = MagicMock(return_value=graph_cm)
+        return service
+
+    @pytest.mark.asyncio
+    async def test_reads_latest_checkpoint_only_when_snapshot_read_failed(self) -> None:
+        with (
+            patch("aegra_api.services.run_executor.get_langgraph_service", return_value=self._graph_service()),
+            patch("aegra_api.services.run_executor._stream_legacy", new_callable=AsyncMock),
+            patch("aegra_api.services.run_executor._capture_thread_values", new_callable=AsyncMock, return_value=None),
+            patch(
+                "aegra_api.services.run_executor._read_latest_checkpoint_id",
+                new_callable=AsyncMock,
+                return_value="cp-9",
+            ) as mock_read_latest,
+        ):
+            result = await run_executor_module._stream_graph(_make_job())
+
+        mock_read_latest.assert_awaited_once()
+        assert result.thread_values is None
+        assert result.latest_checkpoint_id == "cp-9"
+
+    @pytest.mark.asyncio
+    async def test_skips_latest_checkpoint_read_when_snapshot_was_captured(self) -> None:
+        captured = ThreadValues(values={}, interrupts={}, checkpoint_id="cp-2")
+        with (
+            patch("aegra_api.services.run_executor.get_langgraph_service", return_value=self._graph_service()),
+            patch("aegra_api.services.run_executor._stream_legacy", new_callable=AsyncMock),
+            patch(
+                "aegra_api.services.run_executor._capture_thread_values", new_callable=AsyncMock, return_value=captured
+            ),
+            patch(
+                "aegra_api.services.run_executor._read_latest_checkpoint_id", new_callable=AsyncMock
+            ) as mock_read_latest,
+        ):
+            result = await run_executor_module._stream_graph(_make_job())
+
+        mock_read_latest.assert_not_awaited()
+        assert result.thread_values is captured
+        assert result.latest_checkpoint_id is None
 
 
 class TestReadLatestCheckpointId:

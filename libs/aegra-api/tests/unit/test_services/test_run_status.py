@@ -254,7 +254,7 @@ class TestFinalizeRunThreadValues:
         mock_clear.assert_awaited_once_with(session, "thread-1", user_id="user-1", checkpoint_id="1f0a-cp-2")
 
     @pytest.mark.asyncio
-    async def test_missing_snapshot_clears_only_up_to_the_run_start_checkpoint(self) -> None:
+    async def test_missing_snapshot_clears_up_to_the_latest_checkpoint(self) -> None:
         session = _make_mock_session()
         result = MagicMock()
         result.scalar_one_or_none.return_value = "run-1"
@@ -274,7 +274,7 @@ class TestFinalizeRunThreadValues:
                 thread_status="idle",
                 thread_values=None,
                 refresh_thread_values=True,
-                run_start_checkpoint_id="1f0a-cp-1",
+                latest_checkpoint_id="1f0a-cp-1",
             )
 
         assert finalized is True
@@ -283,7 +283,7 @@ class TestFinalizeRunThreadValues:
         session.commit.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_missing_snapshot_without_run_start_checkpoint_leaves_cache_alone(self) -> None:
+    async def test_missing_snapshot_without_latest_checkpoint_leaves_cache_alone(self) -> None:
         """No ordering bound means a clear could erase a newer update_state snapshot, so none happens."""
         session = _make_mock_session()
         result = MagicMock()
@@ -303,7 +303,7 @@ class TestFinalizeRunThreadValues:
                 thread_status="idle",
                 thread_values=None,
                 refresh_thread_values=True,
-                run_start_checkpoint_id=None,
+                latest_checkpoint_id=None,
             )
 
         assert finalized is True
@@ -332,7 +332,7 @@ class TestFinalizeRunThreadValues:
                 status="success",
                 thread_status="idle",
                 refresh_thread_values=True,
-                run_start_checkpoint_id="1f0a-cp-1",
+                latest_checkpoint_id="1f0a-cp-1",
             )
 
         assert finalized is True

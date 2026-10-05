@@ -132,12 +132,12 @@ async def _refresh_thread_values_in_savepoint(
     *,
     user_id: str,
     run_id: str,
-    run_start_checkpoint_id: str | None,
+    latest_checkpoint_id: str | None,
 ) -> None:
     """Point the thread cache at the run's final state without risking the run's terminal status.
 
-    A rejected write (e.g. NaN in JSONB) or a missing snapshot clears the cache instead of leaving the
-    previous run's values in place, but never clears a snapshot newer than the one this run superseded.
+    A rejected write (e.g. NaN in JSONB) or a missing snapshot clears every cached snapshot up to the
+    run's last checkpoint instead of leaving older values in place, and never one cached after it.
     """
     if thread_values is not None:
         try:
@@ -147,9 +147,9 @@ async def _refresh_thread_values_in_savepoint(
         except SQLAlchemyError:
             logger.warning("Failed to cache thread values", run_id=run_id, thread_id=thread_id, exc_info=True)
 
-    checkpoint_id = thread_values.checkpoint_id if thread_values is not None else run_start_checkpoint_id
+    checkpoint_id = thread_values.checkpoint_id if thread_values is not None else latest_checkpoint_id
     if checkpoint_id is None:
-        # Without an ordering bound a clear could erase a newer snapshot; the thread had none to supersede.
+        # Without an ordering bound a clear could erase a snapshot cached after this run.
         logger.warning("Thread values left as-is: no checkpoint bound for the clear", run_id=run_id)
         return
     try:
@@ -253,14 +253,14 @@ async def finalize_run(
     error: str | None = None,
     thread_values: ThreadValues | None = None,
     refresh_thread_values: bool = False,
-    run_start_checkpoint_id: str | None = None,
+    latest_checkpoint_id: str | None = None,
 ) -> bool:
     """Conditionally update run and thread status in one transaction.
 
     Returns false when another actor has already made the run terminal. This
     prevents an expired worker from overwriting a reconciled cancellation.
     With ``refresh_thread_values``, the thread's cached values move to ``thread_values``, or are cleared
-    when that snapshot is missing or rejected (bounded by ``run_start_checkpoint_id`` when it is missing).
+    when that snapshot is missing or rejected (bounded by ``latest_checkpoint_id`` when it is missing).
     """
     validated_run = validate_run_status(status)
     validated_thread = validate_thread_status(thread_status)
@@ -298,7 +298,7 @@ async def finalize_run(
                 thread_values,
                 user_id=user_id,
                 run_id=run_id,
-                run_start_checkpoint_id=run_start_checkpoint_id,
+                latest_checkpoint_id=latest_checkpoint_id,
             )
         await set_thread_status_if_no_active_runs(
             session,

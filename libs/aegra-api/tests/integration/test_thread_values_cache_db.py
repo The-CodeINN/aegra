@@ -196,8 +196,8 @@ async def test_rejected_snapshot_clears_previous_runs_values(maker: async_sessio
 async def test_missing_snapshot_clears_previous_runs_values(maker: async_sessionmaker[AsyncSession]) -> None:
     """The final-state read failed, so nothing new can be cached; the old answer must not look current."""
     thread_id, run_id = await _create_thread_with_running_run(maker)
-    run_start_checkpoint = str(uuid6())
-    await _write_cache(maker, thread_id, _snapshot("previous run's answer", run_start_checkpoint))
+    previous_checkpoint, latest_checkpoint = str(uuid6()), str(uuid6())
+    await _write_cache(maker, thread_id, _snapshot("previous run's answer", previous_checkpoint))
 
     with patch("aegra_api.services.run_status._get_session_maker", return_value=maker):
         finalized = await finalize_run(
@@ -208,7 +208,7 @@ async def test_missing_snapshot_clears_previous_runs_values(maker: async_session
             thread_status="idle",
             thread_values=None,
             refresh_thread_values=True,
-            run_start_checkpoint_id=run_start_checkpoint,
+            latest_checkpoint_id=latest_checkpoint,
         )
 
     assert finalized is True
@@ -221,9 +221,9 @@ async def test_missing_snapshot_clears_previous_runs_values(maker: async_session
 async def test_missing_snapshot_does_not_erase_a_newer_update_state_snapshot(
     maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    """update_state cached a newer checkpoint while the run ran; the run's failed read must not erase it."""
+    """update_state cached a checkpoint after the run's latest-checkpoint read; the clear must not erase it."""
     thread_id, run_id = await _create_thread_with_running_run(maker)
-    run_start_checkpoint, update_state_checkpoint = str(uuid6()), str(uuid6())
+    latest_checkpoint, update_state_checkpoint = str(uuid6()), str(uuid6())
     await _write_cache(maker, thread_id, _snapshot("from update_state", update_state_checkpoint))
 
     with patch("aegra_api.services.run_status._get_session_maker", return_value=maker):
@@ -235,12 +235,39 @@ async def test_missing_snapshot_does_not_erase_a_newer_update_state_snapshot(
             thread_status="idle",
             thread_values=None,
             refresh_thread_values=True,
-            run_start_checkpoint_id=run_start_checkpoint,
+            latest_checkpoint_id=latest_checkpoint,
         )
 
     thread = await _read_thread(maker, thread_id)
     assert thread.values_json == {"answer": "from update_state"}
     assert thread.values_checkpoint_id == update_state_checkpoint
+
+
+@pytest.mark.asyncio
+async def test_missing_snapshot_clears_an_update_state_snapshot_older_than_the_runs_last_checkpoint(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Run starts at A, update_state caches B, the run writes C, then its final read fails: B is stale."""
+    thread_id, run_id = await _create_thread_with_running_run(maker)
+    run_start, update_state_during_run, run_last = str(uuid6()), str(uuid6()), str(uuid6())
+    await _write_cache(maker, thread_id, _snapshot("run start", run_start))
+    await _write_cache(maker, thread_id, _snapshot("from update_state during the run", update_state_during_run))
+
+    with patch("aegra_api.services.run_status._get_session_maker", return_value=maker):
+        await finalize_run(
+            run_id,
+            thread_id,
+            user_id=_USER_ID,
+            status="success",
+            thread_status="idle",
+            thread_values=None,
+            refresh_thread_values=True,
+            latest_checkpoint_id=run_last,
+        )
+
+    thread = await _read_thread(maker, thread_id)
+    assert thread.values_json is None
+    assert thread.values_checkpoint_id == run_last
 
 
 @pytest.mark.asyncio

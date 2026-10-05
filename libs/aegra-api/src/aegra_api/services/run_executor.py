@@ -70,7 +70,7 @@ async def execute_run(job: RunJob) -> None:
                 output=final_output.data,
                 thread_values=final_output.thread_values,
                 refresh_thread_values=True,
-                run_start_checkpoint_id=final_output.start_checkpoint_id,
+                latest_checkpoint_id=final_output.latest_checkpoint_id,
             )
         else:
             finalized = await finalize_run(
@@ -82,7 +82,7 @@ async def execute_run(job: RunJob) -> None:
                 output=final_output.data,
                 thread_values=final_output.thread_values,
                 refresh_thread_values=True,
-                run_start_checkpoint_id=final_output.start_checkpoint_id,
+                latest_checkpoint_id=final_output.latest_checkpoint_id,
             )
 
     except asyncio.CancelledError:
@@ -171,12 +171,12 @@ async def _best_effort_signal(fn: Any, *args: Any) -> None:
 class _GraphResult:
     """Accumulates output and interrupt state during graph streaming."""
 
-    __slots__ = ("data", "has_interrupt", "start_checkpoint_id", "thread_values")
+    __slots__ = ("data", "has_interrupt", "latest_checkpoint_id", "thread_values")
 
     def __init__(self) -> None:
         self.data: dict[str, Any] = {}
         self.has_interrupt: bool = False
-        self.start_checkpoint_id: str | None = None
+        self.latest_checkpoint_id: str | None = None
         self.thread_values: ThreadValues | None = None
 
 
@@ -199,21 +199,22 @@ async def _stream_graph(job: RunJob) -> _GraphResult:
         ) as graph,
         with_auth_ctx(job.user, job.user.permissions),  # type: ignore[arg-type]
     ):
-        result.start_checkpoint_id = await _read_latest_checkpoint_id(graph, job)
         if job.execution.event_streaming_v2:
             await _stream_native_v2(job, graph, execution_input, run_config, result)
         else:
             await _stream_legacy(job, graph, execution_input, run_config, stream_modes, result)
         result.thread_values = await _capture_thread_values(graph, job)
+        if result.thread_values is None:
+            result.latest_checkpoint_id = await _read_latest_checkpoint_id(graph, job)
 
     return result
 
 
 async def _read_latest_checkpoint_id(graph: Any, job: RunJob) -> str | None:
-    """Return the thread's newest checkpoint ID before the run writes any, or None if unknown.
+    """Return the thread's newest root checkpoint ID, or None if unknown.
 
-    Marks which cached snapshot this run supersedes, so a failed final-state read can clear
-    only that one and never a newer snapshot cached by a concurrent update_state.
+    Read only after the final-state read failed: it bounds the cache clear, so every snapshot up to
+    the run's own last checkpoint goes and anything a later update_state caches survives.
     """
     checkpointer = getattr(graph, "checkpointer", None)
     if not isinstance(checkpointer, BaseCheckpointSaver):
@@ -222,7 +223,7 @@ async def _read_latest_checkpoint_id(graph: Any, job: RunJob) -> str | None:
     try:
         checkpoint_tuple = await checkpointer.aget_tuple(config)
     except Exception:
-        logger.warning("Failed to read starting checkpoint", run_id=job.identity.run_id, exc_info=True)
+        logger.warning("Failed to read latest checkpoint", run_id=job.identity.run_id, exc_info=True)
         return None
     if checkpoint_tuple is None:
         return None
