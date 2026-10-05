@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import structlog
-from sqlalchemy import CursorResult, exists, or_, select, update
+from sqlalchemy import ColumnElement, CursorResult, exists, null, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -79,17 +79,13 @@ async def set_thread_values(
 
     Does NOT commit — the caller controls the transaction boundary.
     """
-    # Checkpoint IDs are time-ordered and the checkpointer picks "latest" by the same ordering,
-    # so a snapshot read before a concurrent update_state can never replace the newer one.
-    cached = ThreadORM.values_checkpoint_id
-    is_not_older = (
-        cached.is_(None)
-        if thread_values.checkpoint_id is None
-        else or_(cached.is_(None), cached <= thread_values.checkpoint_id)
-    )
     await session.execute(
         update(ThreadORM)
-        .where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user_id, is_not_older)
+        .where(
+            ThreadORM.thread_id == thread_id,
+            ThreadORM.user_id == user_id,
+            _not_older_than_cached(thread_values.checkpoint_id),
+        )
         .values(
             values_json=thread_values.values,
             interrupts_json=thread_values.interrupts,
@@ -98,20 +94,59 @@ async def set_thread_values(
     )
 
 
-async def _cache_thread_values_in_savepoint(
+async def clear_thread_values(
     session: AsyncSession,
     thread_id: str,
-    thread_values: ThreadValues,
+    *,
+    user_id: str,
+    checkpoint_id: str | None,
+) -> None:
+    """Drop cached values a finished run could not replace, so reads never serve them as current.
+
+    Does NOT commit. With no known checkpoint the clear is unconditional: missing values are safe, stale ones are not.
+    """
+    stmt = update(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user_id)
+    if checkpoint_id is not None:
+        stmt = stmt.where(_not_older_than_cached(checkpoint_id))
+    await session.execute(stmt.values(values_json=null(), interrupts_json={}, values_checkpoint_id=checkpoint_id))
+
+
+def _not_older_than_cached(checkpoint_id: str | None) -> ColumnElement[bool]:
+    # Checkpoint IDs are time-ordered and the checkpointer picks "latest" by the same ordering,
+    # so a snapshot read before a concurrent update_state can never replace the newer one.
+    cached = ThreadORM.values_checkpoint_id
+    if checkpoint_id is None:
+        return cached.is_(None)
+    return or_(cached.is_(None), cached <= checkpoint_id)
+
+
+async def _refresh_thread_values_in_savepoint(
+    session: AsyncSession,
+    thread_id: str,
+    thread_values: ThreadValues | None,
     *,
     user_id: str,
     run_id: str,
 ) -> None:
-    """Write the thread cache without letting a rejected write roll back the run's terminal status."""
+    """Point the thread cache at the run's final state without risking the run's terminal status.
+
+    A rejected write (e.g. NaN in JSONB) or a missing snapshot clears the cache instead of leaving the
+    previous run's values in place.
+    """
+    if thread_values is not None:
+        try:
+            async with session.begin_nested():
+                await set_thread_values(session, thread_id, thread_values, user_id=user_id)
+            return
+        except SQLAlchemyError:
+            logger.warning("Failed to cache thread values", run_id=run_id, thread_id=thread_id, exc_info=True)
+
+    checkpoint_id = thread_values.checkpoint_id if thread_values is not None else None
     try:
         async with session.begin_nested():
-            await set_thread_values(session, thread_id, thread_values, user_id=user_id)
+            await clear_thread_values(session, thread_id, user_id=user_id, checkpoint_id=checkpoint_id)
     except SQLAlchemyError:
-        logger.warning("Failed to cache thread values", run_id=run_id, thread_id=thread_id, exc_info=True)
+        logger.warning("Failed to clear stale thread values", run_id=run_id, thread_id=thread_id, exc_info=True)
 
 
 async def set_thread_status_if_no_active_runs(
@@ -207,11 +242,14 @@ async def finalize_run(
     output: Any = None,
     error: str | None = None,
     thread_values: ThreadValues | None = None,
+    refresh_thread_values: bool = False,
 ) -> bool:
     """Conditionally update run and thread status in one transaction.
 
     Returns false when another actor has already made the run terminal. This
     prevents an expired worker from overwriting a reconciled cancellation.
+    With ``refresh_thread_values``, the thread's cached values move to ``thread_values``,
+    or are cleared when that snapshot is missing or rejected.
     """
     validated_run = validate_run_status(status)
     validated_thread = validate_thread_status(thread_status)
@@ -242,8 +280,8 @@ async def finalize_run(
             logger.info("Skipped finalizing terminal run", run_id=run_id, status=validated_run)
             return False
 
-        if thread_values is not None:
-            await _cache_thread_values_in_savepoint(session, thread_id, thread_values, user_id=user_id, run_id=run_id)
+        if refresh_thread_values:
+            await _refresh_thread_values_in_savepoint(session, thread_id, thread_values, user_id=user_id, run_id=run_id)
         await set_thread_status_if_no_active_runs(
             session,
             [thread_id],

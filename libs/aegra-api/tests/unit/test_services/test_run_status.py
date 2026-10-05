@@ -7,6 +7,7 @@ from sqlalchemy.exc import DBAPIError
 
 from aegra_api.services.run_status import (
     _safe_serialize,
+    clear_thread_values,
     finalize_run,
     interrupt_unowned_run,
     set_thread_status,
@@ -212,6 +213,7 @@ class TestFinalizeRunThreadValues:
                 status="success",
                 thread_status="idle",
                 thread_values=_THREAD_VALUES,
+                refresh_thread_values=True,
             )
 
         assert finalized is True
@@ -233,6 +235,7 @@ class TestFinalizeRunThreadValues:
                 "aegra_api.services.run_status.set_thread_status_if_no_active_runs", new_callable=AsyncMock
             ) as mock_set_status,
             patch("aegra_api.services.run_status.set_thread_values", new_callable=AsyncMock, side_effect=rejected),
+            patch("aegra_api.services.run_status.clear_thread_values", new_callable=AsyncMock) as mock_clear,
         ):
             finalized = await finalize_run(
                 "run-1",
@@ -241,6 +244,65 @@ class TestFinalizeRunThreadValues:
                 status="success",
                 thread_status="idle",
                 thread_values=_THREAD_VALUES,
+                refresh_thread_values=True,
+            )
+
+        assert finalized is True
+        mock_set_status.assert_awaited_once()
+        session.commit.assert_awaited_once()
+        # The previous run's values must not survive as if they were this run's result.
+        mock_clear.assert_awaited_once_with(session, "thread-1", user_id="user-1", checkpoint_id="1f0a-cp-2")
+
+    @pytest.mark.asyncio
+    async def test_missing_snapshot_clears_cached_values(self) -> None:
+        session = _make_mock_session()
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = "run-1"
+        session.execute = AsyncMock(return_value=result)
+
+        with (
+            patch("aegra_api.services.run_status._get_session_maker", return_value=_make_mock_session_maker(session)),
+            patch("aegra_api.services.run_status.set_thread_status_if_no_active_runs", new_callable=AsyncMock),
+            patch("aegra_api.services.run_status.set_thread_values", new_callable=AsyncMock) as mock_set_values,
+            patch("aegra_api.services.run_status.clear_thread_values", new_callable=AsyncMock) as mock_clear,
+        ):
+            finalized = await finalize_run(
+                "run-1",
+                "thread-1",
+                user_id="user-1",
+                status="success",
+                thread_status="idle",
+                thread_values=None,
+                refresh_thread_values=True,
+            )
+
+        assert finalized is True
+        mock_set_values.assert_not_awaited()
+        mock_clear.assert_awaited_once_with(session, "thread-1", user_id="user-1", checkpoint_id=None)
+        session.commit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_failed_clear_still_commits_terminal_status(self) -> None:
+        session = _make_mock_session()
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = "run-1"
+        session.execute = AsyncMock(return_value=result)
+        rejected = DBAPIError("UPDATE thread", {}, Exception("connection reset"))
+
+        with (
+            patch("aegra_api.services.run_status._get_session_maker", return_value=_make_mock_session_maker(session)),
+            patch(
+                "aegra_api.services.run_status.set_thread_status_if_no_active_runs", new_callable=AsyncMock
+            ) as mock_set_status,
+            patch("aegra_api.services.run_status.clear_thread_values", new_callable=AsyncMock, side_effect=rejected),
+        ):
+            finalized = await finalize_run(
+                "run-1",
+                "thread-1",
+                user_id="user-1",
+                status="success",
+                thread_status="idle",
+                refresh_thread_values=True,
             )
 
         assert finalized is True
@@ -258,10 +320,12 @@ class TestFinalizeRunThreadValues:
             patch("aegra_api.services.run_status._get_session_maker", return_value=_make_mock_session_maker(session)),
             patch("aegra_api.services.run_status.set_thread_status_if_no_active_runs", new_callable=AsyncMock),
             patch("aegra_api.services.run_status.set_thread_values", new_callable=AsyncMock) as mock_set_values,
+            patch("aegra_api.services.run_status.clear_thread_values", new_callable=AsyncMock) as mock_clear,
         ):
             await finalize_run("run-1", "thread-1", user_id="user-1", status="error", thread_status="error")
 
         mock_set_values.assert_not_awaited()
+        mock_clear.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_does_not_cache_values_when_run_already_terminal(self) -> None:
@@ -281,6 +345,7 @@ class TestFinalizeRunThreadValues:
                 status="success",
                 thread_status="idle",
                 thread_values=_THREAD_VALUES,
+                refresh_thread_values=True,
             )
 
         assert finalized is False
@@ -322,6 +387,32 @@ class TestSetThreadValues:
         sql = str(session.execute.await_args.args[0].compile())
         assert "thread.values_checkpoint_id IS NULL" in sql
         assert "<=" not in sql
+
+
+class TestClearThreadValues:
+    @pytest.mark.asyncio
+    async def test_clears_only_when_not_older_than_cached_checkpoint(self) -> None:
+        session = _make_mock_session()
+
+        await clear_thread_values(session, "thread-1", user_id="user-1", checkpoint_id="1f0a-cp-2")
+
+        compiled = session.execute.await_args.args[0].compile()
+        sql = str(compiled)
+        assert "thread.user_id" in sql
+        assert "thread.values_checkpoint_id IS NULL OR thread.values_checkpoint_id <=" in sql
+        assert "values_json=NULL" in sql.replace(" ", "")
+        assert compiled.params["values_checkpoint_id"] == "1f0a-cp-2"
+        session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clears_unconditionally_without_a_checkpoint(self) -> None:
+        session = _make_mock_session()
+
+        await clear_thread_values(session, "thread-1", user_id="user-1", checkpoint_id=None)
+
+        sql = str(session.execute.await_args.args[0].compile())
+        assert "values_checkpoint_id <=" not in sql
+        assert "values_checkpoint_id IS NULL" not in sql
 
 
 class TestSetThreadStatus:

@@ -71,7 +71,7 @@ last_message = (thread["values"] or {}).get("messages", [])[-1:]
 
 `GET /threads` leaves both fields out because it isn't paginated. Use `threads.search` to page through threads with their values.
 
-Aegra stores this snapshot on the thread when a run ends with `success` or `interrupted`, and when you call `update_state`, so reading it costs no graph load. `values` is `null` until one of those happens. A run that errors or is cancelled leaves the previous snapshot in place, so use `get_state` when you need the exact checkpoint.
+Aegra stores this snapshot on the thread when a run ends with `success` or `interrupted`, and when you call `update_state`, so reading it costs no graph load. `values` is `null` until one of those happens. It is also `null` if a finished run's state couldn't be stored, so an older answer is never shown as the latest one. A run that errors or is cancelled leaves the previous snapshot in place, so use `get_state` when you need the exact checkpoint.
 
 ## Getting thread state
 

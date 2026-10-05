@@ -104,6 +104,7 @@ class TestExecuteRunThreadValues:
 
         assert mock_finalize.await_args.kwargs["status"] == status
         assert mock_finalize.await_args.kwargs["thread_values"] is graph_result.thread_values
+        assert mock_finalize.await_args.kwargs["refresh_thread_values"] is True
 
 
 class TestCaptureThreadValues:

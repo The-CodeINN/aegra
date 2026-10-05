@@ -68,6 +68,7 @@ async def execute_run(job: RunJob) -> None:
                 thread_status="interrupted",
                 output=final_output.data,
                 thread_values=final_output.thread_values,
+                refresh_thread_values=True,
             )
         else:
             finalized = await finalize_run(
@@ -78,6 +79,7 @@ async def execute_run(job: RunJob) -> None:
                 thread_status="idle",
                 output=final_output.data,
                 thread_values=final_output.thread_values,
+                refresh_thread_values=True,
             )
 
     except asyncio.CancelledError:
