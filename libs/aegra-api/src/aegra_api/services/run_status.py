@@ -99,16 +99,21 @@ async def clear_thread_values(
     thread_id: str,
     *,
     user_id: str,
-    checkpoint_id: str | None,
+    checkpoint_id: str,
 ) -> None:
     """Drop cached values a finished run could not replace, so reads never serve them as current.
 
-    Does NOT commit. With no known checkpoint the clear is unconditional: missing values are safe, stale ones are not.
+    Only snapshots no newer than ``checkpoint_id`` are cleared. Does NOT commit.
     """
-    stmt = update(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user_id)
-    if checkpoint_id is not None:
-        stmt = stmt.where(_not_older_than_cached(checkpoint_id))
-    await session.execute(stmt.values(values_json=null(), interrupts_json={}, values_checkpoint_id=checkpoint_id))
+    await session.execute(
+        update(ThreadORM)
+        .where(
+            ThreadORM.thread_id == thread_id,
+            ThreadORM.user_id == user_id,
+            _not_older_than_cached(checkpoint_id),
+        )
+        .values(values_json=null(), interrupts_json={}, values_checkpoint_id=checkpoint_id)
+    )
 
 
 def _not_older_than_cached(checkpoint_id: str | None) -> ColumnElement[bool]:
@@ -127,11 +132,12 @@ async def _refresh_thread_values_in_savepoint(
     *,
     user_id: str,
     run_id: str,
+    run_start_checkpoint_id: str | None,
 ) -> None:
     """Point the thread cache at the run's final state without risking the run's terminal status.
 
     A rejected write (e.g. NaN in JSONB) or a missing snapshot clears the cache instead of leaving the
-    previous run's values in place.
+    previous run's values in place, but never clears a snapshot newer than the one this run superseded.
     """
     if thread_values is not None:
         try:
@@ -141,7 +147,11 @@ async def _refresh_thread_values_in_savepoint(
         except SQLAlchemyError:
             logger.warning("Failed to cache thread values", run_id=run_id, thread_id=thread_id, exc_info=True)
 
-    checkpoint_id = thread_values.checkpoint_id if thread_values is not None else None
+    checkpoint_id = thread_values.checkpoint_id if thread_values is not None else run_start_checkpoint_id
+    if checkpoint_id is None:
+        # Without an ordering bound a clear could erase a newer snapshot; the thread had none to supersede.
+        logger.warning("Thread values left as-is: no checkpoint bound for the clear", run_id=run_id)
+        return
     try:
         async with session.begin_nested():
             await clear_thread_values(session, thread_id, user_id=user_id, checkpoint_id=checkpoint_id)
@@ -243,13 +253,14 @@ async def finalize_run(
     error: str | None = None,
     thread_values: ThreadValues | None = None,
     refresh_thread_values: bool = False,
+    run_start_checkpoint_id: str | None = None,
 ) -> bool:
     """Conditionally update run and thread status in one transaction.
 
     Returns false when another actor has already made the run terminal. This
     prevents an expired worker from overwriting a reconciled cancellation.
-    With ``refresh_thread_values``, the thread's cached values move to ``thread_values``,
-    or are cleared when that snapshot is missing or rejected.
+    With ``refresh_thread_values``, the thread's cached values move to ``thread_values``, or are cleared
+    when that snapshot is missing or rejected (bounded by ``run_start_checkpoint_id`` when it is missing).
     """
     validated_run = validate_run_status(status)
     validated_thread = validate_thread_status(thread_status)
@@ -281,7 +292,14 @@ async def finalize_run(
             return False
 
         if refresh_thread_values:
-            await _refresh_thread_values_in_savepoint(session, thread_id, thread_values, user_id=user_id, run_id=run_id)
+            await _refresh_thread_values_in_savepoint(
+                session,
+                thread_id,
+                thread_values,
+                user_id=user_id,
+                run_id=run_id,
+                run_start_checkpoint_id=run_start_checkpoint_id,
+            )
         await set_thread_status_if_no_active_runs(
             session,
             [thread_id],

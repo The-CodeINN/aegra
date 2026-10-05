@@ -4,6 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langgraph.checkpoint.base import BaseCheckpointSaver, CheckpointTuple
 
 from aegra_api.models.auth import User
 from aegra_api.models.run_job import RunExecution, RunIdentity, RunJob
@@ -13,6 +14,7 @@ from aegra_api.services.run_executor import (
     _capture_thread_values,
     _GraphResult,
     _lease_loss_cancellations,
+    _read_latest_checkpoint_id,
     _shutdown_cancellations,
     _signal_end_event,
     _signal_run_done,
@@ -107,6 +109,50 @@ class TestExecuteRunThreadValues:
         assert mock_finalize.await_args.kwargs["status"] == status
         assert mock_finalize.await_args.kwargs["thread_values"] is graph_result.thread_values
         assert mock_finalize.await_args.kwargs["refresh_thread_values"] is True
+        assert mock_finalize.await_args.kwargs["run_start_checkpoint_id"] == graph_result.start_checkpoint_id
+
+
+def _graph_with_checkpointer(checkpointer: object) -> MagicMock:
+    graph = MagicMock()
+    graph.checkpointer = checkpointer
+    return graph
+
+
+class TestReadLatestCheckpointId:
+    @pytest.mark.asyncio
+    async def test_returns_the_threads_newest_root_checkpoint_id(self) -> None:
+        checkpointer = MagicMock(spec=BaseCheckpointSaver)
+        checkpointer.aget_tuple = AsyncMock(
+            return_value=CheckpointTuple(
+                config={"configurable": {"thread_id": "thread-1", "checkpoint_ns": "", "checkpoint_id": "cp-1"}},
+                checkpoint=MagicMock(),
+                metadata=MagicMock(),
+            )
+        )
+
+        result = await _read_latest_checkpoint_id(_graph_with_checkpointer(checkpointer), _make_job())
+
+        assert result == "cp-1"
+        config = checkpointer.aget_tuple.await_args.args[0]
+        assert config == {"configurable": {"thread_id": "thread-1", "checkpoint_ns": ""}}
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_a_thread_without_checkpoints(self) -> None:
+        checkpointer = MagicMock(spec=BaseCheckpointSaver)
+        checkpointer.aget_tuple = AsyncMock(return_value=None)
+
+        assert await _read_latest_checkpoint_id(_graph_with_checkpointer(checkpointer), _make_job()) is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_the_read_fails(self) -> None:
+        checkpointer = MagicMock(spec=BaseCheckpointSaver)
+        checkpointer.aget_tuple = AsyncMock(side_effect=RuntimeError("checkpointer down"))
+
+        assert await _read_latest_checkpoint_id(_graph_with_checkpointer(checkpointer), _make_job()) is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_graph_has_no_checkpointer(self) -> None:
+        assert await _read_latest_checkpoint_id(_graph_with_checkpointer(None), _make_job()) is None
 
 
 class TestCaptureThreadValues:

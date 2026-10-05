@@ -302,7 +302,9 @@ async def create_thread(
     )
 
     if existing is not None and request.if_exists == "do_nothing":
-        return _serialize_thread(existing)
+        # Only threads.create was authorized here, so return the thread without its checkpoint state;
+        # reading values goes through GET /threads/{id} and its threads.read handler.
+        return Thread.model_validate(_serialize_thread_summary(existing).model_dump())
 
     raise HTTPException(409, f"Thread '{thread_id}' already exists")
 

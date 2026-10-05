@@ -1458,6 +1458,22 @@ class TestThreadValuesAndInterrupts:
         assert "values_json" not in selected
         assert "interrupts_json" not in selected
 
+    def test_create_if_exists_do_nothing_returns_existing_thread_without_state(self) -> None:
+        """Only threads.create is authorized on this path, so cached state must not ride along."""
+        app = create_test_app(include_runs=False, include_threads=True)
+        existing = _thread_row("existing-thread-id", metadata={"original": True})
+        existing.values_json = {"messages": [{"type": "ai", "content": "secret"}]}
+        existing.interrupts_json = {"task-1": [{"value": "approve?", "id": "int-1"}]}
+        client = make_client(_conflicting_app(app, existing))
+
+        resp = client.post("/threads", json={"threadId": "existing-thread-id", "ifExists": "do_nothing"})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["metadata"]["original"] is True
+        assert data["values"] is None
+        assert data["interrupts"] == {}
+
     def test_create_thread_returns_null_values(self) -> None:
         app = create_test_app(include_runs=False, include_threads=True)
         override_session_dependency(app, BasicSession)

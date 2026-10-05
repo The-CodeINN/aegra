@@ -189,7 +189,8 @@ async def test_rejected_snapshot_clears_previous_runs_values(maker: async_sessio
 async def test_missing_snapshot_clears_previous_runs_values(maker: async_sessionmaker[AsyncSession]) -> None:
     """The final-state read failed, so nothing new can be cached; the old answer must not look current."""
     thread_id, run_id = await _create_thread_with_running_run(maker)
-    await _write_cache(maker, thread_id, _snapshot("previous run's answer", str(uuid6())))
+    run_start_checkpoint = str(uuid6())
+    await _write_cache(maker, thread_id, _snapshot("previous run's answer", run_start_checkpoint))
 
     with patch("aegra_api.services.run_status._get_session_maker", return_value=maker):
         finalized = await finalize_run(
@@ -200,13 +201,39 @@ async def test_missing_snapshot_clears_previous_runs_values(maker: async_session
             thread_status="idle",
             thread_values=None,
             refresh_thread_values=True,
+            run_start_checkpoint_id=run_start_checkpoint,
         )
 
     assert finalized is True
     assert await _read_run_status(maker, run_id) == "success"
     thread = await _read_thread(maker, thread_id)
     assert thread.values_json is None
-    assert thread.values_checkpoint_id is None
+
+
+@pytest.mark.asyncio
+async def test_missing_snapshot_does_not_erase_a_newer_update_state_snapshot(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """update_state cached a newer checkpoint while the run ran; the run's failed read must not erase it."""
+    thread_id, run_id = await _create_thread_with_running_run(maker)
+    run_start_checkpoint, update_state_checkpoint = str(uuid6()), str(uuid6())
+    await _write_cache(maker, thread_id, _snapshot("from update_state", update_state_checkpoint))
+
+    with patch("aegra_api.services.run_status._get_session_maker", return_value=maker):
+        await finalize_run(
+            run_id,
+            thread_id,
+            user_id=_USER_ID,
+            status="success",
+            thread_status="idle",
+            thread_values=None,
+            refresh_thread_values=True,
+            run_start_checkpoint_id=run_start_checkpoint,
+        )
+
+    thread = await _read_thread(maker, thread_id)
+    assert thread.values_json == {"answer": "from update_state"}
+    assert thread.values_checkpoint_id == update_state_checkpoint
 
 
 @pytest.mark.asyncio

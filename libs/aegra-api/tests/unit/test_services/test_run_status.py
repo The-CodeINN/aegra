@@ -254,7 +254,7 @@ class TestFinalizeRunThreadValues:
         mock_clear.assert_awaited_once_with(session, "thread-1", user_id="user-1", checkpoint_id="1f0a-cp-2")
 
     @pytest.mark.asyncio
-    async def test_missing_snapshot_clears_cached_values(self) -> None:
+    async def test_missing_snapshot_clears_only_up_to_the_run_start_checkpoint(self) -> None:
         session = _make_mock_session()
         result = MagicMock()
         result.scalar_one_or_none.return_value = "run-1"
@@ -274,11 +274,40 @@ class TestFinalizeRunThreadValues:
                 thread_status="idle",
                 thread_values=None,
                 refresh_thread_values=True,
+                run_start_checkpoint_id="1f0a-cp-1",
             )
 
         assert finalized is True
         mock_set_values.assert_not_awaited()
-        mock_clear.assert_awaited_once_with(session, "thread-1", user_id="user-1", checkpoint_id=None)
+        mock_clear.assert_awaited_once_with(session, "thread-1", user_id="user-1", checkpoint_id="1f0a-cp-1")
+        session.commit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_snapshot_without_run_start_checkpoint_leaves_cache_alone(self) -> None:
+        """No ordering bound means a clear could erase a newer update_state snapshot, so none happens."""
+        session = _make_mock_session()
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = "run-1"
+        session.execute = AsyncMock(return_value=result)
+
+        with (
+            patch("aegra_api.services.run_status._get_session_maker", return_value=_make_mock_session_maker(session)),
+            patch("aegra_api.services.run_status.set_thread_status_if_no_active_runs", new_callable=AsyncMock),
+            patch("aegra_api.services.run_status.clear_thread_values", new_callable=AsyncMock) as mock_clear,
+        ):
+            finalized = await finalize_run(
+                "run-1",
+                "thread-1",
+                user_id="user-1",
+                status="success",
+                thread_status="idle",
+                thread_values=None,
+                refresh_thread_values=True,
+                run_start_checkpoint_id=None,
+            )
+
+        assert finalized is True
+        mock_clear.assert_not_awaited()
         session.commit.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -303,6 +332,7 @@ class TestFinalizeRunThreadValues:
                 status="success",
                 thread_status="idle",
                 refresh_thread_values=True,
+                run_start_checkpoint_id="1f0a-cp-1",
             )
 
         assert finalized is True
@@ -403,16 +433,6 @@ class TestClearThreadValues:
         assert "values_json=NULL" in sql.replace(" ", "")
         assert compiled.params["values_checkpoint_id"] == "1f0a-cp-2"
         session.commit.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_clears_unconditionally_without_a_checkpoint(self) -> None:
-        session = _make_mock_session()
-
-        await clear_thread_values(session, "thread-1", user_id="user-1", checkpoint_id=None)
-
-        sql = str(session.execute.await_args.args[0].compile())
-        assert "values_checkpoint_id <=" not in sql
-        assert "values_checkpoint_id IS NULL" not in sql
 
 
 class TestSetThreadStatus:
